@@ -1,4 +1,4 @@
-import { Suspense, useCallback, useState } from 'react'
+import { Suspense, useCallback, useEffect, useState } from 'react'
 
 import { OrbitControls } from '@react-three/drei/webgpu'
 import { Canvas, useLoader } from '@react-three/fiber/webgpu'
@@ -23,6 +23,15 @@ const CompressedSphere = ({ url, onResult }: { url: string; onResult: (result: E
   const texture = useGputex(url, { hint: 'color', colorSpace: 'srgb' }, (_tex, result) => {
     if (result) onResult(result)
   })
+
+  useEffect(() => {
+    return () => {
+      const tex = Array.isArray(texture) ? texture[0] : texture
+      tex?.dispose()
+      useGputex.clear(url)
+    }
+  }, [texture, url])
+
   return <Sphere texture={texture as Texture | CompressedTexture} />
 }
 
@@ -33,6 +42,14 @@ const OriginalSphere = ({ url }: { url: string }) => {
   texture.minFilter = LinearFilter
   texture.magFilter = LinearFilter
   texture.generateMipmaps = false
+
+  useEffect(() => {
+    return () => {
+      texture.dispose()
+      useLoader.clear(TextureLoader, url)
+    }
+  }, [texture, url])
+
   return <Sphere texture={texture} />
 }
 
@@ -44,15 +61,25 @@ const IndexPage = () => {
   const [useCompressed, setUseCompressed] = useState(true)
   const [encoding, setEncoding] = useState(false)
 
-  const onFileDrop = useCallback((droppedFile: File) => {
-    setFile(droppedFile)
-    setResult(null)
-    setEncoding(true)
-    setBlobUrl(URL.createObjectURL(droppedFile))
-    const reader = new FileReader()
-    reader.onload = () => setDataUrl(reader.result as string)
-    reader.readAsDataURL(droppedFile)
-  }, [])
+  const onFileDrop = useCallback(
+    (droppedFile: File) => {
+      // Dispose previous textures before loading a new file
+      if (dataUrl) useGputex.clear(dataUrl)
+      if (blobUrl) {
+        useLoader.clear(TextureLoader, blobUrl)
+        URL.revokeObjectURL(blobUrl)
+      }
+
+      setFile(droppedFile)
+      setResult(null)
+      setEncoding(true)
+      setBlobUrl(URL.createObjectURL(droppedFile))
+      const reader = new FileReader()
+      reader.onload = () => setDataUrl(reader.result as string)
+      reader.readAsDataURL(droppedFile)
+    },
+    [dataUrl, blobUrl],
+  )
 
   const handleResult = useCallback((r: EncodeInfo) => {
     setResult(r)
