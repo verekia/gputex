@@ -24,6 +24,8 @@ import {
   RepeatWrapping,
 } from 'three'
 
+import { uploadSourceTexture } from './workarounds.js'
+
 import type { CompressedTextureMipmap, CompressedPixelFormat } from 'three'
 
 /**
@@ -273,9 +275,11 @@ export abstract class Encoder {
       label: `${this.label}-src`,
       size: [paddedWidth, paddedHeight, 1],
       format: 'rgba8unorm',
+      // RENDER_ATTACHMENT is required by copyExternalImageToTexture
+      // (internally a blit) even though we never render into this texture.
       usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
     })
-    device.queue.copyExternalImageToTexture({ source, flipY }, { texture: srcTex }, [width, height, 1])
+    uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
 
     // 2. Output storage buffer.
     const dstBuffer = device.createBuffer({

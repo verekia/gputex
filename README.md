@@ -158,9 +158,9 @@ encoder.destroy()
 - `texture-compression-bc` (desktop) or `texture-compression-astc` (mobile) for compressed output
 - Falls back to uncompressed RGBA8 when neither is available
 
-## Known issues
+## Device-specific workarounds
 
-- Black texture on Google Pixel 10
+- Black texture on Google Pixel 10: `copyExternalImageToTexture` produces black textures on the Pixel 10's PowerVR DXT GPU (vendor `img-tec`, architecture `d-series`). Worked around by uploading via `writeTexture` with rasterised pixel data instead.
 
 ## Acknowledgements
 

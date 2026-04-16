@@ -21,6 +21,7 @@ import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Tex
 import { Encoder } from './Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
 import { selectFormat, type TextureHint } from './selectFormat.js'
+import { needsWriteTextureWorkaround } from './workarounds.js'
 
 import type { CompressedTexture } from 'three'
 
@@ -279,8 +280,17 @@ export async function compressTexture(
   }
 
   try {
+    const needsWriteTexture = needsWriteTextureWorkaround(adapter)
+
     if (!mipmaps) {
-      const bytes = await encoder.encodeToBytes(bitmap, { flipY })
+      let bytes
+      if (needsWriteTexture) {
+        const level0 = bitmapToMipLevel(bitmap, flipY)
+        const imageData = mipLevelToImageData(level0)
+        bytes = await encoder.encodeToBytes(imageData)
+      } else {
+        bytes = await encoder.encodeToBytes(bitmap, { flipY })
+      }
       const tex = encoder.buildMippedTexture([bytes], { colorSpace })
       return {
         texture: tex,
