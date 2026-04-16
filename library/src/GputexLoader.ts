@@ -5,7 +5,7 @@
 // already uses `TextureLoader` or similar can drop this in with the
 // identical call shape:
 //
-//   const loader = new WebGPUCompressedTextureLoader()
+//   const loader = new GputexLoader()
 //   loader.hint = 'normal'
 //   loader.mipmaps = true
 //   const tex = await loader.loadAsync('/normal.png')
@@ -23,7 +23,7 @@ import type { Texture } from 'three'
 
 import type { TextureHint } from './selectFormat.js'
 
-export class WebGPUCompressedTextureLoader extends Loader<Texture> {
+export class GputexLoader extends Loader<Texture> {
   /** Format-selection hint. Default 'color'. */
   hint: TextureHint = 'color'
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */

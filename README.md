@@ -43,12 +43,12 @@ const { texture, format } = await compressTexture('/cobblestone.avif', {
 material.map = texture
 ```
 
-### `WebGPUCompressedTextureLoader` — Three.js Loader
+### `GputexLoader` — Three.js Loader
 
 ```ts
-import { WebGPUCompressedTextureLoader } from 'gputex'
+import { GputexLoader } from 'gputex'
 
-const loader = new WebGPUCompressedTextureLoader()
+const loader = new GputexLoader()
 loader.hint = 'normal'
 loader.mipmaps = true
 const normalMap = await loader.loadAsync('/brick_normal.png')
@@ -57,14 +57,14 @@ material.normalMap = normalMap
 
 ### React Three Fiber
 
-The `WebGPUCompressedTextureLoader` works with R3F's `useLoader`:
+The `GputexLoader` works with R3F's `useLoader`:
 
 ```tsx
 import { useLoader } from '@react-three/fiber'
-import { WebGPUCompressedTextureLoader } from 'gputex'
+import { GputexLoader } from 'gputex'
 
 function Scene() {
-  const texture = useLoader(WebGPUCompressedTextureLoader, '/cobblestone.avif', loader => {
+  const texture = useLoader(GputexLoader, '/cobblestone.avif', loader => {
     loader.hint = 'color'
     loader.colorSpace = 'srgb'
     loader.mipmaps = true
@@ -84,11 +84,11 @@ For a reusable hook with metadata access:
 ```tsx
 import { useLayoutEffect } from 'react'
 import { useLoader } from '@react-three/fiber'
-import { WebGPUCompressedTextureLoader } from 'gputex'
+import { GputexLoader } from 'gputex'
 import type { TextureHint } from 'gputex'
 
 function useGputex(url: string, options?: { hint?: TextureHint; colorSpace?: 'srgb' | 'linear'; mipmaps?: boolean }) {
-  const texture = useLoader(WebGPUCompressedTextureLoader, url, loader => {
+  const texture = useLoader(GputexLoader, url, loader => {
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
     if (options?.mipmaps !== undefined) loader.mipmaps = options.mipmaps
@@ -102,7 +102,7 @@ useGputex.preload = (
   url: string,
   options?: { hint?: TextureHint; colorSpace?: 'srgb' | 'linear'; mipmaps?: boolean },
 ) => {
-  useLoader.preload(WebGPUCompressedTextureLoader, url, loader => {
+  useLoader.preload(GputexLoader, url, loader => {
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
     if (options?.mipmaps !== undefined) loader.mipmaps = options.mipmaps

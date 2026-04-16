@@ -1,7 +1,7 @@
 // Public entry point for the encoder package.
 //
 // Two surfaces:
-//   • High-level — `compressTexture()` + `WebGPUCompressedTextureLoader`
+//   • High-level — `compressTexture()` + `GputexLoader`
 //     for drop-in use in Three.js apps.
 //   • Low-level  — the individual `*Encoder` classes and capability /
 //     format utilities for callers that want direct control.
@@ -37,7 +37,7 @@ export {
   type CompressOptions,
   type CompressResult,
 } from './compressTexture.js'
-export { WebGPUCompressedTextureLoader } from './CompressedTextureLoader.js'
+export { GputexLoader } from './GputexLoader.js'
 
 // Mip-chain helpers (exported so callers can pre-generate a chain once
 // and feed it into `Encoder.encodeToBytes` themselves if they want

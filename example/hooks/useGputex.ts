@@ -1,6 +1,6 @@
 import { useLayoutEffect } from 'react'
 
-import { WebGPUCompressedTextureLoader } from 'gputex'
+import { GputexLoader } from 'gputex'
 import type { TextureHint } from 'gputex'
 
 import { useLoader } from '@react-three/fiber'
@@ -30,7 +30,7 @@ export function useGputex(
   options?: UseGputexOptions,
   onLoad?: (texture: Texture | Texture[], result: EncodeInfo | null) => void,
 ): Texture | Texture[] {
-  const textures = useLoader(WebGPUCompressedTextureLoader, url, loader => {
+  const textures = useLoader(GputexLoader, url, loader => {
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
     if (options?.flipY !== undefined) loader.flipY = options.flipY
@@ -47,7 +47,7 @@ export function useGputex(
 }
 
 useGputex.preload = (url: string | string[], options?: UseGputexOptions) => {
-  useLoader.preload(WebGPUCompressedTextureLoader, url, loader => {
+  useLoader.preload(GputexLoader, url, loader => {
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
     if (options?.flipY !== undefined) loader.flipY = options.flipY
@@ -56,5 +56,5 @@ useGputex.preload = (url: string | string[], options?: UseGputexOptions) => {
 }
 
 useGputex.clear = (url: string | string[]) => {
-  useLoader.clear(WebGPUCompressedTextureLoader, url)
+  useLoader.clear(GputexLoader, url)
 }
