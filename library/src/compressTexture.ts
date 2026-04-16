@@ -279,13 +279,20 @@ export async function compressTexture(
   }
 
   try {
+    // copyExternalImageToTexture produces black textures on some Mali
+    // drivers (Pixel 10 / G925). On those GPUs, rasterise to CPU pixels
+    // and upload via writeTexture instead.
+    const needsWriteTexture = adapter.info?.architecture?.includes('Mali')
+
     if (!mipmaps) {
-      // Rasterise to CPU pixels and pass ImageData so encodeToBytes uses
-      // writeTexture instead of copyExternalImageToTexture — the latter
-      // produces black textures on some Mali drivers (Pixel 10 / G925).
-      const level0 = bitmapToMipLevel(bitmap, flipY)
-      const imageData = mipLevelToImageData(level0)
-      const bytes = await encoder.encodeToBytes(imageData)
+      let bytes
+      if (needsWriteTexture) {
+        const level0 = bitmapToMipLevel(bitmap, flipY)
+        const imageData = mipLevelToImageData(level0)
+        bytes = await encoder.encodeToBytes(imageData)
+      } else {
+        bytes = await encoder.encodeToBytes(bitmap, { flipY })
+      }
       const tex = encoder.buildMippedTexture([bytes], { colorSpace })
       return {
         texture: tex,
