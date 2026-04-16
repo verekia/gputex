@@ -275,7 +275,9 @@ export abstract class Encoder {
       label: `${this.label}-src`,
       size: [paddedWidth, paddedHeight, 1],
       format: 'rgba8unorm',
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      // RENDER_ATTACHMENT is required by copyExternalImageToTexture
+      // (internally a blit) even though we never render into this texture.
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
     })
     uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
 
