@@ -25,9 +25,40 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
 
   useEffect(() => {
     const probe = async () => {
-      if (!('gpu' in navigator)) return
+      if (!('gpu' in navigator)) {
+        console.log('[GPUtex] WebGPU not available')
+        return
+      }
       const adapter = await navigator.gpu.requestAdapter()
-      if (!adapter) return
+      if (!adapter) {
+        console.log('[GPUtex] No GPU adapter found')
+        return
+      }
+
+      const info = adapter.info
+      console.log('[GPUtex] GPU Adapter Info:', {
+        vendor: info.vendor,
+        architecture: info.architecture,
+        device: info.device,
+        description: info.description,
+      })
+      console.log('[GPUtex] GPU Features:', [...adapter.features].sort().join(', '))
+      console.log('[GPUtex] GPU Limits:', {
+        maxTextureDimension2D: adapter.limits.maxTextureDimension2D,
+        maxBufferSize: adapter.limits.maxBufferSize,
+        maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+        maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
+        maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+      })
+      if ('userAgentData' in navigator) {
+        const ua = (navigator as any).userAgentData
+        console.log('[GPUtex] User Agent Data:', {
+          platform: ua?.platform,
+          mobile: ua?.mobile,
+          brands: ua?.brands,
+        })
+      }
+
       setCaps(detectCapabilities(adapter))
     }
     probe()
