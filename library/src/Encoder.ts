@@ -273,9 +273,15 @@ export abstract class Encoder {
       label: `${this.label}-src`,
       size: [paddedWidth, paddedHeight, 1],
       format: 'rgba8unorm',
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
     })
-    device.queue.copyExternalImageToTexture({ source, flipY }, { texture: srcTex }, [width, height, 1])
+    // Prefer writeTexture for ImageData — bypasses copyExternalImageToTexture
+    // which produces black textures on some Mali drivers (Pixel 10 / G925).
+    if (source instanceof ImageData) {
+      device.queue.writeTexture({ texture: srcTex }, source.data, { bytesPerRow: width * 4 }, [width, height, 1])
+    } else {
+      device.queue.copyExternalImageToTexture({ source, flipY }, { texture: srcTex }, [width, height, 1])
+    }
 
     // 2. Output storage buffer.
     const dstBuffer = device.createBuffer({

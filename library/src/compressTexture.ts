@@ -280,7 +280,12 @@ export async function compressTexture(
 
   try {
     if (!mipmaps) {
-      const bytes = await encoder.encodeToBytes(bitmap, { flipY })
+      // Rasterise to CPU pixels and pass ImageData so encodeToBytes uses
+      // writeTexture instead of copyExternalImageToTexture — the latter
+      // produces black textures on some Mali drivers (Pixel 10 / G925).
+      const level0 = bitmapToMipLevel(bitmap, flipY)
+      const imageData = mipLevelToImageData(level0)
+      const bytes = await encoder.encodeToBytes(imageData)
       const tex = encoder.buildMippedTexture([bytes], { colorSpace })
       return {
         texture: tex,
