@@ -1,0 +1,40 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "printWidth": 120,
+  "tabWidth": 2,
+  "useTabs": false,
+  "semi": false,
+  "singleQuote": true,
+  "trailingComma": "all",
+  "arrowParens": "avoid",
+  "bracketSpacing": true,
+  "experimentalSortImports": {
+    "customGroups": [
+      {
+        "groupName": "react",
+        "elementNamePattern": ["react"]
+      },
+      {
+        "groupName": "workspace",
+        "elementNamePattern": ["gputex"]
+      },
+      {
+        "groupName": "local",
+        "elementNamePattern": ["#/"]
+      }
+    ],
+    "groups": [
+      ["react"],
+      ["workspace"],
+      ["side-effect", "builtin", "external"],
+      ["local"],
+      ["parent", "sibling", "index"],
+      ["type-external"],
+      ["type-parent", "type-sibling", "type-index"]
+    ],
+    "newlinesBetween": true,
+    "ignoreCase": true
+  },
+  "experimentalTailwindcss": {},
+  "ignorePatterns": ["node_modules", "dist", "out", ".next"]
+}

@@ -1,0 +1,108 @@
+diff --git a/index.mjs b/index.mjs
+index 34a8a888b6e0a5f11d87aef5360308e415ede603..04985f639d08bce2adfd030948a8c99fc958e7f5 100644
+--- a/index.mjs
++++ b/index.mjs
+@@ -2,7 +2,7 @@ import * as React from 'react';
+ import { forwardRef, useImperativeHandle, useMemo, useEffect, useCallback, useRef, useLayoutEffect, useState, Fragment, createContext, useContext, Suspense } from 'react';
+ import { useThree, useFrame, extend, createPortal, applyProps, useInstanceHandle, context as context$9, useLoader, addEffect, addAfterEffect } from '@react-three/fiber';
+ import * as THREE from 'three';
+-import { REVISION, WebGLRenderTarget, Frustum, Matrix4, Vector3, Vector4, Vector2, Color, InstancedInterleavedBuffer, InterleavedBufferAttribute, Object3D, WebGLCubeRenderTarget, HalfFloatType, CubeCamera as CubeCamera$1, EventDispatcher, Euler, Quaternion, MathUtils, TextureLoader, Texture as Texture$1, MeshLambertMaterial, DynamicDrawUsage, CatmullRomCurve3, CubicBezierCurve3, QuadraticBezierCurve3, Shape as Shape$1, CanvasTexture, DoubleSide, PerspectiveCamera as PerspectiveCamera$1, OrthographicCamera as OrthographicCamera$1, AudioListener, AudioLoader, AnimationMixer, BufferAttribute, Box3, Sphere as Sphere$1, InstancedBufferAttribute, DepthTexture, DepthFormat, UnsignedShortType, CubeTextureLoader, DefaultLoadingManager, Ray, Raycaster, Camera, CubeReflectionMapping, EquirectangularReflectionMapping, Scene, RepeatWrapping, Mesh, Spherical } from 'three';
++import { REVISION, WebGLRenderTarget, Frustum, Matrix4, Vector3, Vector4, Vector2, Color, InstancedInterleavedBuffer, InterleavedBufferAttribute, Object3D, CubeRenderTarget, HalfFloatType, CubeCamera as CubeCamera$1, EventDispatcher, Euler, Quaternion, MathUtils, TextureLoader, Texture as Texture$1, MeshLambertMaterial, DynamicDrawUsage, CatmullRomCurve3, CubicBezierCurve3, QuadraticBezierCurve3, Shape as Shape$1, CanvasTexture, DoubleSide, PerspectiveCamera as PerspectiveCamera$1, OrthographicCamera as OrthographicCamera$1, AudioListener, AudioLoader, AnimationMixer, BufferAttribute, Box3, Sphere as Sphere$1, InstancedBufferAttribute, DepthTexture, DepthFormat, UnsignedShortType, CubeTextureLoader, DefaultLoadingManager, Ray, Raycaster, Camera, CubeReflectionMapping, EquirectangularReflectionMapping, Scene, RepeatWrapping, Mesh, Spherical } from 'three';
+ import { ArcballControls as ArcballControls$1 } from 'three/examples/jsm/controls/ArcballControls.js';
+ import { useGesture } from '@use-gesture/react';
+ import { FirstPersonControls as FirstPersonControls$1 } from 'three/examples/jsm/controls/FirstPersonControls.js';
+@@ -1145,7 +1145,7 @@ function useCubeCamera({ resolution = 256, near = 0.1, far = 1e3, envMap, fog }
+   const gl = useThree(({ gl: gl2 }) => gl2);
+   const scene = useThree(({ scene: scene2 }) => scene2);
+   const fbo = useMemo(() => {
+-    const fbo2 = new WebGLCubeRenderTarget(resolution);
++    const fbo2 = new CubeRenderTarget(resolution);
+     fbo2.texture.type = HalfFloatType;
+     return fbo2;
+   }, [resolution]);
+@@ -6440,7 +6440,7 @@ function Preload({ all, scene, camera }) {
+       });
+     }
+     gl.compile(scene || dScene, camera || dCamera);
+-    const cubeRenderTarget = new WebGLCubeRenderTarget(128);
++    const cubeRenderTarget = new CubeRenderTarget(128);
+     const cubeCamera = new CubeCamera$1(0.01, 1e5, cubeRenderTarget);
+     cubeCamera.update(gl, scene || dScene);
+     cubeRenderTarget.dispose();
+@@ -7078,11 +7078,11 @@ const RenderCubeTexture = /* @__PURE__ */ React.forwardRef(
+         depthBuffer,
+         generateMipmaps
+       };
+-      const fboA2 = new THREE.WebGLCubeRenderTarget(fboSize, settings);
++      const fboA2 = new CubeRenderTarget(fboSize, settings);
+       fboA2.texture.isRenderTargetTexture = !flip;
+       fboA2.texture.flipY = true;
+       fboA2.texture.type = THREE.HalfFloatType;
+-      const fboB2 = new THREE.WebGLCubeRenderTarget(fboSize, settings);
++      const fboB2 = new CubeRenderTarget(fboSize, settings);
+       fboB2.texture.isRenderTargetTexture = !flip;
+       fboB2.texture.flipY = true;
+       fboB2.texture.type = THREE.HalfFloatType;
+@@ -8100,7 +8100,7 @@ function EnvironmentPortal({
+   const camera = React.useRef(null);
+   const [virtualScene] = React.useState(() => new Scene());
+   const fbo = React.useMemo(() => {
+-    const fbo2 = new WebGLCubeRenderTarget(resolution);
++    const fbo2 = new CubeRenderTarget(resolution);
+     fbo2.texture.type = HalfFloatType;
+     return fbo2;
+   }, [resolution]);
+diff --git a/webgpu/index.mjs b/webgpu/index.mjs
+index 265237b344dcfbec0670881af532f2e8af6730ea..bcb62cc30a8ebc964c2847c468fe81fb9fa17666 100644
+--- a/webgpu/index.mjs
++++ b/webgpu/index.mjs
+@@ -2,7 +2,7 @@ import * as React from 'react';
+ import { forwardRef, useImperativeHandle, useMemo, useEffect, useCallback, useRef, useLayoutEffect, useState, Fragment, createContext, useContext } from 'react';
+ import { useThree, useFrame, extend, createPortal, applyProps, useInstanceHandle, context as context$a, useLoader, addEffect, addAfterEffect } from '@react-three/fiber';
+ import * as THREE from 'three/webgpu';
+-import { MeshBasicNodeMaterial, RenderTarget, MeshNormalNodeMaterial, QuadMesh, MeshPhysicalNodeMaterial, Frustum, Matrix4, Line2NodeMaterial, Vector3, Vector4, Vector2, Color, InstancedInterleavedBuffer, InterleavedBufferAttribute, Object3D, WebGLCubeRenderTarget, HalfFloatType, CubeCamera as CubeCamera$1, EventDispatcher, Euler, Quaternion, MathUtils, TextureLoader, Texture as Texture$1, MeshLambertMaterial, DynamicDrawUsage, CatmullRomCurve3, CubicBezierCurve3, QuadraticBezierCurve3, Shape as Shape$1, CanvasTexture, DoubleSide, PerspectiveCamera as PerspectiveCamera$1, OrthographicCamera as OrthographicCamera$1, REVISION, AudioListener, AudioLoader, AnimationMixer, BufferAttribute, Box3, Sphere as Sphere$1, InstancedBufferAttribute, DepthTexture, DepthFormat, UnsignedShortType, CubeTextureLoader, DefaultLoadingManager, Ray, Raycaster, Camera, CubeReflectionMapping, EquirectangularReflectionMapping, Scene, RepeatWrapping, SpriteNodeMaterial, AdditiveBlending, CylinderGeometry } from 'three/webgpu';
++import { MeshBasicNodeMaterial, RenderTarget, MeshNormalNodeMaterial, QuadMesh, MeshPhysicalNodeMaterial, Frustum, Matrix4, Line2NodeMaterial, Vector3, Vector4, Vector2, Color, InstancedInterleavedBuffer, InterleavedBufferAttribute, Object3D, CubeRenderTarget, HalfFloatType, CubeCamera as CubeCamera$1, EventDispatcher, Euler, Quaternion, MathUtils, TextureLoader, Texture as Texture$1, MeshLambertMaterial, DynamicDrawUsage, CatmullRomCurve3, CubicBezierCurve3, QuadraticBezierCurve3, Shape as Shape$1, CanvasTexture, DoubleSide, PerspectiveCamera as PerspectiveCamera$1, OrthographicCamera as OrthographicCamera$1, REVISION, AudioListener, AudioLoader, AnimationMixer, BufferAttribute, Box3, Sphere as Sphere$1, InstancedBufferAttribute, DepthTexture, DepthFormat, UnsignedShortType, CubeTextureLoader, DefaultLoadingManager, Ray, Raycaster, Camera, CubeReflectionMapping, EquirectangularReflectionMapping, Scene, RepeatWrapping, SpriteNodeMaterial, AdditiveBlending, CylinderGeometry } from 'three/webgpu';
+ import { ArcballControls as ArcballControls$1 } from 'three/examples/jsm/controls/ArcballControls.js';
+ import { useGesture } from '@use-gesture/react';
+ import { FirstPersonControls as FirstPersonControls$1 } from 'three/examples/jsm/controls/FirstPersonControls.js';
+@@ -2610,11 +2610,11 @@ const RenderCubeTexture = /* @__PURE__ */ React.forwardRef(
+         depthBuffer,
+         generateMipmaps
+       };
+-      const fboA2 = new THREE.WebGLCubeRenderTarget(fboSize, settings);
++      const fboA2 = new CubeRenderTarget(fboSize, settings);
+       fboA2.texture.isRenderTargetTexture = !flip;
+       fboA2.texture.flipY = true;
+       fboA2.texture.type = THREE.HalfFloatType;
+-      const fboB2 = new THREE.WebGLCubeRenderTarget(fboSize, settings);
++      const fboB2 = new CubeRenderTarget(fboSize, settings);
+       fboB2.texture.isRenderTargetTexture = !flip;
+       fboB2.texture.flipY = true;
+       fboB2.texture.type = THREE.HalfFloatType;
+@@ -3064,7 +3064,7 @@ function useCubeCamera({ resolution = 256, near = 0.1, far = 1e3, envMap, fog }
+   const gl = useThree(({ gl: gl2 }) => gl2);
+   const scene = useThree(({ scene: scene2 }) => scene2);
+   const fbo = useMemo(() => {
+-    const fbo2 = new WebGLCubeRenderTarget(resolution);
++    const fbo2 = new CubeRenderTarget(resolution);
+     fbo2.texture.type = HalfFloatType;
+     return fbo2;
+   }, [resolution]);
+@@ -8362,7 +8362,7 @@ function Preload({ all, scene, camera }) {
+       });
+     }
+     gl.compile(scene || dScene, camera || dCamera);
+-    const cubeRenderTarget = new WebGLCubeRenderTarget(128);
++    const cubeRenderTarget = new CubeRenderTarget(128);
+     const cubeCamera = new CubeCamera$1(0.01, 1e5, cubeRenderTarget);
+     cubeCamera.update(gl, scene || dScene);
+     cubeRenderTarget.dispose();
+@@ -9804,7 +9804,7 @@ function EnvironmentPortal({
+   const camera = React.useRef(null);
+   const [virtualScene] = React.useState(() => new Scene());
+   const fbo = React.useMemo(() => {
+-    const fbo2 = new WebGLCubeRenderTarget(resolution);
++    const fbo2 = new CubeRenderTarget(resolution);
+     fbo2.texture.type = HalfFloatType;
+     return fbo2;
+   }, [resolution]);

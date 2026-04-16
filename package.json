@@ -1,0 +1,34 @@
+{
+  "name": "gputex-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": [
+    "example",
+    "library"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --parallel --filter '*' dev",
+    "build": "bun run --filter '*' build",
+    "start": "bun run --filter '*' start",
+    "typecheck": "bun run --filter '*' typecheck",
+    "lint": "oxlint --quiet",
+    "lint:fix": "oxlint --fix",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "buntest": "bun test",
+    "all": "bun run lint && bun run format:check && bun run buntest && bun run typecheck",
+    "prepare": "husky",
+    "pub": "bun run --filter 'gputex' build && npm publish --workspace library"
+  },
+  "devDependencies": {
+    "husky": "9.1.7",
+    "oxfmt": "0.28.0",
+    "oxlint": "1.43.0"
+  },
+  "patchedDependencies": {
+    "detect-gpu@5.0.70": "patches/detect-gpu@5.0.70.patch",
+    "@react-three/fiber@10.0.0-canary.1b98c17": "patches/@react-three%2Ffiber@10.0.0-canary.1b98c17.patch",
+    "@react-three/drei@11.0.0-alpha.5": "patches/@react-three%2Fdrei@11.0.0-alpha.5.patch"
+  }
+}

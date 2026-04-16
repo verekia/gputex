@@ -1,0 +1,48 @@
+diff --git a/node_modules/@react-three/fiber/.bun-tag-2d8a10866dad4c44 b/.bun-tag-2d8a10866dad4c44
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 0b7936695c40382e1d79dc825e0143f5815529d8..c634934bb49e527b918c5eb6da3adc4c551caf68 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -1,7 +1,7 @@
+ import * as webgpu from 'three/webgpu';
+-import { RenderTarget, CubeReflectionMapping, EquirectangularReflectionMapping, CubeTextureLoader, Scene, WebGLCubeRenderTarget, HalfFloatType, Color, Frustum, Matrix4, Group, BoxGeometry, MeshBasicNodeMaterial, Mesh, Node, NodeUpdateType, Layers, SRGBColorSpace, RGBAFormat, UnsignedByteType, Vector3, Vector2, TextureLoader, Texture as Texture$1, CanvasTarget, Raycaster, OrthographicCamera, PerspectiveCamera, PCFShadowMap, VSMShadowMap, BasicShadowMap, ACESFilmicToneMapping, WebGPURenderer } from 'three/webgpu';
++import { RenderTarget, CubeReflectionMapping, EquirectangularReflectionMapping, CubeTextureLoader, Scene, CubeRenderTarget, HalfFloatType, Color, Frustum, Matrix4, Group, BoxGeometry, MeshBasicNodeMaterial, Mesh, Node, NodeUpdateType, Layers, SRGBColorSpace, RGBAFormat, UnsignedByteType, Vector3, Vector2, TextureLoader, Texture as Texture$1, CanvasTarget, Raycaster, OrthographicCamera, PerspectiveCamera, PCFShadowMap, VSMShadowMap, BasicShadowMap, ACESFilmicToneMapping, WebGPURenderer } from 'three/webgpu';
+ import { WebGLRenderTarget, WebGLRenderer } from 'three';
+-import { Inspector } from 'three/addons/inspector/Inspector.js';
++const Inspector = class Inspector { constructor() { throw new Error('Inspector is not available in SSR.'); } };
+ import { jsx, Fragment, jsxs } from 'react/jsx-runtime';
+ import * as React from 'react';
+ import React__default, { useLayoutEffect, useRef, useMemo, useEffect, useContext, useImperativeHandle, useCallback, useState } from 'react';
+@@ -316,7 +316,7 @@ function EnvironmentPortal({
+   const camera = React.useRef(null);
+   const [virtualScene] = React.useState(() => new Scene());
+   const fbo = React.useMemo(() => {
+-    const fbo2 = new WebGLCubeRenderTarget(resolution);
++    const fbo2 = new CubeRenderTarget(resolution);
+     fbo2.texture.type = HalfFloatType;
+     return fbo2;
+   }, [resolution]);
+diff --git a/dist/webgpu/index.mjs b/dist/webgpu/index.mjs
+index 1bab0d5b99d2f171f33e3ee521e8a9eae618481b..778e852135307bd26db77304e3ca472ce8b3cc3d 100644
+--- a/dist/webgpu/index.mjs
++++ b/dist/webgpu/index.mjs
+@@ -1,6 +1,6 @@
+ import * as webgpu from 'three/webgpu';
+-import { RenderTarget, CubeReflectionMapping, EquirectangularReflectionMapping, CubeTextureLoader, Scene, WebGLCubeRenderTarget, HalfFloatType, Color, Frustum, Matrix4, Group, BoxGeometry, MeshBasicNodeMaterial, Mesh, Node, NodeUpdateType, Layers, SRGBColorSpace, RGBAFormat, UnsignedByteType, Vector3, Vector2, TextureLoader, Texture as Texture$1, CanvasTarget, Raycaster, OrthographicCamera, PerspectiveCamera, PCFShadowMap, VSMShadowMap, BasicShadowMap, ACESFilmicToneMapping, WebGPURenderer, Vector4, PostProcessing } from 'three/webgpu';
+-import { Inspector } from 'three/addons/inspector/Inspector.js';
++import { RenderTarget, CubeReflectionMapping, EquirectangularReflectionMapping, CubeTextureLoader, Scene, CubeRenderTarget, HalfFloatType, Color, Frustum, Matrix4, Group, BoxGeometry, MeshBasicNodeMaterial, Mesh, Node, NodeUpdateType, Layers, SRGBColorSpace, RGBAFormat, UnsignedByteType, Vector3, Vector2, TextureLoader, Texture as Texture$1, CanvasTarget, Raycaster, OrthographicCamera, PerspectiveCamera, PCFShadowMap, VSMShadowMap, BasicShadowMap, ACESFilmicToneMapping, WebGPURenderer, Vector4, PostProcessing } from 'three/webgpu';
++const Inspector = class Inspector { constructor() { throw new Error('Inspector is not available in SSR.'); } };
+ import { jsx, Fragment, jsxs } from 'react/jsx-runtime';
+ import * as React from 'react';
+ import React__default, { useLayoutEffect, useRef, useMemo, useEffect, useContext, useImperativeHandle, useCallback, useState } from 'react';
+@@ -326,7 +326,7 @@ function EnvironmentPortal({
+   const camera = React.useRef(null);
+   const [virtualScene] = React.useState(() => new Scene());
+   const fbo = React.useMemo(() => {
+-    const fbo2 = new WebGLCubeRenderTarget(resolution);
++    const fbo2 = new CubeRenderTarget(resolution);
+     fbo2.texture.type = HalfFloatType;
+     return fbo2;
+   }, [resolution]);
