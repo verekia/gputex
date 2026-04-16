@@ -158,6 +158,10 @@ encoder.destroy()
 - `texture-compression-bc` (desktop) or `texture-compression-astc` (mobile) for compressed output
 - Falls back to uncompressed RGBA8 when neither is available
 
+## Known issues
+
+- Black texture on Google Pixel 10
+
 ## Acknowledgements
 
 The concept of encoding images on the GPU on the fly via compute shaders was first introduced by [spark.js](https://ludicon.com/sparkjs/), which is a much more robust solution for users who can afford its license. GPUtex is not derived from Spark and its encoders have been implemented from scratch using official references, which have been ported to TypeScript, and then converted to WGSL via AI. For any serious production use of GPU-compressed textures, Spark is the recommended choice over GPUtex.
