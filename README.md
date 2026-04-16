@@ -160,7 +160,7 @@ encoder.destroy()
 
 ## Known issues
 
-- Black texture on Google Pixel 10: `copyExternalImageToTexture` appears broken on Mali-G925 WebGPU drivers. Worked around by uploading via `writeTexture` with rasterised pixel data instead.
+- Black texture on Google Pixel 10: `copyExternalImageToTexture` produces black textures on the Pixel 10's PowerVR DXT GPU (vendor `img-tec`, architecture `d-series`). Worked around by uploading via `writeTexture` with rasterised pixel data instead.
 
 ## Acknowledgements
 

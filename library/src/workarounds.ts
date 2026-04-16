@@ -1,15 +1,19 @@
 // Device-specific workarounds.
 //
-// copyExternalImageToTexture produces black textures on some Mali
-// drivers (Pixel 10 / Mali-G925). On those GPUs we rasterise to CPU
-// pixels and upload via writeTexture instead.
+// copyExternalImageToTexture produces black textures on Pixel 10
+// (Imagination Technologies "img-tec" / "d-series" PowerVR DXT GPU).
+// On those GPUs we rasterise to CPU pixels and upload via writeTexture
+// instead.
 
 /**
  * Returns true when the adapter's GPU is known to have a broken
  * `copyExternalImageToTexture` implementation.
+ *
+ * Pixel 10 reports: vendor "img-tec", architecture "d-series".
  */
 export function needsWriteTextureWorkaround(adapter: GPUAdapter): boolean {
-  return adapter.info?.architecture?.includes('Mali') ?? false
+  const { vendor, architecture } = adapter.info ?? {}
+  return vendor === 'img-tec' && architecture === 'd-series'
 }
 
 /**
