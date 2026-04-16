@@ -21,6 +21,7 @@ import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Tex
 import { Encoder } from './Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
 import { selectFormat, type TextureHint } from './selectFormat.js'
+import { needsWriteTextureWorkaround } from './workarounds.js'
 
 import type { CompressedTexture } from 'three'
 
@@ -279,10 +280,7 @@ export async function compressTexture(
   }
 
   try {
-    // copyExternalImageToTexture produces black textures on some Mali
-    // drivers (Pixel 10 / G925). On those GPUs, rasterise to CPU pixels
-    // and upload via writeTexture instead.
-    const needsWriteTexture = adapter.info?.architecture?.includes('Mali')
+    const needsWriteTexture = needsWriteTextureWorkaround(adapter)
 
     if (!mipmaps) {
       let bytes

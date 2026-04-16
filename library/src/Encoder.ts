@@ -24,6 +24,8 @@ import {
   RepeatWrapping,
 } from 'three'
 
+import { uploadSourceTexture } from './workarounds.js'
+
 import type { CompressedTextureMipmap, CompressedPixelFormat } from 'three'
 
 /**
@@ -275,13 +277,7 @@ export abstract class Encoder {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
     })
-    // Prefer writeTexture for ImageData — bypasses copyExternalImageToTexture
-    // which produces black textures on some Mali drivers (Pixel 10 / G925).
-    if (source instanceof ImageData) {
-      device.queue.writeTexture({ texture: srcTex }, source.data, { bytesPerRow: width * 4 }, [width, height, 1])
-    } else {
-      device.queue.copyExternalImageToTexture({ source, flipY }, { texture: srcTex }, [width, height, 1])
-    }
+    uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
 
     // 2. Output storage buffer.
     const dstBuffer = device.createBuffer({
