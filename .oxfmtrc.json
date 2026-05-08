@@ -35,6 +35,6 @@
     "newlinesBetween": true,
     "ignoreCase": true
   },
-  "sortTailwindcss": {},
+  "sortTailwindcss": true,
   "ignorePatterns": ["node_modules", "dist", "out", ".next"]
 }
