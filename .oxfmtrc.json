@@ -8,7 +8,7 @@
   "trailingComma": "all",
   "arrowParens": "avoid",
   "bracketSpacing": true,
-  "experimentalSortImports": {
+  "sortImports": {
     "customGroups": [
       {
         "groupName": "react",
@@ -26,7 +26,7 @@
     "groups": [
       ["react"],
       ["workspace"],
-      ["side-effect", "builtin", "external"],
+      ["side_effect", "builtin", "external"],
       ["local"],
       ["parent", "sibling", "index"],
       ["type-external"],
@@ -35,6 +35,6 @@
     "newlinesBetween": true,
     "ignoreCase": true
   },
-  "experimentalTailwindcss": {},
+  "sortTailwindcss": {},
   "ignorePatterns": ["node_modules", "dist", "out", ".next"]
 }
