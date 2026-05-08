@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "dev": "next dev",
+    "dev": "portless gputex next dev",
     "build": "next build",
     "start": "serve out",
     "typecheck": "tsc --noEmit"
@@ -27,6 +27,7 @@
     "@types/three": "0.183.1",
     "@webgpu/types": "0.1.69",
     "next": "16.1.2",
+    "portless": "0.13.0",
     "postcss": "8.5.6",
     "serve": "14.2.5",
     "tailwindcss": "4.1.18",
