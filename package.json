@@ -11,20 +11,20 @@
     "dev": "bun run --parallel --filter '*' dev",
     "build": "bun run --filter '*' build",
     "start": "bun run --filter '*' start",
-    "typecheck": "bun run --filter '*' typecheck",
-    "lint": "oxlint --quiet",
-    "lint:fix": "oxlint --fix",
-    "format": "oxfmt --write .",
+    "typecheck": "tsc -b --noEmit",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint --fix .",
+    "format": "oxfmt .",
     "format:check": "oxfmt --check .",
-    "buntest": "bun test",
-    "all": "bun run lint && bun run format:check && bun run buntest && bun run typecheck",
+    "test": "bun test",
+    "all": "bun run format:check && bun run lint && bun run typecheck && bun run test",
     "prepare": "husky",
     "pub": "bun run --filter 'gputex' build && npm publish --workspace library"
   },
   "devDependencies": {
     "husky": "9.1.7",
-    "oxfmt": "0.28.0",
-    "oxlint": "1.43.0"
+    "oxfmt": "0.48.0",
+    "oxlint": "1.63.0"
   },
   "patchedDependencies": {
     "detect-gpu@5.0.70": "patches/detect-gpu@5.0.70.patch",
