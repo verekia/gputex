@@ -26,6 +26,7 @@
     "@types/react-dom": "19.2.3",
     "@types/three": "0.183.1",
     "@webgpu/types": "0.1.69",
+    "babel-plugin-react-compiler": "1.0.0",
     "next": "16.1.2",
     "portless": "0.13.0",
     "postcss": "8.5.6",
