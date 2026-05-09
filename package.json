@@ -11,17 +11,19 @@
     "dev": "bun run --parallel --filter '*' dev",
     "build": "bun run --filter '*' build",
     "start": "bun run --filter '*' start",
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "bun run --filter '*' typecheck",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
     "format": "oxfmt .",
     "format:check": "oxfmt --check .",
     "test": "bun test",
-    "all": "bun run format:check && bun run lint && bun run typecheck && bun run test",
+    "warden": "warden",
+    "all": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run warden",
     "prepare": "husky",
     "pub": "bun run --filter 'gputex' build && npm publish --workspace library"
   },
   "devDependencies": {
+    "@verekia/warden": "0.0.2",
     "husky": "9.1.7",
     "oxfmt": "0.48.0",
     "oxlint": "1.63.0"
@@ -30,5 +32,14 @@
     "detect-gpu@5.0.70": "patches/detect-gpu@5.0.70.patch",
     "@react-three/fiber@10.0.0-canary.1b98c17": "patches/@react-three%2Ffiber@10.0.0-canary.1b98c17.patch",
     "@react-three/drei@11.0.0-alpha.5": "patches/@react-three%2Fdrei@11.0.0-alpha.5.patch"
+  },
+  "warden": {
+    "checks": {
+      "typecheckScript": {
+        "modes": {
+          "gputex": "bun-filter-all"
+        }
+      }
+    }
   }
 }

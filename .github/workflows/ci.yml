@@ -26,4 +26,4 @@ jobs:
         run: bun run build
 
       - name: Run all checks
-        run: bun all
+        run: bun run all
