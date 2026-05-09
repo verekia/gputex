@@ -18,7 +18,7 @@
     "format:check": "oxfmt --check .",
     "test": "bun test",
     "warden": "warden",
-    "all": "bun run format:check && bun run lint && bun run typecheck && bun run test && bun run warden",
+    "all": "bun run format:check && bun run lint && bun run typecheck && bun run warden && bun run test",
     "prepare": "husky",
     "pub": "bun run --filter 'gputex' build && npm publish --workspace library"
   },
