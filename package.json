@@ -11,7 +11,7 @@
     "dev": "bun run --parallel --filter '*' dev",
     "build": "bun run --filter '*' build",
     "start": "bun run --filter '*' start",
-    "typecheck": "bun run --filter '*' typecheck",
+    "typecheck": "tsc -b --noEmit",
     "lint": "oxlint .",
     "lint:fix": "oxlint --fix .",
     "format": "oxfmt .",
@@ -32,14 +32,5 @@
     "detect-gpu@5.0.70": "patches/detect-gpu@5.0.70.patch",
     "@react-three/fiber@10.0.0-canary.1b98c17": "patches/@react-three%2Ffiber@10.0.0-canary.1b98c17.patch",
     "@react-three/drei@11.0.0-alpha.5": "patches/@react-three%2Fdrei@11.0.0-alpha.5.patch"
-  },
-  "warden": {
-    "checks": {
-      "typecheckScript": {
-        "modes": {
-          "gputex": "bun-filter-all"
-        }
-      }
-    }
   }
 }
