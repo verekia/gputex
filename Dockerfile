@@ -18,7 +18,7 @@ RUN bun run build
 
 # Production stage
 
-FROM fholzer/nginx-brotli:v1.26.2
+FROM verekia/nginx-brotli:1.30.0
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
