@@ -23,10 +23,11 @@
     "pub": "bun run --filter 'gputex' build && npm publish --workspace library"
   },
   "devDependencies": {
-    "@verekia/warden": "0.0.2",
+    "@verekia/warden": "0.0.4",
     "husky": "9.1.7",
     "oxfmt": "0.48.0",
-    "oxlint": "1.63.0"
+    "oxlint": "1.63.0",
+    "typescript": "6.0.3"
   },
   "patchedDependencies": {
     "detect-gpu@5.0.70": "patches/detect-gpu@5.0.70.patch",

@@ -21,7 +21,9 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false,
-    "incremental": false
+    "incremental": false,
+    // tsup's dts build injects a deprecated `baseUrl` internally
+    "ignoreDeprecations": "6.0"
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
