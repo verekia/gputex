@@ -4,35 +4,26 @@
 // buffer at `dst[block_index * 4 .. + 3]`.
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): the shared p-bit for each endpoint is chosen by minimum
-//     quantisation error (O(1)), then a single full 16-entry nearest-search
-//     assignment is run. Profiling on real hardware showed the exhaustive
-//     4-combo p-bit search below costs > half the kernel yet improves PSNR by
-//     only ~0.1 dB — so it is off by default. ~2.6× faster.
-//   high (1): the original exhaustive search over all four (p0,p1) ∈ {0,1}²
-//     combinations, byte-for-byte identical to bc7_ref.ts.
-// Both levels keep the one-pass LSQ endpoint refit (worth ~1.3 dB).
+//   fast (0, default): O(N) bounding-box seed → endpoints fitted by a single
+//     least-squares pass whose normal-equation sums are accumulated *during* a
+//     projection-based index assignment. The 16 palette entries are colinear
+//     (pal[i] = lerp(e0,e1,w[i])), so the nearest index is found by projecting
+//     each pixel onto the endpoint line — O(1) per pixel, no palette build and
+//     no 16-entry search. Profiled ~20× faster than `high` for ~0.4 dB PSNR.
+//   high (1): farthest-pair seed, exhaustive p-bit search over all four
+//     (p0,p1) ∈ {0,1}² combos, full 16-entry nearest search, one LSQ refit —
+//     byte-for-byte identical to bc7_ref.ts.
 //
-// The 16-entry nearest search, palette interpolation and quantisation all run
-// in the i32 domain (palette built once per combo as i32) so the hot loop is
-// pure integer math with no per-comparison type conversions.
+// Both paths run in the i32 domain. The fast path's branch is selected at
+// pipeline-compile time, so the driver eliminates the unused (high) code.
 //
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
 //   bits 0..6    mode field      (0b0000001 — only bit 6 is 1)
-//   bits 7..13   R0 (7-bit)
-//   bits 14..20  R1
-//   bits 21..27  G0
-//   bits 28..34  G1          ← straddles the word 0 / word 1 boundary
-//   bits 35..41  B0
-//   bits 42..48  B1
-//   bits 49..55  A0
-//   bits 56..62  A1
-//   bit  63      P0 (shared p-bit for endpoint 0)
-//   bit  64      P1
+//   bits 7..13   R0 (7-bit)   bits 14..20 R1   bits 21..27 G0   bits 28..34 G1
+//   bits 35..41  B0   bits 42..48 B1   bits 49..55 A0   bits 56..62 A1
+//   bit  63      P0   bit 64 P1
 //   bits 65..67  pixel 0 index (3 bits; anchor, MSB implicit 0)
-//   bits 68..71  pixel 1 index (4 bits)
-//   ...
-//   bits 124..127 pixel 15 index
+//   bits 68..71  pixel 1 index (4 bits) ... bits 124..127 pixel 15 index
 //
 // Effective 8-bit endpoint channel = (7_bit_value << 1) | p_bit.
 // Palette[i] = ((64 − W4[i]) × e0_8 + W4[i] × e1_8 + 32) >> 6, integer.
@@ -51,8 +42,7 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-// Mode 6 interpolation weights (× 1/64), fixed by the spec. Same table as
-// the CPU reference (`W4` in bc7_ref.ts).
+// Mode 6 interpolation weights (× 1/64), fixed by the spec (`W4` in bc7_ref.ts).
 fn w4(i: u32) -> u32 {
   switch i {
     case 0u:  { return  0u; }
@@ -74,31 +64,88 @@ fn w4(i: u32) -> u32 {
   }
 }
 
-// Hardware-exact integer interpolation, all four channels at once. Operands are
-// in [0,255] so the result is in [0,255] and stays non-negative.
 fn interp4(e0: vec4<i32>, e1: vec4<i32>, w: i32) -> vec4<i32> {
   return ((64 - w) * e0 + w * e1 + vec4<i32>(32)) >> vec4<u32>(6u);
 }
 
-// f32-normalised [0,1] → clamped 8-bit, all four channels at once.
 fn to8(v: vec4<f32>) -> vec4<i32> {
   return vec4<i32>(clamp(floor(v * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
 }
 
-// 4-channel L2 distance squared in the i32 domain (≤ 4 · 255² = 260 100).
 fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
   let d = a - b;
   let e = d * d;
   return e.x + e.y + e.z + e.w;
 }
 
-// -------------------------- Farthest-pair seed -------------------------- //
+// Quantize an 8-bit ideal endpoint to (7-bit value, reconstructed 8-bit) under
+// a fixed p-bit, all four channels at once. q7 = round((ideal8 − p)/2); used by
+// both paths.
+struct QuantPair { seven: vec4<i32>, eight: vec4<i32> };
+fn quantize_endpoint(ideal8: vec4<i32>, p: u32) -> QuantPair {
+  let q = vec4<i32>(clamp(
+    floor((vec4<f32>(ideal8) - f32(p)) / 2.0 + 0.5),
+    vec4<f32>(0.0), vec4<f32>(127.0),
+  ));
+  let eff = (q << vec4<u32>(1u)) | vec4<i32>(i32(p));
+  return QuantPair(q, eff);
+}
+
+// ============================ FAST PATH ================================ //
+
+// Endpoint with its chosen p-bit, picked by minimum quantisation error.
+struct Ep { seven: vec4<i32>, eight: vec4<i32>, p: u32 };
+fn pick_ep(ideal: vec4<i32>) -> Ep {
+  let a = quantize_endpoint(ideal, 0u);
+  let b = quantize_endpoint(ideal, 1u);
+  if (dist2(b.eight, ideal) < dist2(a.eight, ideal)) { return Ep(b.seven, b.eight, 1u); }
+  return Ep(a.seven, a.eight, 0u);
+}
+
+// Projection index assignment. The palette is colinear, so the nearest entry is
+// found by projecting onto the endpoint line — O(1) per pixel. When `fit`, the
+// LSQ normal-equation sums are accumulated in the same pass for a fused refit
+// (uniform weight i/15 — within a fraction of a code of the exact w4 table).
+struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
+fn proj_assign(
+  pixels: ptr<function, array<vec4<i32>, 16>>,
+  e0: vec4<i32>, e1: vec4<i32>,
+  out_idx: ptr<function, array<u32, 16>>,
+  fit: bool,
+) -> Fit {
+  var out: Fit;
+  let dir = e1 - e0;
+  let dd = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z + dir.w * dir.w;
+  if (dd == 0) {
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) { (*out_idx)[k] = 0u; }
+    out.valid = false;
+    return out;
+  }
+  let inv = 15.0 / f32(dd);
+  var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
+  var sAV: vec4<f32> = vec4<f32>(0.0); var sBV: vec4<f32> = vec4<f32>(0.0);
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let q = (*pixels)[k] - e0;
+    let s = clamp(floor(f32(q.x * dir.x + q.y * dir.y + q.z * dir.z + q.w * dir.w) * inv + 0.5), 0.0, 15.0);
+    (*out_idx)[k] = u32(s);
+    if (fit) {
+      let v = vec4<f32>((*pixels)[k]);
+      let b = s / 15.0; let a = 1.0 - b;
+      sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b; sAV = sAV + a * v; sBV = sBV + b * v;
+    }
+  }
+  if (!fit) { out.valid = false; return out; }
+  let det = sAA * sBB - sAB * sAB;
+  if (abs(det) < 1e-9) { out.valid = false; return out; }
+  out.e0 = vec4<i32>(clamp(round((sBB * sAV - sAB * sBV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
+  out.e1 = vec4<i32>(clamp(round((sAA * sBV - sAB * sAV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
+  out.valid = true;
+  return out;
+}
+
+// ============================ HIGH PATH ================================ //
 
 struct Pair { a: vec4<i32>, b: vec4<i32> };
-
-// O(N²) = 120 comparisons returning the two most distant pixel *values*.
-// See bc7_ref.ts `farthestPair` for why bbox corners aren't safe initial
-// endpoints when channels vary in different directions along the data line.
 fn farthest_pair(pixels: ptr<function, array<vec4<i32>, 16>>) -> Pair {
   var best_d: i32 = 0;
   var pa = (*pixels)[0];
@@ -113,17 +160,12 @@ fn farthest_pair(pixels: ptr<function, array<vec4<i32>, 16>>) -> Pair {
   return Pair(pa, pb);
 }
 
-// -------------------------- Palette + assignment ------------------------ //
-
-// Build the 16-entry RGBA palette (i32 domain) from 8-bit endpoints.
 fn build_palette_6(e0: vec4<i32>, e1: vec4<i32>, pal: ptr<function, array<vec4<i32>, 16>>) {
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     (*pal)[i] = interp4(e0, e1, i32(w4(i)));
   }
 }
 
-// Assign all 16 pixels to their nearest palette entry (full 16-entry L2),
-// writing indices into `out_idx` and returning the total squared error.
 fn assign_all(
   pixels:  ptr<function, array<vec4<i32>, 16>>,
   pal:     ptr<function, array<vec4<i32>, 16>>,
@@ -144,30 +186,6 @@ fn assign_all(
   return err;
 }
 
-// -------------------------- Endpoint quantisation ----------------------- //
-
-// Quantize an 8-bit ideal endpoint to (7-bit value, reconstructed 8-bit)
-// under a fixed p-bit, all four channels at once. Matches the CPU reference:
-// q7 = round((ideal8 − p) / 2) clamped to [0,127]; eff = (q7 << 1) | p.
-struct QuantPair { seven: vec4<i32>, eight: vec4<i32> };
-
-fn quantize_endpoint(ideal8: vec4<i32>, p: u32) -> QuantPair {
-  let q = vec4<i32>(clamp(
-    floor((vec4<f32>(ideal8) - f32(p)) / 2.0 + 0.5),
-    vec4<f32>(0.0), vec4<f32>(127.0),
-  ));
-  let eff = (q << vec4<u32>(1u)) | vec4<i32>(i32(p));
-  return QuantPair(q, eff);
-}
-
-// Squared reconstruction error of a quantised endpoint vs the ideal — used by
-// the fast path to pick each endpoint's p-bit without a reassignment.
-fn ep_err(eight: vec4<i32>, ideal: vec4<i32>) -> i32 {
-  return dist2(eight, ideal);
-}
-
-// Candidate mode-6 solution. Threaded by pointer so the p-bit search updates
-// it in place; `err` doubles as the acceptance threshold.
 struct BestMode6 {
   e0_7: vec4<i32>, e1_7: vec4<i32>,
   p0: u32,         p1: u32,
@@ -175,71 +193,37 @@ struct BestMode6 {
   err: i32,
 };
 
-// Choose endpoints/p-bits/indices for the given ideal endpoints, committing to
-// `*best` only when the error beats the incoming `(*best).err`. Two strategies,
-// selected at pipeline-compile time by QUALITY_HIGH (dead code is eliminated):
-//   high — exhaustive over all four (p0,p1) combos (matches bc7_ref.ts).
-//   fast — p-bit per endpoint by minimum quant error, one assignment.
+// Exhaustive p-bit search (high path); commits to `*best` only on improvement.
 fn try_pbit_combos(
   pixels: ptr<function, array<vec4<i32>, 16>>,
   ideal0: vec4<i32>,
   ideal1: vec4<i32>,
   best:   ptr<function, BestMode6>,
 ) {
+  var local_best = (*best).err;
   var pal: array<vec4<i32>, 16>;
   var tmp: array<u32, 16>;
-
-  if (QUALITY_HIGH != 0u) {
-    var local_best = (*best).err;
-    for (var p0: u32 = 0u; p0 < 2u; p0 = p0 + 1u) {
-      let q0 = quantize_endpoint(ideal0, p0);
-      for (var p1: u32 = 0u; p1 < 2u; p1 = p1 + 1u) {
-        let q1 = quantize_endpoint(ideal1, p1);
-        build_palette_6(q0.eight, q1.eight, &pal);
-        let err = assign_all(pixels, &pal, &tmp);
-        if (err < local_best) {
-          local_best = err;
-          (*best).e0_7 = q0.seven;
-          (*best).e1_7 = q1.seven;
-          (*best).p0 = p0;
-          (*best).p1 = p1;
-          (*best).indices = tmp;
-          (*best).err = err;
-        }
+  for (var p0: u32 = 0u; p0 < 2u; p0 = p0 + 1u) {
+    let q0 = quantize_endpoint(ideal0, p0);
+    for (var p1: u32 = 0u; p1 < 2u; p1 = p1 + 1u) {
+      let q1 = quantize_endpoint(ideal1, p1);
+      build_palette_6(q0.eight, q1.eight, &pal);
+      let err = assign_all(pixels, &pal, &tmp);
+      if (err < local_best) {
+        local_best = err;
+        (*best).e0_7 = q0.seven;
+        (*best).e1_7 = q1.seven;
+        (*best).p0 = p0;
+        (*best).p1 = p1;
+        (*best).indices = tmp;
+        (*best).err = err;
       }
-    }
-  } else {
-    let q0a = quantize_endpoint(ideal0, 0u);
-    let q0b = quantize_endpoint(ideal0, 1u);
-    var q0 = q0a; var p0: u32 = 0u;
-    if (ep_err(q0b.eight, ideal0) < ep_err(q0a.eight, ideal0)) { q0 = q0b; p0 = 1u; }
-
-    let q1a = quantize_endpoint(ideal1, 0u);
-    let q1b = quantize_endpoint(ideal1, 1u);
-    var q1 = q1a; var p1: u32 = 0u;
-    if (ep_err(q1b.eight, ideal1) < ep_err(q1a.eight, ideal1)) { q1 = q1b; p1 = 1u; }
-
-    build_palette_6(q0.eight, q1.eight, &pal);
-    let err = assign_all(pixels, &pal, &tmp);
-    if (err < (*best).err) {
-      (*best).e0_7 = q0.seven;
-      (*best).e1_7 = q1.seven;
-      (*best).p0 = p0;
-      (*best).p1 = p1;
-      (*best).indices = tmp;
-      (*best).err = err;
     }
   }
 }
 
-// ---------------------- Least-squares endpoint refit -------------------- //
-
-// Channel-independent LSQ fit of (e0, e1) given current indices. Normal
-// equations: see bc7_ref.ts `refitEndpointsMode6`. Returns 8-bit ideal
-// endpoints (before p-bit quantisation). `valid` = false for a degenerate
-// system (all texels on one palette entry).
+// Exact-weight LSQ refit (high path); matches bc7_ref.ts `refitEndpointsMode6`.
 struct RefitResult { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
-
 fn refit_endpoints(
   pixels: ptr<function, array<vec4<i32>, 16>>,
   indices: ptr<function, array<u32, 16>>,
@@ -276,17 +260,13 @@ fn refit_endpoints(
 
 // -------------------------- Bit-packing helper -------------------------- //
 
-// Write `n_bits` LSBs of `value` at bit position `pos` in a 128-bit field
-// split across 4 u32s. Straddles the word boundary when necessary.
 fn write_bits(block: ptr<function, array<u32, 4>>, pos: u32, n_bits: u32, value: u32) {
   let v = value & ((1u << n_bits) - 1u);
   let word_lo = pos / 32u;
   let bit_lo = pos % 32u;
   let bits_in_lo = min(n_bits, 32u - bit_lo);
-
   let mask_lo = ((1u << bits_in_lo) - 1u) << bit_lo;
   (*block)[word_lo] = ((*block)[word_lo] & ~mask_lo) | ((v << bit_lo) & mask_lo);
-
   if (bits_in_lo < n_bits) {
     let bits_in_hi = n_bits - bits_in_lo;
     let mask_hi = (1u << bits_in_hi) - 1u;
@@ -310,69 +290,79 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let base   = vec2<i32>(i32(bx) * 4, i32(by) * 4);
   let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  // 1. Load 16 RGBA pixels in 8-bit integer domain.
+  // Load 16 RGBA pixels (8-bit integer domain) and the per-channel bbox.
   var pixels: array<vec4<i32>, 16>;
+  var lo = vec4<i32>(255);
+  var hi = vec4<i32>(0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
     let p  = clamp(base + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
-    pixels[i] = to8(textureLoad(src_tex, p, 0));
+    let px = to8(textureLoad(src_tex, p, 0));
+    pixels[i] = px;
+    lo = min(lo, px);
+    hi = max(hi, px);
   }
 
-  // 2. Farthest-pair → initial endpoints (values, not indices).
-  let fp = farthest_pair(&pixels);
+  var e0_7: vec4<i32>;
+  var e1_7: vec4<i32>;
+  var p0: u32;
+  var p1: u32;
+  var indices: array<u32, 16>;
 
-  // 3. First p-bit search over the farthest-pair seed.
-  var best: BestMode6;
-  best.err = 2147483647;
-  try_pbit_combos(&pixels, fp.a, fp.b, &best);
-
-  // 4. One-pass LSQ refit + second p-bit search; the threshold inside
-  //    try_pbit_combos commits the result only if the error decreases.
-  let refit = refit_endpoints(&pixels, &best.indices);
-  if (refit.valid) {
-    try_pbit_combos(&pixels, refit.e0, refit.e1, &best);
+  if (QUALITY_HIGH != 0u) {
+    let fp = farthest_pair(&pixels);
+    var best: BestMode6;
+    best.err = 2147483647;
+    try_pbit_combos(&pixels, fp.a, fp.b, &best);
+    let refit = refit_endpoints(&pixels, &best.indices);
+    if (refit.valid) {
+      try_pbit_combos(&pixels, refit.e0, refit.e1, &best);
+    }
+    e0_7 = best.e0_7; e1_7 = best.e1_7; p0 = best.p0; p1 = best.p1; indices = best.indices;
+  } else {
+    var ep0 = pick_ep(lo);
+    var ep1 = pick_ep(hi);
+    let r = proj_assign(&pixels, ep0.eight, ep1.eight, &indices, true);
+    if (r.valid) {
+      ep0 = pick_ep(r.e0);
+      ep1 = pick_ep(r.e1);
+      proj_assign(&pixels, ep0.eight, ep1.eight, &indices, false);
+    }
+    e0_7 = ep0.seven; e1_7 = ep1.seven; p0 = ep0.p; p1 = ep1.p;
   }
 
-  // 5. Anchor rule — pixel 0's index MSB must be 0. If not, swap endpoints
-  // and reflect every index (new_i = 15 − old_i). The decoded palette
-  // reverses, so the reconstructed image is unchanged.
-  if ((best.indices[0] & 0x8u) != 0u) {
-    let tmp7 = best.e0_7; best.e0_7 = best.e1_7; best.e1_7 = tmp7;
-    let tmpP = best.p0;   best.p0   = best.p1;   best.p1   = tmpP;
+  // Anchor rule — pixel 0's index MSB must be 0. If not, swap endpoints and
+  // reflect every index (new_i = 15 − old_i); decoded image is unchanged.
+  if ((indices[0] & 0x8u) != 0u) {
+    let t7 = e0_7; e0_7 = e1_7; e1_7 = t7;
+    let tp = p0;   p0   = p1;   p1   = tp;
     for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      best.indices[k] = 15u - best.indices[k];
+      indices[k] = 15u - indices[k];
     }
   }
 
-  // 6. Pack into 128 bits = 4 u32s.
+  // Pack into 128 bits = 4 u32s.
   var block: array<u32, 4>;
   block[0] = 0u; block[1] = 0u; block[2] = 0u; block[3] = 0u;
-
   var pos: u32 = 0u;
-  // Mode 6: six zero bits followed by a 1 (LSB-first).
   write_bits(&block, pos, 7u, 0x40u); pos = pos + 7u;
-  // Endpoints: R0, R1, G0, G1, B0, B1, A0, A1 — 7 bits each.
-  write_bits(&block, pos, 7u, u32(best.e0_7.x)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e1_7.x)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e0_7.y)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e1_7.y)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e0_7.z)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e1_7.z)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e0_7.w)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(best.e1_7.w)); pos = pos + 7u;
-  // P-bits.
-  write_bits(&block, pos, 1u, best.p0); pos = pos + 1u;
-  write_bits(&block, pos, 1u, best.p1); pos = pos + 1u;
-  // Pixel 0: 3-bit anchor (MSB implicit 0).
-  write_bits(&block, pos, 3u, best.indices[0] & 0x7u); pos = pos + 3u;
-  // Pixels 1..15: 4 bits each.
+  write_bits(&block, pos, 7u, u32(e0_7.x)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e1_7.x)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e0_7.y)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e1_7.y)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e0_7.z)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e1_7.z)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e0_7.w)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(e1_7.w)); pos = pos + 7u;
+  write_bits(&block, pos, 1u, p0); pos = pos + 1u;
+  write_bits(&block, pos, 1u, p1); pos = pos + 1u;
+  write_bits(&block, pos, 3u, indices[0] & 0x7u); pos = pos + 3u;
   for (var k: u32 = 1u; k < 16u; k = k + 1u) {
-    write_bits(&block, pos, 4u, best.indices[k] & 0xFu);
+    write_bits(&block, pos, 4u, indices[k] & 0xFu);
     pos = pos + 4u;
   }
 
-  // 7. Store.
   let out = block_index * 4u;
   dst[out + 0u] = block[0];
   dst[out + 1u] = block[1];
