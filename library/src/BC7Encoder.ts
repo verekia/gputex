@@ -15,6 +15,7 @@
 import { RGBA_BPTC_Format } from 'three'
 
 import shaderSource from './bc7.wgsl'
+import shaderSourceF16 from './bc7_fast_f16.wgsl'
 import { Encoder, type FormatVariant } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
 
@@ -39,6 +40,9 @@ export class BC7Encoder extends Encoder {
 
   override wgslSource(): string {
     return shaderSource
+  }
+  override wgslSourceFastF16(): string {
+    return shaderSourceF16
   }
 
   override gpuTextureFormat({ colorSpace }: FormatVariant): GPUTextureFormat {

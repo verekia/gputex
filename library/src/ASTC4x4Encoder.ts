@@ -17,6 +17,7 @@
 import { RGBA_ASTC_4x4_Format } from 'three'
 
 import shaderSource from './astc4x4.wgsl'
+import shaderSourceF16 from './astc4x4_fast_f16.wgsl'
 import { Encoder, type FormatVariant } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
 
@@ -41,6 +42,9 @@ export class ASTC4x4Encoder extends Encoder {
 
   override wgslSource(): string {
     return shaderSource
+  }
+  override wgslSourceFastF16(): string {
+    return shaderSourceF16
   }
 
   override gpuTextureFormat({ colorSpace }: FormatVariant): GPUTextureFormat {

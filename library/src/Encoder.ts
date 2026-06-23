@@ -134,6 +134,11 @@ export abstract class Encoder {
     if (this.requiredFeature && adapter.features.has(this.requiredFeature)) {
       requiredFeatures.push(this.requiredFeature)
     }
+    // f16 powers the ~2× faster 'fast' path. Non-fatal if absent — the encoder
+    // falls back to the f32 fast shader.
+    if (adapter.features.has('shader-f16')) {
+      requiredFeatures.push('shader-f16')
+    }
     const device = await adapter.requestDevice({ requiredFeatures })
     return new this({ device, adapter, ownsDevice: true })
   }
@@ -144,6 +149,10 @@ export abstract class Encoder {
   // `!:` because these are set in `_buildPipeline()` which the constructor
   // calls; TypeScript's flow analysis doesn't see through method calls.
   protected _module!: GPUShaderModule
+  // f16 'fast' module — built only when the device supports shader-f16 and the
+  // subclass provides an f16 source. null otherwise (falls back to _module).
+  protected _moduleF16: GPUShaderModule | null = null
+  protected _pipelineF16: GPUComputePipeline | null = null
   // Default pipeline (fast). Kept as a field for back-compat; the per-quality
   // cache below holds the specialised pipelines for encoders that support it.
   protected _pipeline!: GPUComputePipeline
@@ -163,6 +172,12 @@ export abstract class Encoder {
       label: `${this.label}-encoder`,
       code,
     })
+    if (this._useF16) {
+      this._moduleF16 = device.createShaderModule({
+        label: `${this.label}-encoder-f16`,
+        code: this.wgslSourceFastF16()!,
+      })
+    }
     if (this.supportsQuality) {
       // Eagerly build the default (fast) pipeline so shader compile errors
       // still surface at construction time, as before.
@@ -183,6 +198,19 @@ export abstract class Encoder {
    */
   protected _getPipeline(quality: EncodeQuality): GPUComputePipeline {
     if (!this.supportsQuality) return this._pipeline
+    // 'fast' uses the dedicated f16 module when available — it's a standalone
+    // fast-only shader (no QUALITY_HIGH override). 'high' always uses the f32
+    // module so its output stays byte-identical to the CPU reference.
+    if (quality === 'fast' && this._moduleF16) {
+      if (!this._pipelineF16) {
+        this._pipelineF16 = this.device.createComputePipeline({
+          label: `${this.label}-encoder-pipeline-fast-f16`,
+          layout: 'auto',
+          compute: { module: this._moduleF16, entryPoint: 'encode' },
+        })
+      }
+      return this._pipelineF16
+    }
     const cached = this._pipelineCache.get(quality)
     if (cached) return cached
     const pipeline = this.device.createComputePipeline({
@@ -229,6 +257,20 @@ export abstract class Encoder {
    */
   get supportsQuality(): boolean {
     return false
+  }
+
+  /**
+   * Optional f16 WGSL for the 'fast' path. Used only when the device reports the
+   * `shader-f16` feature; the format's f32 `wgslSource()` is the fallback and
+   * `'high'` always uses it. Returns null when there's no f16 variant (BC1).
+   */
+  wgslSourceFastF16(): string | null {
+    return null
+  }
+
+  /** Whether the f16 fast path is both available and supported on this device. */
+  protected get _useF16(): boolean {
+    return this.wgslSourceFastF16() !== null && this.device.features.has('shader-f16')
   }
 
   /** WGSL compute-shader source. */

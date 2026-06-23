@@ -51,9 +51,11 @@ material.map = texture
 - **`'fast'` (default)** — a bounding-box endpoint seed plus projection-based
   index assignment (each pixel is projected onto the colinear endpoint line in
   O(1) instead of searching every palette entry) with a single fused
-  least-squares refit. Measured on Apple GPU at 1024×1024: **BC7 ~20×**,
-  **ASTC ~4×**, **BC5 ~4×** faster, for a PSNR cost of **≤0.4 dB**
-  (imperceptible). BC1 is single-pass and unaffected.
+  least-squares refit. On GPUs that report the `shader-f16` feature the whole
+  fast path runs in f16 (≈2× on Apple) — the f32 path is the automatic
+  fallback. Net vs `'high'` on an Apple GPU: **BC7 ~50×**, **ASTC ~9×**,
+  **BC5 ~5×** faster, for a PSNR cost of **≤0.45 dB** (imperceptible). BC1 is
+  single-pass and unaffected.
 - **`'high'`** — exhaustive endpoint search (farthest-pair seed, full nearest
   search, p-bit search); output is byte-for-byte identical to the CPU reference
   encoders.

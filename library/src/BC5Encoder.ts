@@ -12,6 +12,7 @@
 import { RED_GREEN_RGTC2_Format } from 'three'
 
 import shaderSource from './bc5.wgsl'
+import shaderSourceF16 from './bc5_fast_f16.wgsl'
 import { Encoder } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
 
@@ -36,6 +37,9 @@ export class BC5Encoder extends Encoder {
 
   override wgslSource(): string {
     return shaderSource
+  }
+  override wgslSourceFastF16(): string {
+    return shaderSourceF16
   }
 
   override gpuTextureFormat(): GPUTextureFormat {
