@@ -3,9 +3,22 @@
 // One invocation per 4×4 block. Emits 16 bytes = 4 u32s into the storage
 // buffer at `dst[block_index * 4 .. + 3]`.
 //
-// This shader mirrors `bc7_ref.ts` function-by-function; see that file for
-// the end-to-end algorithm rationale and the full mode 6 bitstream layout
-// (summarised below).
+// This shader is numerically identical to `bc7_ref.ts` (same farthest-pair
+// seed, same 4-way p-bit search, same one-pass LSQ refit, same tie-breaks)
+// — the rewrite only changes *how* the arithmetic is scheduled, not the
+// bits produced:
+//   • Pixels and palettes live in the i32 domain so the inner nearest-entry
+//     search is pure integer subtract/multiply/add with zero per-comparison
+//     type conversions (the previous code re-cast both operands u32→i32 on
+//     every one of the 16 palette comparisons per pixel).
+//   • Endpoint interpolation and quantisation run once per 4-channel vec4
+//     instead of four scalar calls.
+//   • The candidate state (`BestMode6`) is threaded by pointer with an error
+//     threshold, so the 4-combo search writes straight into the running best
+//     and we never copy a 16-entry index array across a function return.
+//   • The farthest-pair seed returns endpoint *values*, so `pixels[]` is only
+//     ever indexed by loop counters (never by a runtime index) and can stay
+//     register-resident.
 //
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
 //   bits 0..6    mode field      (0b0000001 — only bit 6 is 1)
@@ -61,148 +74,133 @@ fn w4(i: u32) -> u32 {
   }
 }
 
-// Hardware-exact integer interpolation.
-fn interp8(e0: u32, e1: u32, w: u32) -> u32 {
-  return ((64u - w) * e0 + w * e1 + 32u) >> 6u;
+// Hardware-exact integer interpolation, all four channels at once. Identical
+// result to four scalar `((64−w)·e0 + w·e1 + 32) >> 6` evaluations; operands
+// are in [0,255] so the i32 arithmetic shift matches the unsigned one.
+fn interp4(e0: vec4<i32>, e1: vec4<i32>, w: i32) -> vec4<i32> {
+  return ((64 - w) * e0 + w * e1 + vec4<i32>(32)) >> vec4<u32>(6u);
 }
 
-// f32-normalised [0,1] → clamped 8-bit.
-fn to8(v: f32) -> u32 {
-  return u32(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
+// f32-normalised [0,1] → clamped 8-bit, all four channels at once.
+fn to8(v: vec4<f32>) -> vec4<i32> {
+  return vec4<i32>(clamp(floor(v * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
+}
+
+// 4-channel L2 distance squared in the i32 domain (≤ 4 · 255² = 260 100).
+fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
+  let d = a - b;
+  let e = d * d;
+  return e.x + e.y + e.z + e.w;
 }
 
 // -------------------------- Farthest-pair seed -------------------------- //
 
-struct PairResult { i0: u32, i1: u32 };
+struct Pair { a: vec4<i32>, b: vec4<i32> };
 
-// 4-channel L2 distance squared, u32 domain (bounded by 4 × 255² = 260 100).
-fn pixel_dist_sq(a: vec4<u32>, b: vec4<u32>) -> u32 {
-  let d = vec4<i32>(a) - vec4<i32>(b);
-  let d2 = d * d;
-  return u32(d2.x + d2.y + d2.z + d2.w);
-}
-
-// O(N²) = 120 comparisons. See bc7_ref.ts `farthestPair` for why bbox
-// corners aren't safe initial endpoints when channels vary in different
-// directions along the data line.
-fn farthest_pair(pixels: ptr<function, array<vec4<u32>, 16>>) -> PairResult {
-  var best_d: u32 = 0u;
-  var best_i: u32 = 0u;
-  var best_j: u32 = 1u;
+// O(N²) = 120 comparisons returning the two most distant pixel *values*.
+// See bc7_ref.ts `farthestPair` for why bbox corners aren't safe initial
+// endpoints when channels vary in different directions along the data line.
+fn farthest_pair(pixels: ptr<function, array<vec4<i32>, 16>>) -> Pair {
+  var best_d: i32 = 0;
+  var pa = (*pixels)[0];
+  var pb = (*pixels)[1];
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+    let xi = (*pixels)[i];
     for (var j: u32 = i + 1u; j < 16u; j = j + 1u) {
-      let d = pixel_dist_sq((*pixels)[i], (*pixels)[j]);
-      if (d > best_d) { best_d = d; best_i = i; best_j = j; }
+      let d = dist2(xi, (*pixels)[j]);
+      if (d > best_d) { best_d = d; pa = xi; pb = (*pixels)[j]; }
     }
   }
-  return PairResult(best_i, best_j);
+  return Pair(pa, pb);
 }
 
 // -------------------------- Palette + assignment ------------------------ //
 
-// Build the 16-entry RGBA palette from 8-bit endpoints.
-fn build_palette_6(e0: vec4<u32>, e1: vec4<u32>, pal: ptr<function, array<vec4<u32>, 16>>) {
+// Build the 16-entry RGBA palette (i32 domain) from 8-bit endpoints.
+fn build_palette_6(e0: vec4<i32>, e1: vec4<i32>, pal: ptr<function, array<vec4<i32>, 16>>) {
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let w = w4(i);
-    (*pal)[i] = vec4<u32>(
-      interp8(e0.x, e1.x, w),
-      interp8(e0.y, e1.y, w),
-      interp8(e0.z, e1.z, w),
-      interp8(e0.w, e1.w, w),
-    );
+    (*pal)[i] = interp4(e0, e1, i32(w4(i)));
   }
 }
 
-// Nearest-palette-entry search for one pixel. Full 16-entry L2 search.
-fn nearest_index_6(pixel: vec4<u32>, pal: ptr<function, array<vec4<u32>, 16>>) -> vec2<u32> {
-  var best_i: u32 = 0u;
-  var best_d: u32 = 0xFFFFFFFFu;
-  for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let d = pixel_dist_sq(pixel, (*pal)[i]);
-    if (d < best_d) { best_d = d; best_i = i; }
-  }
-  // x = best index, y = its squared error.
-  return vec2<u32>(best_i, best_d);
-}
-
-// Assign all 16 pixels to nearest palette entries, accumulate total error.
-struct AssignResult { indices: array<u32, 16>, err: u32 };
-
+// Assign all 16 pixels to their nearest palette entry (full 16-entry L2),
+// writing indices into `out_idx` and returning the total squared error.
 fn assign_all(
-  pixels: ptr<function, array<vec4<u32>, 16>>,
-  pal:    ptr<function, array<vec4<u32>, 16>>,
-) -> AssignResult {
-  var out: AssignResult;
-  out.err = 0u;
+  pixels:  ptr<function, array<vec4<i32>, 16>>,
+  pal:     ptr<function, array<vec4<i32>, 16>>,
+  out_idx: ptr<function, array<u32, 16>>,
+) -> i32 {
+  var err: i32 = 0;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let sel = nearest_index_6((*pixels)[k], pal);
-    out.indices[k] = sel.x;
-    out.err = out.err + sel.y;
+    let px = (*pixels)[k];
+    var best_i: u32 = 0u;
+    var best_d: i32 = 2147483647;
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let d = dist2(px, (*pal)[i]);
+      if (d < best_d) { best_d = d; best_i = i; }
+    }
+    (*out_idx)[k] = best_i;
+    err = err + best_d;
   }
-  return out;
+  return err;
 }
 
 // -------------------------- Endpoint quantisation ----------------------- //
 
-// Quantize one 8-bit ideal channel to (7-bit value, reconstructed 8-bit)
-// under a fixed p-bit. Matches the CPU reference.
-fn quantize_ch(ideal8: u32, p: u32) -> vec2<u32> {
-  // q7 = round((ideal8 − p) / 2), clamp to [0, 127].
-  let q = u32(clamp(
-    floor((f32(ideal8) - f32(p)) / 2.0 + 0.5),
-    0.0, 127.0,
+// Quantize an 8-bit ideal endpoint to (7-bit value, reconstructed 8-bit)
+// under a fixed p-bit, all four channels at once. Matches the CPU reference:
+// q7 = round((ideal8 − p) / 2) clamped to [0,127]; eff = (q7 << 1) | p.
+struct QuantPair { seven: vec4<i32>, eight: vec4<i32> };
+
+fn quantize_endpoint(ideal8: vec4<i32>, p: u32) -> QuantPair {
+  let q = vec4<i32>(clamp(
+    floor((vec4<f32>(ideal8) - f32(p)) / 2.0 + 0.5),
+    vec4<f32>(0.0), vec4<f32>(127.0),
   ));
-  let eff = (q << 1u) | p;
-  return vec2<u32>(q, eff);
+  let eff = (q << vec4<u32>(1u)) | vec4<i32>(i32(p));
+  return QuantPair(q, eff);
 }
 
-struct QuantPair { seven: vec4<u32>, eight: vec4<u32> };
-
-fn quantize_endpoint(ideal8: vec4<u32>, p: u32) -> QuantPair {
-  let r = quantize_ch(ideal8.x, p);
-  let g = quantize_ch(ideal8.y, p);
-  let b = quantize_ch(ideal8.z, p);
-  let a = quantize_ch(ideal8.w, p);
-  return QuantPair(
-    vec4<u32>(r.x, g.x, b.x, a.x),
-    vec4<u32>(r.y, g.y, b.y, a.y),
-  );
-}
-
-// Try all four p-bit combos (p0, p1) ∈ {0,1}² and return the best
-// quantised-endpoint-plus-indices triple.
+// Candidate mode-6 solution. Threaded by pointer so the p-bit search updates
+// it in place; `err` doubles as the acceptance threshold.
 struct BestMode6 {
-  e0_7: vec4<u32>, e1_7: vec4<u32>,
+  e0_7: vec4<i32>, e1_7: vec4<i32>,
   p0: u32,         p1: u32,
   indices: array<u32, 16>,
-  err: u32,
+  err: i32,
 };
 
+// Try all four p-bit combos (p0, p1) ∈ {0,1}² for the given ideal endpoints.
+// Overwrites `*best` (endpoints, p-bits, indices, err) only for combos whose
+// error beats the incoming `(*best).err`. Seeding the threshold with the
+// running best means the post-refit call only commits when it genuinely
+// improves — exactly the `if (cand.err < best.err)` rule, with no struct copy.
 fn try_pbit_combos(
-  pixels: ptr<function, array<vec4<u32>, 16>>,
-  ideal0: vec4<u32>,
-  ideal1: vec4<u32>,
-) -> BestMode6 {
-  var best: BestMode6;
-  best.err = 0xFFFFFFFFu;
+  pixels: ptr<function, array<vec4<i32>, 16>>,
+  ideal0: vec4<i32>,
+  ideal1: vec4<i32>,
+  best:   ptr<function, BestMode6>,
+) {
+  var local_best = (*best).err;
+  var pal: array<vec4<i32>, 16>;
+  var tmp: array<u32, 16>;
   for (var p0: u32 = 0u; p0 < 2u; p0 = p0 + 1u) {
     let q0 = quantize_endpoint(ideal0, p0);
     for (var p1: u32 = 0u; p1 < 2u; p1 = p1 + 1u) {
       let q1 = quantize_endpoint(ideal1, p1);
-      var pal: array<vec4<u32>, 16>;
       build_palette_6(q0.eight, q1.eight, &pal);
-      let assigned = assign_all(pixels, &pal);
-      if (assigned.err < best.err) {
-        best.e0_7 = q0.seven;
-        best.e1_7 = q1.seven;
-        best.p0   = p0;
-        best.p1   = p1;
-        best.indices = assigned.indices;
-        best.err  = assigned.err;
+      let err = assign_all(pixels, &pal, &tmp);
+      if (err < local_best) {
+        local_best = err;
+        (*best).e0_7 = q0.seven;
+        (*best).e1_7 = q1.seven;
+        (*best).p0 = p0;
+        (*best).p1 = p1;
+        (*best).indices = tmp;
+        (*best).err = err;
       }
     }
   }
-  return best;
 }
 
 // ---------------------- Least-squares endpoint refit -------------------- //
@@ -211,10 +209,10 @@ fn try_pbit_combos(
 // equations: see bc7_ref.ts `refitEndpointsMode6`. Returns 8-bit ideal
 // endpoints (before p-bit quantisation). `valid` = false for a degenerate
 // system (all texels on one palette entry).
-struct RefitResult { e0: vec4<u32>, e1: vec4<u32>, valid: bool };
+struct RefitResult { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
 
 fn refit_endpoints(
-  pixels: ptr<function, array<vec4<u32>, 16>>,
+  pixels: ptr<function, array<vec4<i32>, 16>>,
   indices: ptr<function, array<u32, 16>>,
 ) -> RefitResult {
   var sAA: f32 = 0.0;
@@ -241,8 +239,8 @@ fn refit_endpoints(
   }
   let e0f = (sBB * sAV - sAB * sBV) / det;
   let e1f = (sAA * sBV - sAB * sAV) / det;
-  out.e0 = vec4<u32>(clamp(round(e0f), vec4<f32>(0.0), vec4<f32>(255.0)));
-  out.e1 = vec4<u32>(clamp(round(e1f), vec4<f32>(0.0), vec4<f32>(255.0)));
+  out.e0 = vec4<i32>(clamp(round(e0f), vec4<f32>(0.0), vec4<f32>(255.0)));
+  out.e1 = vec4<i32>(clamp(round(e1f), vec4<f32>(0.0), vec4<f32>(255.0)));
   out.valid = true;
   return out;
 }
@@ -284,30 +282,27 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
   // 1. Load 16 RGBA pixels in 8-bit integer domain.
-  var pixels: array<vec4<u32>, 16>;
+  var pixels: array<vec4<i32>, 16>;
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
     let p  = clamp(base + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
-    let c  = textureLoad(src_tex, p, 0);
-    pixels[i] = vec4<u32>(to8(c.r), to8(c.g), to8(c.b), to8(c.a));
+    pixels[i] = to8(textureLoad(src_tex, p, 0));
   }
 
-  // 2. Farthest-pair → initial endpoints.
+  // 2. Farthest-pair → initial endpoints (values, not indices).
   let fp = farthest_pair(&pixels);
-  let ideal0_init = pixels[fp.i0];
-  let ideal1_init = pixels[fp.i1];
 
   // 3. First p-bit search over the farthest-pair seed.
-  var best = try_pbit_combos(&pixels, ideal0_init, ideal1_init);
+  var best: BestMode6;
+  best.err = 2147483647;
+  try_pbit_combos(&pixels, fp.a, fp.b, &best);
 
-  // 4. One-pass LSQ refit + second p-bit search; accept if error decreases.
+  // 4. One-pass LSQ refit + second p-bit search; the threshold inside
+  //    try_pbit_combos commits the result only if the error decreases.
   let refit = refit_endpoints(&pixels, &best.indices);
   if (refit.valid) {
-    let cand = try_pbit_combos(&pixels, refit.e0, refit.e1);
-    if (cand.err < best.err) {
-      best = cand;
-    }
+    try_pbit_combos(&pixels, refit.e0, refit.e1, &best);
   }
 
   // 5. Anchor rule — pixel 0's index MSB must be 0. If not, swap endpoints
@@ -329,14 +324,14 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Mode 6: six zero bits followed by a 1 (LSB-first).
   write_bits(&block, pos, 7u, 0x40u); pos = pos + 7u;
   // Endpoints: R0, R1, G0, G1, B0, B1, A0, A1 — 7 bits each.
-  write_bits(&block, pos, 7u, best.e0_7.x); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e1_7.x); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e0_7.y); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e1_7.y); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e0_7.z); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e1_7.z); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e0_7.w); pos = pos + 7u;
-  write_bits(&block, pos, 7u, best.e1_7.w); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e0_7.x)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e1_7.x)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e0_7.y)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e1_7.y)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e0_7.z)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e1_7.z)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e0_7.w)); pos = pos + 7u;
+  write_bits(&block, pos, 7u, u32(best.e1_7.w)); pos = pos + 7u;
   // P-bits.
   write_bits(&block, pos, 1u, best.p0); pos = pos + 1u;
   write_bits(&block, pos, 1u, best.p1); pos = pos + 1u;

@@ -3,9 +3,17 @@
 // One invocation per 4×4 block. Emits 16 bytes = 4 u32s into the storage
 // buffer at `dst[block_index * 4 .. + 3]`.
 //
-// This shader mirrors `astc4x4_ref.ts` function-by-function; see that
-// file for the end-to-end algorithm rationale and the full block layout
-// / block-mode derivation. A short recap follows.
+// Numerically identical to `astc4x4_ref.ts` (same farthest-pair seed, same
+// single LSQ refit accepted only on strict error decrease, same endpoint
+// ordering rule). The rewrite only reschedules the arithmetic:
+//   • Pixels and the 4-entry palette live in the i32 domain, so the nearest-
+//     entry search is pure integer math with no per-comparison conversions.
+//   • Endpoint interpolation runs once per 4-channel vec4 instead of four
+//     scalar calls.
+//   • The farthest-pair seed returns endpoint *values*, keeping `pixels[]`
+//     indexed only by loop counters (register-resident).
+//   • The 16 two-bit weights pack with a single shift-OR into the top word
+//     instead of 32 individual masked read-modify-write `write_bits` calls.
 //
 // RESTRICTED SUBSET (both CPU ref and this shader):
 //   • Single partition, no dual-plane
@@ -40,103 +48,85 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 // QUANT_4 weight unquantisation: q ∈ [0,3] → unq ∈ [0, 21, 43, 64].
-// Switch keeps us off a module-scope const array (some backends reject
-// those inside function-call bodies).
-fn weight_unq(i: u32) -> u32 {
+fn weight_unq(i: u32) -> i32 {
   switch i {
-    case 0u: { return  0u; }
-    case 1u: { return 21u; }
-    case 2u: { return 43u; }
-    default: { return 64u; }  // case 3u
+    case 0u: { return  0; }
+    case 1u: { return 21; }
+    case 2u: { return 43; }
+    default: { return 64; }  // case 3u
   }
 }
 
-// Hardware-exact integer interpolation. Identical to BC7's; matches the
-// CPU reference bit-for-bit.
-fn interp8(e0: u32, e1: u32, w: u32) -> u32 {
-  return ((64u - w) * e0 + w * e1 + 32u) >> 6u;
+// Hardware-exact integer interpolation, all four channels at once. Operands
+// are in [0,255]; the i32 arithmetic shift matches the unsigned formula.
+fn interp4(e0: vec4<i32>, e1: vec4<i32>, w: i32) -> vec4<i32> {
+  return ((64 - w) * e0 + w * e1 + vec4<i32>(32)) >> vec4<u32>(6u);
 }
 
-// Normalised [0, 1] → clamped 8-bit. Same rounding rule (floor(v + 0.5))
-// as the CPU reference's Math.round.
-fn to8(v: f32) -> u32 {
-  return u32(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
+// Normalised [0, 1] → clamped 8-bit, all four channels at once. Same
+// rounding rule (floor(v + 0.5)) as the CPU reference's Math.round.
+fn to8(v: vec4<f32>) -> vec4<i32> {
+  return vec4<i32>(clamp(floor(v * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
 }
 
-// 4-channel L2 distance squared in u32 domain. Bounded by 4 · 255² = 260,100.
-fn pixel_dist_sq(a: vec4<u32>, b: vec4<u32>) -> u32 {
-  let d = vec4<i32>(a) - vec4<i32>(b);
-  let d2 = d * d;
-  return u32(d2.x + d2.y + d2.z + d2.w);
+// 4-channel L2 distance squared in the i32 domain (≤ 4 · 255² = 260 100).
+fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
+  let d = a - b;
+  let e = d * d;
+  return e.x + e.y + e.z + e.w;
 }
 
 // -------------------------- Farthest-pair seed -------------------------- //
 
-struct PairResult { i0: u32, i1: u32 };
+struct Pair { a: vec4<i32>, b: vec4<i32> };
 
-// O(N²) = 120 comparisons. Same rationale as BC7's `farthest_pair`:
-// bounding-box corners aren't safe initial endpoints when channels vary
-// in different directions along the data line.
-fn farthest_pair(pixels: ptr<function, array<vec4<u32>, 16>>) -> PairResult {
-  var best_d: u32 = 0u;
-  var best_i: u32 = 0u;
-  var best_j: u32 = 1u;
+// O(N²) = 120 comparisons returning the two most distant pixel *values*.
+// Same rationale as BC7's `farthest_pair`: bbox corners aren't safe initial
+// endpoints when channels vary in different directions along the data line.
+fn farthest_pair(pixels: ptr<function, array<vec4<i32>, 16>>) -> Pair {
+  var best_d: i32 = 0;
+  var pa = (*pixels)[0];
+  var pb = (*pixels)[1];
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+    let xi = (*pixels)[i];
     for (var j: u32 = i + 1u; j < 16u; j = j + 1u) {
-      let d = pixel_dist_sq((*pixels)[i], (*pixels)[j]);
-      if (d > best_d) { best_d = d; best_i = i; best_j = j; }
+      let d = dist2(xi, (*pixels)[j]);
+      if (d > best_d) { best_d = d; pa = xi; pb = (*pixels)[j]; }
     }
   }
-  return PairResult(best_i, best_j);
+  return Pair(pa, pb);
 }
 
 // -------------------------- Palette + assignment ------------------------ //
 
-// Build the 4-entry RGBA palette from 8-bit endpoints. Uses the same
-// integer interpolation formula as decode, so assignments made against
-// this palette match the hardware round-trip.
-fn build_palette(
-  e0: vec4<u32>, e1: vec4<u32>,
-  pal: ptr<function, array<vec4<u32>, 4>>,
-) {
+// Build the 4-entry RGBA palette (i32 domain) from 8-bit endpoints. Uses the
+// same integer interpolation as decode, so assignments round-trip exactly.
+fn build_palette(e0: vec4<i32>, e1: vec4<i32>, pal: ptr<function, array<vec4<i32>, 4>>) {
   for (var i: u32 = 0u; i < 4u; i = i + 1u) {
-    let w = weight_unq(i);
-    (*pal)[i] = vec4<u32>(
-      interp8(e0.x, e1.x, w),
-      interp8(e0.y, e1.y, w),
-      interp8(e0.z, e1.z, w),
-      interp8(e0.w, e1.w, w),
-    );
+    (*pal)[i] = interp4(e0, e1, weight_unq(i));
   }
 }
 
-// Nearest palette entry for a single RGBA pixel. Full 4-way L2 search.
-// Returns (best_index, its squared error).
-fn nearest_index(pixel: vec4<u32>, pal: ptr<function, array<vec4<u32>, 4>>) -> vec2<u32> {
-  var best_i: u32 = 0u;
-  var best_d: u32 = 0xFFFFFFFFu;
-  for (var i: u32 = 0u; i < 4u; i = i + 1u) {
-    let d = pixel_dist_sq(pixel, (*pal)[i]);
-    if (d < best_d) { best_d = d; best_i = i; }
-  }
-  return vec2<u32>(best_i, best_d);
-}
-
-// Assign all 16 texels to nearest palette entries; accumulate squared error.
-struct AssignResult { indices: array<u32, 16>, err: u32 };
-
+// Assign all 16 texels to their nearest palette entry (full 4-way L2),
+// writing indices into `out_idx` and returning the total squared error.
 fn assign_all(
-  pixels: ptr<function, array<vec4<u32>, 16>>,
-  pal:    ptr<function, array<vec4<u32>, 4>>,
-) -> AssignResult {
-  var out: AssignResult;
-  out.err = 0u;
+  pixels:  ptr<function, array<vec4<i32>, 16>>,
+  pal:     ptr<function, array<vec4<i32>, 4>>,
+  out_idx: ptr<function, array<u32, 16>>,
+) -> i32 {
+  var err: i32 = 0;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let sel = nearest_index((*pixels)[k], pal);
-    out.indices[k] = sel.x;
-    out.err = out.err + sel.y;
+    let px = (*pixels)[k];
+    var best_i: u32 = 0u;
+    var best_d: i32 = 2147483647;
+    for (var i: u32 = 0u; i < 4u; i = i + 1u) {
+      let d = dist2(px, (*pal)[i]);
+      if (d < best_d) { best_d = d; best_i = i; }
+    }
+    (*out_idx)[k] = best_i;
+    err = err + best_d;
   }
-  return out;
+  return err;
 }
 
 // ---------------------- Least-squares endpoint refit -------------------- //
@@ -145,10 +135,10 @@ fn assign_all(
 // (e0, e1). See the CPU reference's `refitEndpoints` for the derivation.
 // `valid = false` signals a degenerate system (all texels on one palette
 // entry) and the caller keeps the farthest-pair seed.
-struct RefitResult { e0: vec4<u32>, e1: vec4<u32>, valid: bool };
+struct RefitResult { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
 
 fn refit_endpoints(
-  pixels:  ptr<function, array<vec4<u32>, 16>>,
+  pixels:  ptr<function, array<vec4<i32>, 16>>,
   indices: ptr<function, array<u32, 16>>,
 ) -> RefitResult {
   var sAA: f32 = 0.0;
@@ -158,8 +148,8 @@ fn refit_endpoints(
   var sBV: vec4<f32> = vec4<f32>(0.0);
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let unq = weight_unq((*indices)[k]);
-    let a = f32(64u - unq) / 64.0;
-    let b = f32(unq)       / 64.0;
+    let a = f32(64 - unq) / 64.0;
+    let b = f32(unq)      / 64.0;
     let v = vec4<f32>((*pixels)[k]);
     sAA = sAA + a * a;
     sBB = sBB + b * b;
@@ -175,8 +165,8 @@ fn refit_endpoints(
   }
   let e0f = (sBB * sAV - sAB * sBV) / det;
   let e1f = (sAA * sBV - sAB * sAV) / det;
-  out.e0 = vec4<u32>(clamp(round(e0f), vec4<f32>(0.0), vec4<f32>(255.0)));
-  out.e1 = vec4<u32>(clamp(round(e1f), vec4<f32>(0.0), vec4<f32>(255.0)));
+  out.e0 = vec4<i32>(clamp(round(e0f), vec4<f32>(0.0), vec4<f32>(255.0)));
+  out.e1 = vec4<i32>(clamp(round(e1f), vec4<f32>(0.0), vec4<f32>(255.0)));
   out.valid = true;
   return out;
 }
@@ -185,7 +175,6 @@ fn refit_endpoints(
 
 // Write `n_bits` LSBs of `value` at bit position `pos` of a 128-bit field
 // represented as `array<u32, 4>`. Handles word-boundary straddles.
-// Lifted from the BC7 shader verbatim; the layout contract is identical.
 fn write_bits(block: ptr<function, array<u32, 4>>, pos: u32, n_bits: u32, value: u32) {
   let v = value & ((1u << n_bits) - 1u);
   let word_lo = pos / 32u;
@@ -219,37 +208,39 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
   // 1. Load 16 RGBA texels in 8-bit integer domain.
-  var pixels: array<vec4<u32>, 16>;
+  var pixels: array<vec4<i32>, 16>;
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
     // Clamp to edge for non-multiple-of-4 input sizes.
     let p  = clamp(base + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
-    let c  = textureLoad(src_tex, p, 0);
-    pixels[i] = vec4<u32>(to8(c.r), to8(c.g), to8(c.b), to8(c.a));
+    pixels[i] = to8(textureLoad(src_tex, p, 0));
   }
 
-  // 2. Farthest-pair seed → initial endpoints.
+  // 2. Farthest-pair seed → initial endpoints (values, not indices).
   let fp = farthest_pair(&pixels);
-  var e0 = pixels[fp.i0];
-  var e1 = pixels[fp.i1];
+  var e0 = fp.a;
+  var e1 = fp.b;
 
   // 3. Initial assignment against the seed endpoints.
-  var pal: array<vec4<u32>, 4>;
+  var pal: array<vec4<i32>, 4>;
   build_palette(e0, e1, &pal);
-  var best = assign_all(&pixels, &pal);
+  var indices: array<u32, 16>;
+  var err = assign_all(&pixels, &pal, &indices);
 
   // 4. One LSQ refit pass. Accept only if the squared error strictly
-  //    decreases — matches the CPU reference.
-  let refit = refit_endpoints(&pixels, &best.indices);
+  //    decreases — matches the CPU reference. The palette buffer is reused;
+  //    on rejection the current indices/endpoints are left untouched.
+  let refit = refit_endpoints(&pixels, &indices);
   if (refit.valid) {
-    var pal2: array<vec4<u32>, 4>;
-    build_palette(refit.e0, refit.e1, &pal2);
-    let cand = assign_all(&pixels, &pal2);
-    if (cand.err < best.err) {
+    build_palette(refit.e0, refit.e1, &pal);
+    var idx2: array<u32, 16>;
+    let err2 = assign_all(&pixels, &pal, &idx2);
+    if (err2 < err) {
       e0 = refit.e0;
       e1 = refit.e1;
-      best = cand;
+      indices = idx2;
+      err = err2;
     }
   }
 
@@ -261,7 +252,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tmp = e0; e0 = e1; e1 = tmp;
     for (var k: u32 = 0u; k < 16u; k = k + 1u) {
       // w' = 3 − w reflects the palette; decoded colour unchanged.
-      best.indices[k] = 3u - best.indices[k];
+      indices[k] = 3u - indices[k];
     }
   }
 
@@ -275,23 +266,25 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   write_bits(&block, 13u, 4u,  12u);      // CEM 12: LDR RGBA direct
 
   // Endpoints in the CEM 12 value order: R0 R1 G0 G1 B0 B1 A0 A1.
-  write_bits(&block, 17u + 0u * 8u, 8u, e0.x);
-  write_bits(&block, 17u + 1u * 8u, 8u, e1.x);
-  write_bits(&block, 17u + 2u * 8u, 8u, e0.y);
-  write_bits(&block, 17u + 3u * 8u, 8u, e1.y);
-  write_bits(&block, 17u + 4u * 8u, 8u, e0.z);
-  write_bits(&block, 17u + 5u * 8u, 8u, e1.z);
-  write_bits(&block, 17u + 6u * 8u, 8u, e0.w);
-  write_bits(&block, 17u + 7u * 8u, 8u, e1.w);
+  write_bits(&block, 17u + 0u * 8u, 8u, u32(e0.x));
+  write_bits(&block, 17u + 1u * 8u, 8u, u32(e1.x));
+  write_bits(&block, 17u + 2u * 8u, 8u, u32(e0.y));
+  write_bits(&block, 17u + 3u * 8u, 8u, u32(e1.y));
+  write_bits(&block, 17u + 4u * 8u, 8u, u32(e0.z));
+  write_bits(&block, 17u + 5u * 8u, 8u, u32(e1.z));
+  write_bits(&block, 17u + 6u * 8u, 8u, u32(e0.w));
+  write_bits(&block, 17u + 7u * 8u, 8u, u32(e1.w));
 
-  // Weights at the top of the block. Two 1-bit writes per weight keeps
-  // the LSB-at-127 convention visible at every call site; the cost over
-  // a batched write is negligible next to the full encode.
+  // Weights occupy exactly the top 32-bit word (bits [127:96]). For weight k,
+  // block_bit(127 − 2k) is its LSB and block_bit(126 − 2k) its MSB; relative
+  // to word 3 (bit 96) those land at local bits (31 − 2k) and (30 − 2k). One
+  // shift-OR per weight reproduces the two per-weight 1-bit writes exactly.
+  var w3: u32 = 0u;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let w = best.indices[k] & 0x3u;
-    write_bits(&block, 127u - 2u * k, 1u,  w & 1u);
-    write_bits(&block, 126u - 2u * k, 1u, (w >> 1u) & 1u);
+    let w = indices[k] & 0x3u;
+    w3 = w3 | ((w & 1u) << (31u - 2u * k)) | (((w >> 1u) & 1u) << (30u - 2u * k));
   }
+  block[3] = w3;
 
   // 7. Store as 4 u32s.
   let out = block_index * 4u;

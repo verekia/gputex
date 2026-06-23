@@ -25,6 +25,10 @@
 //      only if quantized endpoints still satisfy r0 > r1 AND total
 //      squared error decreased.
 //   5. Pack 2 endpoint bytes + 48 bits of indices into the 8-byte block.
+//
+// The candidate endpoints/indices/error are tracked in place — the refit
+// overwrites them only when accepted — so no 16-entry index array is ever
+// copied across a function return.
 
 struct Params {
   blocks_x: u32,
@@ -71,22 +75,37 @@ fn quantize8(v: f32) -> u32 {
   return u32(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
 }
 
-// Nearest-palette-index search over the 8-entry palette, returning the
-// index and squared error. `palette` is stored in function memory so we
-// pass by pointer.
-fn nearest_index(v: f32, palette: ptr<function, array<f32, 8>>) -> vec2<f32> {
-  // x = best index (encoded as f32), y = best squared error.
-  var best_j: u32 = 0u;
-  var best_d: f32 = 1e20;
+// Build the 8-entry palette for endpoints (r0f, r1f) in normalised space.
+fn build_pal(r0f: f32, r1f: f32, pal: ptr<function, array<f32, 8>>) {
   for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-    let d  = (*palette)[j] - v;
-    let d2 = d * d;
-    if (d2 < best_d) {
-      best_d = d2;
-      best_j = j;
-    }
+    (*pal)[j] = w0_6(j) * r0f + w1_6(j) * r1f;
   }
-  return vec2<f32>(f32(best_j), best_d);
+}
+
+// Assign each of the 16 values its nearest palette entry (full 8-entry L2),
+// writing indices into `out_idx` and returning the total squared error.
+fn assign_all(
+  values:  ptr<function, array<f32, 16>>,
+  pal:     ptr<function, array<f32, 8>>,
+  out_idx: ptr<function, array<u32, 16>>,
+) -> f32 {
+  var err: f32 = 0.0;
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let v = (*values)[k];
+    var best_j: u32 = 0u;
+    var best_d: f32 = 1e20;
+    for (var j: u32 = 0u; j < 8u; j = j + 1u) {
+      let d  = (*pal)[j] - v;
+      let d2 = d * d;
+      if (d2 < best_d) {
+        best_d = d2;
+        best_j = j;
+      }
+    }
+    (*out_idx)[k] = best_j;
+    err = err + best_d;
+  }
+  return err;
 }
 
 // Encode 16 single-channel values into an 8-byte BC4 block, packed as
@@ -108,24 +127,10 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
   }
 
   // ---------------- 2. Initial palette + indices + error --------------
-  var palette: array<f32, 8>;
-  let r0f = f32(r0) / 255.0;
-  let r1f = f32(r1) / 255.0;
-  for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-    palette[j] = w0_6(j) * r0f + w1_6(j) * r1f;
-  }
+  var pal: array<f32, 8>;
+  build_pal(f32(r0) / 255.0, f32(r1) / 255.0, &pal);
   var indices: array<u32, 16>;
-  var err: f32 = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let sel = nearest_index((*values)[k], &palette);
-    indices[k] = u32(sel.x);
-    err = err + sel.y;
-  }
-
-  var best_r0 = r0;
-  var best_r1 = r1;
-  var best_indices = indices;
-  var best_err = err;
+  var err = assign_all(values, &pal, &indices);
 
   // ---------------- 3. Refinement: least-squares on (r0, r1) ----------
   // Normal equations for palette[j] = a_j * r0 + b_j * r1:
@@ -153,24 +158,14 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
     // Only accept refinements that stay in 6-interp mode. A refinement
     // that flips or equalizes the endpoints would change decode mode.
     if (qR0 > qR1) {
-      var pal2: array<f32, 8>;
-      let r0f2 = f32(qR0) / 255.0;
-      let r1f2 = f32(qR1) / 255.0;
-      for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-        pal2[j] = w0_6(j) * r0f2 + w1_6(j) * r1f2;
-      }
+      build_pal(f32(qR0) / 255.0, f32(qR1) / 255.0, &pal);
       var idx2: array<u32, 16>;
-      var err2: f32 = 0.0;
-      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-        let sel = nearest_index((*values)[k], &pal2);
-        idx2[k] = u32(sel.x);
-        err2 = err2 + sel.y;
-      }
-      if (err2 < best_err) {
-        best_r0 = qR0;
-        best_r1 = qR1;
-        best_indices = idx2;
-        best_err = err2;
+      let err2 = assign_all(values, &pal, &idx2);
+      if (err2 < err) {
+        r0 = qR0;
+        r1 = qR1;
+        indices = idx2;
+        err = err2;
       }
     }
   }
@@ -186,7 +181,7 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
   var idx_hi: u32 = 0u;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let bit = 3u * k;
-    let v = best_indices[k] & 7u;
+    let v = indices[k] & 7u;
     if (bit + 3u <= 32u) {
       idx_lo = idx_lo | (v << bit);
     } else if (bit >= 32u) {
@@ -201,7 +196,7 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
   // Final u32s, both little-endian:
   //   u32[0] bytes = red0, red1, idx_lo[7:0], idx_lo[15:8]
   //   u32[1] bytes = idx_lo[23:16], idx_lo[31:24], idx_hi[7:0], idx_hi[15:8]
-  let out_lo = best_r0 | (best_r1 << 8u) | ((idx_lo & 0xFFFFu) << 16u);
+  let out_lo = r0 | (r1 << 8u) | ((idx_lo & 0xFFFFu) << 16u);
   let out_hi = (idx_lo >> 16u) | (idx_hi << 16u);
 
   return vec2<u32>(out_lo, out_hi);
