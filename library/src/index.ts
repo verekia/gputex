@@ -18,6 +18,7 @@ export {
   type EncoderOptions,
   type EncoderConstructor,
   type EncodeCallOptions,
+  type EncodeQuality,
   type EncodeResult,
   type EncodeBytesResult,
   type FormatVariant,

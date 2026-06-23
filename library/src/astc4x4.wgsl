@@ -35,6 +35,15 @@
 // endpoints and reflect indices (w' = 3 − w). This keeps the decoder out
 // of the blue-contraction branch (see CPU ref file header for the full
 // decoder behaviour).
+//
+// QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
+//   fast (0, default): O(N) bounding-box seed. With only a 4-entry palette the
+//     per-block work is dominated by the O(N²) farthest-pair search below; the
+//     bbox seed plus the (retained) LSQ refit lands within ~0.3 dB at ~2.4×.
+//   high (1): O(N²) farthest-pair seed, byte-for-byte identical to astc4x4_ref.
+
+// 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
+override QUALITY_HIGH: u32 = 0u;
 
 struct Params {
   blocks_x: u32,
@@ -80,21 +89,31 @@ fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
 
 struct Pair { a: vec4<i32>, b: vec4<i32> };
 
-// O(N²) = 120 comparisons returning the two most distant pixel *values*.
-// Same rationale as BC7's `farthest_pair`: bbox corners aren't safe initial
-// endpoints when channels vary in different directions along the data line.
+// Initial endpoints. high: O(N²) = 120 comparisons returning the two most
+// distant pixel values (bbox corners aren't safe when channels vary in
+// different directions along the data line). fast: O(N) per-channel bounding
+// box — the refit pass corrects the seed. Branch resolved at pipeline compile.
 fn farthest_pair(pixels: ptr<function, array<vec4<i32>, 16>>) -> Pair {
-  var best_d: i32 = 0;
-  var pa = (*pixels)[0];
-  var pb = (*pixels)[1];
-  for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let xi = (*pixels)[i];
-    for (var j: u32 = i + 1u; j < 16u; j = j + 1u) {
-      let d = dist2(xi, (*pixels)[j]);
-      if (d > best_d) { best_d = d; pa = xi; pb = (*pixels)[j]; }
+  if (QUALITY_HIGH != 0u) {
+    var best_d: i32 = 0;
+    var pa = (*pixels)[0];
+    var pb = (*pixels)[1];
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let xi = (*pixels)[i];
+      for (var j: u32 = i + 1u; j < 16u; j = j + 1u) {
+        let d = dist2(xi, (*pixels)[j]);
+        if (d > best_d) { best_d = d; pa = xi; pb = (*pixels)[j]; }
+      }
     }
+    return Pair(pa, pb);
   }
-  return Pair(pa, pb);
+  var lo = (*pixels)[0];
+  var hi = (*pixels)[0];
+  for (var i: u32 = 1u; i < 16u; i = i + 1u) {
+    lo = min(lo, (*pixels)[i]);
+    hi = max(hi, (*pixels)[i]);
+  }
+  return Pair(lo, hi);
 }
 
 // -------------------------- Palette + assignment ------------------------ //

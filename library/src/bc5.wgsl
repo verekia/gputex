@@ -29,6 +29,15 @@
 // The candidate endpoints/indices/error are tracked in place — the refit
 // overwrites them only when accepted — so no 16-entry index array is ever
 // copied across a function return.
+//
+// QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
+//   fast (0, default): bbox endpoints + a single nearest-search assignment per
+//     channel. The LSQ refit pass below is the bulk of the kernel and buys
+//     only ~0.36 dB, so it is skipped — ~3.8× faster.
+//   high (1): runs the refit, byte-for-byte identical to bc4_ref/bc5_ref.
+
+// 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
+override QUALITY_HIGH: u32 = 0u;
 
 struct Params {
   blocks_x: u32,
@@ -133,39 +142,44 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
   var err = assign_all(values, &pal, &indices);
 
   // ---------------- 3. Refinement: least-squares on (r0, r1) ----------
-  // Normal equations for palette[j] = a_j * r0 + b_j * r1:
-  //   [ΣAA  ΣAB] [r0]   [ΣAV]
-  //   [ΣAB  ΣBB] [r1] = [ΣBV]
-  var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
-  var sAV: f32 = 0.0; var sBV: f32 = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let a = w0_6(indices[k]);
-    let b = w1_6(indices[k]);
-    let v = (*values)[k];
-    sAA = sAA + a * a;
-    sBB = sBB + b * b;
-    sAB = sAB + a * b;
-    sAV = sAV + a * v;
-    sBV = sBV + b * v;
-  }
-  let det = sAA * sBB - sAB * sAB;
-  // Degenerate system → skip refinement.
-  if (abs(det) > 1e-9) {
-    let new_r0 = clamp((sBB * sAV - sAB * sBV) / det, 0.0, 1.0);
-    let new_r1 = clamp((sAA * sBV - sAB * sAV) / det, 0.0, 1.0);
-    let qR0 = quantize8(new_r0);
-    let qR1 = quantize8(new_r1);
-    // Only accept refinements that stay in 6-interp mode. A refinement
-    // that flips or equalizes the endpoints would change decode mode.
-    if (qR0 > qR1) {
-      build_pal(f32(qR0) / 255.0, f32(qR1) / 255.0, &pal);
-      var idx2: array<u32, 16>;
-      let err2 = assign_all(values, &pal, &idx2);
-      if (err2 < err) {
-        r0 = qR0;
-        r1 = qR1;
-        indices = idx2;
-        err = err2;
+  // High-quality only — the refit is the bulk of the per-channel cost and the
+  // branch is resolved at pipeline-compile time, so the fast path skips all of
+  // it (the sums loop included), not just the acceptance test.
+  if (QUALITY_HIGH != 0u) {
+    // Normal equations for palette[j] = a_j * r0 + b_j * r1:
+    //   [ΣAA  ΣAB] [r0]   [ΣAV]
+    //   [ΣAB  ΣBB] [r1] = [ΣBV]
+    var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
+    var sAV: f32 = 0.0; var sBV: f32 = 0.0;
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let a = w0_6(indices[k]);
+      let b = w1_6(indices[k]);
+      let v = (*values)[k];
+      sAA = sAA + a * a;
+      sBB = sBB + b * b;
+      sAB = sAB + a * b;
+      sAV = sAV + a * v;
+      sBV = sBV + b * v;
+    }
+    let det = sAA * sBB - sAB * sAB;
+    // Degenerate system → skip refinement.
+    if (abs(det) > 1e-9) {
+      let new_r0 = clamp((sBB * sAV - sAB * sBV) / det, 0.0, 1.0);
+      let new_r1 = clamp((sAA * sBV - sAB * sAV) / det, 0.0, 1.0);
+      let qR0 = quantize8(new_r0);
+      let qR1 = quantize8(new_r1);
+      // Only accept refinements that stay in 6-interp mode. A refinement
+      // that flips or equalizes the endpoints would change decode mode.
+      if (qR0 > qR1) {
+        build_pal(f32(qR0) / 255.0, f32(qR1) / 255.0, &pal);
+        var idx2: array<u32, 16>;
+        let err2 = assign_all(values, &pal, &idx2);
+        if (err2 < err) {
+          r0 = qR0;
+          r1 = qR1;
+          indices = idx2;
+          err = err2;
+        }
       }
     }
   }

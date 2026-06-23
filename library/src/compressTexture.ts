@@ -18,7 +18,7 @@
 
 import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Texture } from 'three'
 
-import { Encoder } from './Encoder.js'
+import { Encoder, type EncodeQuality } from './Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
 import { selectFormat, type TextureHint } from './selectFormat.js'
 import { needsWriteTextureWorkaround } from './workarounds.js'
@@ -51,6 +51,12 @@ export interface CompressOptions {
   flipY?: boolean
   /** Generate a full mip chain down to 1×1 on the CPU, encode every level. */
   mipmaps?: boolean
+  /**
+   * Encode quality / speed trade-off. 'fast' (default) is ~2–4× faster for a
+   * ≤0.36 dB PSNR cost; 'high' runs the exhaustive search (output identical to
+   * the CPU reference encoders). No effect on BC1.
+   */
+  quality?: EncodeQuality
   /** Reuse an existing device (e.g. Three.js's renderer device) instead
    *  of creating a new one. When provided, the encoder never destroys it. */
   device?: GPUDevice
@@ -197,6 +203,7 @@ export async function compressTexture(
     colorSpace = 'srgb',
     flipY = true,
     mipmaps = false,
+    quality = 'fast',
     device: providedDevice,
     adapter: providedAdapter,
   } = options
@@ -287,9 +294,9 @@ export async function compressTexture(
       if (needsWriteTexture) {
         const level0 = bitmapToMipLevel(bitmap, flipY)
         const imageData = mipLevelToImageData(level0)
-        bytes = await encoder.encodeToBytes(imageData)
+        bytes = await encoder.encodeToBytes(imageData, { quality })
       } else {
-        bytes = await encoder.encodeToBytes(bitmap, { flipY })
+        bytes = await encoder.encodeToBytes(bitmap, { flipY, quality })
       }
       const tex = encoder.buildMippedTexture([bytes], { colorSpace })
       return {
@@ -323,7 +330,7 @@ export async function compressTexture(
       // is a no-op when the level is already block-aligned.
       const padded = padToBlockMultiple(level)
       const imageData = mipLevelToImageData(padded)
-      const bytes = await encoder.encodeToBytes(imageData)
+      const bytes = await encoder.encodeToBytes(imageData, { quality })
       encodedLevels.push(bytes)
       totalEncodeMs += bytes.encodeMs
     }

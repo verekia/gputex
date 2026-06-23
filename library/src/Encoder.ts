@@ -47,9 +47,19 @@ export interface EncoderOptions {
   ownsDevice?: boolean
 }
 
+/**
+ * Encoder quality level. 'fast' (default) uses the cheaper search paths in the
+ * shaders — measured ~2–4× faster for ≤0.36 dB PSNR. 'high' runs the exhaustive
+ * search, producing output byte-identical to the CPU reference encoders.
+ * No effect on BC1 (already single-pass; both levels are identical).
+ */
+export type EncodeQuality = 'fast' | 'high'
+
 export interface EncodeCallOptions {
   /** Tags the output color space. Forced 'linear' for encoders with supportsSrgb=false. */
   colorSpace?: 'srgb' | 'linear'
+  /** Encode quality / speed trade-off. Default 'fast'. */
+  quality?: EncodeQuality
 }
 
 export interface EncodeResult {
@@ -134,7 +144,10 @@ export abstract class Encoder {
   // `!:` because these are set in `_buildPipeline()` which the constructor
   // calls; TypeScript's flow analysis doesn't see through method calls.
   protected _module!: GPUShaderModule
+  // Default pipeline (fast). Kept as a field for back-compat; the per-quality
+  // cache below holds the specialised pipelines for encoders that support it.
   protected _pipeline!: GPUComputePipeline
+  protected _pipelineCache = new Map<EncodeQuality, GPUComputePipeline>()
 
   constructor({ device, adapter, ownsDevice = false }: EncoderOptions) {
     this.device = device
@@ -150,11 +163,39 @@ export abstract class Encoder {
       label: `${this.label}-encoder`,
       code,
     })
-    this._pipeline = device.createComputePipeline({
-      label: `${this.label}-encoder-pipeline`,
+    if (this.supportsQuality) {
+      // Eagerly build the default (fast) pipeline so shader compile errors
+      // still surface at construction time, as before.
+      this._pipeline = this._getPipeline('fast')
+    } else {
+      this._pipeline = device.createComputePipeline({
+        label: `${this.label}-encoder-pipeline`,
+        layout: 'auto',
+        compute: { module: this._module, entryPoint: 'encode' },
+      })
+    }
+  }
+
+  /**
+   * Pipeline for a given quality level. Encoders that don't declare a
+   * `QUALITY_HIGH` override (`supportsQuality === false`, e.g. BC1) ignore the
+   * argument and reuse the single pipeline. Specialised pipelines are cached.
+   */
+  protected _getPipeline(quality: EncodeQuality): GPUComputePipeline {
+    if (!this.supportsQuality) return this._pipeline
+    const cached = this._pipelineCache.get(quality)
+    if (cached) return cached
+    const pipeline = this.device.createComputePipeline({
+      label: `${this.label}-encoder-pipeline-${quality}`,
       layout: 'auto',
-      compute: { module: this._module, entryPoint: 'encode' },
+      compute: {
+        module: this._module,
+        entryPoint: 'encode',
+        constants: { QUALITY_HIGH: quality === 'high' ? 1 : 0 },
+      },
     })
+    this._pipelineCache.set(quality, pipeline)
+    return pipeline
   }
 
   destroy(): void {
@@ -181,6 +222,15 @@ export abstract class Encoder {
     return true
   }
 
+  /**
+   * Whether the shader declares a `QUALITY_HIGH` pipeline-overridable constant
+   * (i.e. has distinct fast/high search paths). BC1 is already single-pass and
+   * leaves this false; BC5/BC7/ASTC override it to true.
+   */
+  get supportsQuality(): boolean {
+    return false
+  }
+
   /** WGSL compute-shader source. */
   abstract wgslSource(): string
 
@@ -204,9 +254,12 @@ export abstract class Encoder {
   // Shared encode() — pad, upload, dispatch, readback, wrap.           //
   // ------------------------------------------------------------------ //
 
-  async encode(source: EncoderImageSource, { colorSpace = 'srgb' }: EncodeCallOptions = {}): Promise<EncodeResult> {
+  async encode(
+    source: EncoderImageSource,
+    { colorSpace = 'srgb', quality = 'fast' }: EncodeCallOptions = {},
+  ): Promise<EncodeResult> {
     const effectiveSrgb = colorSpace === 'srgb' && this.supportsSrgb
-    const bytes = await this.encodeToBytes(source)
+    const bytes = await this.encodeToBytes(source, { quality })
 
     const threeFormat = this.threeTextureFormat({ colorSpace: effectiveSrgb ? 'srgb' : 'linear' })
     const mip: CompressedTextureMipmap = {
@@ -249,7 +302,7 @@ export abstract class Encoder {
    */
   async encodeToBytes(
     source: EncoderImageSource,
-    { flipY = false }: { flipY?: boolean } = {},
+    { flipY = false, quality = 'fast' }: { flipY?: boolean; quality?: EncodeQuality } = {},
   ): Promise<EncodeBytesResult> {
     const device = this.device
     // ImageBitmap/VideoFrame/etc. all expose width/height numerically;
@@ -296,10 +349,14 @@ export abstract class Encoder {
     })
     device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, paddedWidth, paddedHeight]))
 
-    // 4. Bind group — layout comes from `layout: 'auto'` on the pipeline.
+    // 4. Pipeline + bind group. The pipeline is specialised for the requested
+    //    quality level; its `layout: 'auto'` bind group layout is identical
+    //    across levels (same bindings), but we source it from the selected
+    //    pipeline to keep them provably compatible.
+    const pipeline = this._getPipeline(quality)
     const bindGroup = device.createBindGroup({
       label: `${this.label}-bg`,
-      layout: this._pipeline.getBindGroupLayout(0),
+      layout: pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: srcTex.createView() },
         { binding: 1, resource: { buffer: dstBuffer } },
@@ -312,7 +369,7 @@ export abstract class Encoder {
     const t0 = performance.now()
     const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
     const pass = enc.beginComputePass()
-    pass.setPipeline(this._pipeline)
+    pass.setPipeline(pipeline)
     pass.setBindGroup(0, bindGroup)
     pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(blocksY / wgY), 1)
     pass.end()

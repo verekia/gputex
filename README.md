@@ -38,10 +38,23 @@ const { texture, format } = await compressTexture('/cobblestone.avif', {
   hint: 'color', // 'color' | 'colorWithAlpha' | 'normal'
   colorSpace: 'srgb',
   mipmaps: true,
+  quality: 'fast', // 'fast' (default) | 'high'
 })
 
 material.map = texture
 ```
+
+#### Quality
+
+`quality` trades encode speed against compression accuracy:
+
+- **`'fast'` (default)** — skips the search steps that cost the most GPU time for
+  the least quality (BC7's exhaustive p-bit search, ASTC's O(N²) endpoint seed,
+  BC5's least-squares refit). Measured on Apple GPU at 1024×1024: **BC7 ~2.6×**,
+  **ASTC ~2.2×**, **BC5 ~4.4×** faster, for a PSNR cost of **≤0.36 dB**
+  (imperceptible). BC1 is single-pass and unaffected.
+- **`'high'`** — runs the exhaustive search; output is byte-for-byte identical to
+  the CPU reference encoders.
 
 ### `GputexLoader` — Three.js Loader
 

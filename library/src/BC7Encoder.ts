@@ -33,6 +33,9 @@ export class BC7Encoder extends Encoder {
   override get supportsSrgb(): boolean {
     return true
   }
+  override get supportsQuality(): boolean {
+    return true
+  }
 
   override wgslSource(): string {
     return shaderSource
