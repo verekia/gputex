@@ -4,23 +4,30 @@
 //   • source loading (URL / Blob / ImageBitmap / HTMLImageElement / ...)
 //   • capability-based format selection
 //   • single-level or full-mip-chain encoding
-//   • uncompressed RGBA8 fallback when no compressed format is available
+//   • a three-tier path: WebGPU compute → WebGL2 fragment-shader fallback →
+//     uncompressed RGBA8 when neither can produce a sampleable compressed format
 //
 //   const { texture } = await compressTexture('/cobblestone.avif', {
 //     hint: 'color', colorSpace: 'srgb', mipmaps: true,
 //   })
 //   material.map = texture
 //
-// Device ownership: if the caller passes `device`, we reuse it and never
-// destroy it. Otherwise we request our own adapter + device, tag the
-// encoder as owning it, and expose a `destroy()` on the result for
-// cleanup. (See `CompressResult.destroy`.)
+// Device ownership (WebGPU): if the caller passes `device`, we reuse it and
+// never destroy it. Otherwise we request our own adapter + device, tag the
+// encoder as owning it, and expose a `destroy()` on the result for cleanup.
+//
+// The WebGL fallback shares one process-wide WebGL2 context (see
+// webgl/webglContext.ts) and runs the *fast* encoders only; the `quality`
+// option and `device`/`adapter` options apply to the WebGPU path only.
 
 import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Texture } from 'three'
 
 import { Encoder, type EncodeQuality } from './Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
 import { selectFormat, type TextureHint } from './selectFormat.js'
+import { selectWebGLFormat } from './webgl/selectWebGLFormat.js'
+import { detectWebGLCapabilities } from './webgl/webglCapabilities.js'
+import { getSharedWebGLContext } from './webgl/webglContext.js'
 import { needsWriteTextureWorkaround } from './workarounds.js'
 
 import type { CompressedTexture } from 'three'
@@ -54,22 +61,29 @@ export interface CompressOptions {
   /**
    * Encode quality / speed trade-off. 'fast' (default) is ~2–4× faster for a
    * ≤0.36 dB PSNR cost; 'high' runs the exhaustive search (output identical to
-   * the CPU reference encoders). No effect on BC1.
+   * the CPU reference encoders). No effect on BC1 or on the WebGL fallback
+   * (which always uses the fast encoders).
    */
   quality?: EncodeQuality
   /** Reuse an existing device (e.g. Three.js's renderer device) instead
-   *  of creating a new one. When provided, the encoder never destroys it. */
+   *  of creating a new one. WebGPU path only. When provided, the encoder
+   *  never destroys it. */
   device?: GPUDevice
   adapter?: GPUAdapter
 }
 
 export interface CompressResult {
-  /** CompressedTexture on the compressed path; Texture on RGBA8 fallback. */
+  /** CompressedTexture on a compressed path; Texture on RGBA8 fallback. */
   texture: Texture | CompressedTexture
   /** The compressed format selected, or null when we fell back to RGBA8. */
   format: TextureFormat | null
   /** True iff we returned an uncompressed Texture because no encoder fit. */
   fallbackUncompressed: boolean
+  /**
+   * Which backend produced the result. 'webgpu' = compute path, 'webgl' =
+   * fragment-shader fallback, 'none' = uncompressed RGBA8.
+   */
+  backend: 'webgpu' | 'webgl' | 'none'
   /**
    * True iff the chosen format is ASTC and the hint was 'normal'. The
    * caller must apply the (R, W) → (x, y) swizzle in the material — ASTC
@@ -175,7 +189,7 @@ function mipLevelToImageData(level: MipLevel): ImageData {
 
 /**
  * Wrap a bitmap as a plain RGBA8 Three.js `Texture`. Used when no
- * compressed format is available on the adapter. The caller is still
+ * compressed format is available on either backend. The caller is still
  * expected to dispose this texture like any other.
  */
 function wrapUncompressed(bitmap: ImageBitmap, srgb: boolean, flipY: boolean): Texture {
@@ -209,151 +223,196 @@ export async function compressTexture(
   } = options
 
   const srgb = colorSpace === 'srgb'
-
   const bitmap = await sourceToBitmap(source)
 
-  // Resolve adapter / device. We need an adapter for capability detection
-  // regardless of whether the user passed in a device.
-  if (!('gpu' in navigator)) {
-    // Can't even inspect capabilities; fall straight back to RGBA8.
-    console.warn('[compressTexture] WebGPU unavailable; returning uncompressed RGBA8.')
-    const tex = wrapUncompressed(bitmap, srgb, flipY)
-    return {
-      texture: tex,
-      format: null,
-      fallbackUncompressed: true,
-      astcNormalRemap: false,
-      width: bitmap.width,
-      height: bitmap.height,
-      mipLevels: 1,
-      encodeMs: 0,
-      destroy: () => {
-        tex.dispose()
-      },
+  // Tier 1: WebGPU compute path. Tier 2: WebGL2 fragment-shader fallback.
+  // Tier 3: uncompressed RGBA8.
+  const viaWebGPU = await encodeViaWebGPU()
+  if (viaWebGPU) return viaWebGPU
+  const viaWebGL = encodeViaWebGL()
+  if (viaWebGL) return viaWebGL
+
+  console.warn(
+    '[compressTexture] No compressed path available (WebGPU and WebGL2 both ' +
+      'lack a usable compressed-texture format); returning uncompressed RGBA8.',
+  )
+  const tex = wrapUncompressed(bitmap, srgb, flipY)
+  return {
+    texture: tex,
+    format: null,
+    fallbackUncompressed: true,
+    backend: 'none',
+    astcNormalRemap: false,
+    width: bitmap.width,
+    height: bitmap.height,
+    mipLevels: 1,
+    encodeMs: 0,
+    destroy: () => {
+      tex.dispose()
+    },
+  }
+
+  // ----------------------------- WebGPU ------------------------------ //
+
+  /** Returns a compressed result, or null if WebGPU can't produce one. */
+  async function encodeViaWebGPU(): Promise<CompressResult | null> {
+    if (!('gpu' in navigator)) return null
+    const adapter = providedAdapter ?? (await navigator.gpu.requestAdapter())
+    if (!adapter) return null
+
+    const selection = selectFormat(adapter, hint, { colorSpace })
+    if (!selection.format || !selection.encoderClass) return null
+
+    // Instantiate the encoder. Reuse a caller-provided device, otherwise
+    // have the encoder's `create()` request its own (with the needed feature).
+    let encoder: Encoder
+    if (providedDevice) {
+      const EncoderCtor = selection.encoderClass
+      encoder = new EncoderCtor({ device: providedDevice, adapter, ownsDevice: false })
+    } else {
+      encoder = await selection.encoderClass.create()
     }
-  }
 
-  const adapter = providedAdapter ?? (await navigator.gpu.requestAdapter())
-  if (!adapter) {
-    console.warn('[compressTexture] No WebGPU adapter; returning uncompressed RGBA8.')
-    const tex = wrapUncompressed(bitmap, srgb, flipY)
-    return {
-      texture: tex,
-      format: null,
-      fallbackUncompressed: true,
-      astcNormalRemap: false,
-      width: bitmap.width,
-      height: bitmap.height,
-      mipLevels: 1,
-      encodeMs: 0,
-      destroy: () => {
-        tex.dispose()
-      },
-    }
-  }
+    try {
+      const needsWriteTexture = needsWriteTextureWorkaround(adapter)
 
-  const selection = selectFormat(adapter, hint, { colorSpace })
-  if (!selection.format || !selection.encoderClass) {
-    console.warn(
-      '[compressTexture] Adapter reports neither texture-compression-bc nor ' +
-        'texture-compression-astc; returning uncompressed RGBA8.',
-    )
-    const tex = wrapUncompressed(bitmap, srgb, flipY)
-    return {
-      texture: tex,
-      format: null,
-      fallbackUncompressed: true,
-      astcNormalRemap: false,
-      width: bitmap.width,
-      height: bitmap.height,
-      mipLevels: 1,
-      encodeMs: 0,
-      destroy: () => {
-        tex.dispose()
-      },
-    }
-  }
-
-  // Instantiate the encoder. Two paths:
-  //   • User provided a device → reuse it.
-  //   • No device provided → have the encoder's `create()` request its
-  //     own, including the needed feature flag.
-  let encoder: Encoder
-  if (providedDevice) {
-    const EncoderCtor = selection.encoderClass
-    encoder = new EncoderCtor({ device: providedDevice, adapter, ownsDevice: false })
-  } else {
-    encoder = await selection.encoderClass.create()
-  }
-
-  try {
-    const needsWriteTexture = needsWriteTextureWorkaround(adapter)
-
-    if (!mipmaps) {
-      let bytes
-      if (needsWriteTexture) {
-        const level0 = bitmapToMipLevel(bitmap, flipY)
-        const imageData = mipLevelToImageData(level0)
-        bytes = await encoder.encodeToBytes(imageData, { quality })
-      } else {
-        bytes = await encoder.encodeToBytes(bitmap, { flipY, quality })
+      if (!mipmaps) {
+        let bytes
+        if (needsWriteTexture) {
+          const level0 = bitmapToMipLevel(bitmap, flipY)
+          const imageData = mipLevelToImageData(level0)
+          bytes = await encoder.encodeToBytes(imageData, { quality })
+        } else {
+          bytes = await encoder.encodeToBytes(bitmap, { flipY, quality })
+        }
+        const tex = encoder.buildMippedTexture([bytes], { colorSpace })
+        return {
+          texture: tex,
+          format: selection.format,
+          fallbackUncompressed: false,
+          backend: 'webgpu',
+          astcNormalRemap: selection.astcNormalRemap,
+          width: bytes.width,
+          height: bytes.height,
+          mipLevels: 1,
+          encodeMs: bytes.encodeMs,
+          destroy: () => {
+            tex.dispose()
+            encoder.destroy()
+          },
+        }
       }
-      const tex = encoder.buildMippedTexture([bytes], { colorSpace })
+
+      // Mipped path. Rasterise once, box-filter the chain on CPU, encode
+      // each level as a separate compute dispatch.
+      const level0 = bitmapToMipLevel(bitmap, flipY)
+      const chain = generateMipChain(level0)
+
+      const encodedLevels = []
+      let totalEncodeMs = 0
+      for (const level of chain) {
+        const padded = padToBlockMultiple(level)
+        const imageData = mipLevelToImageData(padded)
+        const bytes = await encoder.encodeToBytes(imageData, { quality })
+        encodedLevels.push(bytes)
+        totalEncodeMs += bytes.encodeMs
+      }
+
+      const tex = encoder.buildMippedTexture(encodedLevels, { colorSpace })
       return {
         texture: tex,
         format: selection.format,
         fallbackUncompressed: false,
+        backend: 'webgpu',
         astcNormalRemap: selection.astcNormalRemap,
-        width: bytes.width,
-        height: bytes.height,
-        mipLevels: 1,
-        encodeMs: bytes.encodeMs,
+        width: level0.width,
+        height: level0.height,
+        mipLevels: encodedLevels.length,
+        encodeMs: totalEncodeMs,
         destroy: () => {
           tex.dispose()
           encoder.destroy()
         },
       }
+    } catch (e) {
+      // Encoder owns a device when we created it; clean up on the error path
+      // so we don't leak adapters across retries.
+      encoder.destroy()
+      throw e
     }
+  }
 
-    // Mipped path. Rasterise once, box-filter the chain on CPU, encode
-    // each level as a separate compute dispatch. The encoder already
-    // knows how to pad non-block-aligned inputs, but sub-4×4 mip levels
-    // (where both dims < 4) need an explicit clamp-to-edge pad so the
-    // block doesn't gain phantom edge-colour bands.
-    const level0 = bitmapToMipLevel(bitmap, flipY)
-    const chain = generateMipChain(level0)
+  // ------------------------------ WebGL ------------------------------ //
 
-    const encodedLevels = []
-    let totalEncodeMs = 0
-    for (const level of chain) {
-      // Pad sub-4 dims up to 4 with clamp-to-edge. `padToBlockMultiple`
-      // is a no-op when the level is already block-aligned.
-      const padded = padToBlockMultiple(level)
-      const imageData = mipLevelToImageData(padded)
-      const bytes = await encoder.encodeToBytes(imageData, { quality })
-      encodedLevels.push(bytes)
-      totalEncodeMs += bytes.encodeMs
+  /**
+   * Returns a compressed result, or null if WebGL2 can't produce one. Any
+   * encode failure degrades to null (→ uncompressed) rather than throwing —
+   * the fallback's job is to keep producing a working texture.
+   */
+  function encodeViaWebGL(): CompressResult | null {
+    const gl = getSharedWebGLContext()
+    if (!gl) return null
+
+    const caps = detectWebGLCapabilities(gl)
+    const selection = selectWebGLFormat(caps, hint, { colorSpace })
+    if (!selection.format || !selection.encoderClass) return null
+
+    const encoder = selection.encoderClass.create(gl)
+    try {
+      if (!mipmaps) {
+        const bytes = encoder.encodeToBytes(bitmap, { flipY })
+        const tex = encoder.buildMippedTexture([bytes], { colorSpace })
+        return {
+          texture: tex,
+          format: selection.format,
+          fallbackUncompressed: false,
+          backend: 'webgl',
+          astcNormalRemap: selection.astcNormalRemap,
+          width: bytes.width,
+          height: bytes.height,
+          mipLevels: 1,
+          encodeMs: bytes.encodeMs,
+          destroy: () => {
+            tex.dispose()
+            encoder.destroy()
+          },
+        }
+      }
+
+      // Mipped path mirrors the WebGPU one: flip baked into level 0, each
+      // CPU-box-filtered level padded to a whole block then encoded.
+      const level0 = bitmapToMipLevel(bitmap, flipY)
+      const chain = generateMipChain(level0)
+
+      const encodedLevels = []
+      let totalEncodeMs = 0
+      for (const level of chain) {
+        const padded = padToBlockMultiple(level)
+        const bytes = encoder.encodeToBytes(padded)
+        encodedLevels.push(bytes)
+        totalEncodeMs += bytes.encodeMs
+      }
+
+      const tex = encoder.buildMippedTexture(encodedLevels, { colorSpace })
+      return {
+        texture: tex,
+        format: selection.format,
+        fallbackUncompressed: false,
+        backend: 'webgl',
+        astcNormalRemap: selection.astcNormalRemap,
+        width: level0.width,
+        height: level0.height,
+        mipLevels: encodedLevels.length,
+        encodeMs: totalEncodeMs,
+        destroy: () => {
+          tex.dispose()
+          encoder.destroy()
+        },
+      }
+    } catch (e) {
+      encoder.destroy()
+      console.warn('[compressTexture] WebGL fallback encode failed; returning uncompressed RGBA8.', e)
+      return null
     }
-
-    const tex = encoder.buildMippedTexture(encodedLevels, { colorSpace })
-    return {
-      texture: tex,
-      format: selection.format,
-      fallbackUncompressed: false,
-      astcNormalRemap: selection.astcNormalRemap,
-      width: level0.width,
-      height: level0.height,
-      mipLevels: encodedLevels.length,
-      encodeMs: totalEncodeMs,
-      destroy: () => {
-        tex.dispose()
-        encoder.destroy()
-      },
-    }
-  } catch (e) {
-    // Encoder owns a device when we created it; make sure it's cleaned
-    // up on the error path so we don't leak adapters across retries.
-    encoder.destroy()
-    throw e
   }
 }

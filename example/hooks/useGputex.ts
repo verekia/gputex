@@ -10,6 +10,7 @@ import type { Texture } from 'three'
 export interface EncodeInfo {
   format: string | null
   fallbackUncompressed: boolean
+  backend: 'webgpu' | 'webgl' | 'none'
   astcNormalRemap: boolean
   width: number
   height: number

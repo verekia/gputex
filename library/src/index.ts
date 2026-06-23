@@ -24,11 +24,35 @@ export {
   type FormatVariant,
 } from './Encoder.js'
 
-// Concrete encoders.
+// Concrete WebGPU encoders.
 export { BC1Encoder } from './BC1Encoder.js'
 export { BC5Encoder } from './BC5Encoder.js'
 export { BC7Encoder } from './BC7Encoder.js'
 export { ASTC4x4Encoder } from './ASTC4x4Encoder.js'
+
+// WebGL2 fallback encoders + capability / selection utilities. Used
+// automatically by `compressTexture()` when WebGPU is unavailable; exported
+// for callers that want to drive the WebGL path directly.
+export {
+  WebGLBlockEncoder,
+  BC1WebGLEncoder,
+  BC5WebGLEncoder,
+  BC7WebGLEncoder,
+  ASTC4x4WebGLEncoder,
+  createWebGLContext,
+  getSharedWebGLContext,
+  isWebGLAvailable,
+  detectWebGLCapabilities,
+  selectWebGLFormat,
+  type WebGLEncoderImageSource,
+  type WebGLEncoderOptions,
+  type WebGLEncoderConstructor,
+  type WebGLEncodeBytesResult,
+  type RawPixelSource,
+  type WebGLCapabilities,
+  type ExtensionProvider,
+  type WebGLFormatSelection,
+} from './webgl/index.js'
 
 // Format selection + high-level API.
 export { selectFormat, type TextureHint, type SelectFormatOptions, type FormatSelection } from './selectFormat.js'

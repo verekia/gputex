@@ -15,15 +15,9 @@
 // That's enough shared structure to factor out everything except the shader
 // and the few format metadata getters.
 //
-import {
-  CompressedTexture,
-  LinearFilter,
-  LinearMipmapLinearFilter,
-  LinearSRGBColorSpace,
-  SRGBColorSpace,
-  RepeatWrapping,
-} from 'three'
+import { CompressedTexture, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace, RepeatWrapping } from 'three'
 
+import { assembleCompressedTexture } from './textureAssembly.js'
 import { uploadSourceTexture } from './workarounds.js'
 
 import type { CompressedTextureMipmap, CompressedPixelFormat } from 'three'
@@ -460,24 +454,8 @@ export abstract class Encoder {
     }
     const effectiveSrgb = colorSpace === 'srgb' && this.supportsSrgb
     const threeFormat = this.threeTextureFormat({ colorSpace: effectiveSrgb ? 'srgb' : 'linear' })
-    const mipmaps: CompressedTextureMipmap[] = levels.map(l => ({
-      data: l.data,
-      width: l.paddedWidth,
-      height: l.paddedHeight,
-    }))
-    const base = levels[0]!
-    const texture = new CompressedTexture(mipmaps, base.paddedWidth, base.paddedHeight, threeFormat)
-    texture.colorSpace = effectiveSrgb ? SRGBColorSpace : LinearSRGBColorSpace
-    texture.magFilter = LinearFilter
-    texture.minFilter = levels.length > 1 ? LinearMipmapLinearFilter : LinearFilter
-    // We provide the full mip chain explicitly; Three.js must not try to
-    // generate its own (which would clobber our compressed levels).
-    texture.generateMipmaps = false
-    texture.wrapS = texture.wrapT = RepeatWrapping
-    texture.needsUpdate = true
-    texture.userData.logicalWidth = base.width
-    texture.userData.logicalHeight = base.height
-    texture.userData.mipLevels = levels.length
-    return texture
+    // Filter / wrap / colour-space setup is shared with the WebGL fallback
+    // encoders; see textureAssembly.ts.
+    return assembleCompressedTexture(levels, threeFormat, effectiveSrgb)
   }
 }

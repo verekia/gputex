@@ -8,5 +8,6 @@ export default defineConfig({
   splitting: false,
   loader: {
     '.wgsl': 'text',
+    '.glsl': 'text',
   },
 })

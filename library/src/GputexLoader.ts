@@ -78,6 +78,7 @@ export class GputexLoader extends Loader<Texture> {
         result.texture.userData.gputex = {
           format: result.format,
           fallbackUncompressed: result.fallbackUncompressed,
+          backend: result.backend,
           astcNormalRemap: result.astcNormalRemap,
           width: result.width,
           height: result.height,

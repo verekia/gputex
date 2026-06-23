@@ -1,6 +1,6 @@
 # GPUtex
 
-Runtime GPU texture compression via WebGPU compute shaders. Feed it a PNG/JPG/WebP/AVIF and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
+Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
 
 ⚠️: This is 100% vibe-coded. The code is completely unreviewed, under-tested, it will probably crash on many devices, and this library is very likely to go unmaintained. Do not use for anything important.
 
@@ -26,6 +26,18 @@ bun add gputex
 | **BC1**      | 8 (4 bpp)         | Legacy (never auto-selected)                              |
 
 Format selection is automatic: BC7/BC5 on desktop, ASTC on mobile, uncompressed RGBA8 fallback otherwise.
+
+## WebGL fallback
+
+WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The output bytes are identical to the WebGPU encoders, so the resulting `CompressedTexture` looks the same under either renderer.
+
+The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend` field on the result (`'webgpu' | 'webgl' | 'none'`) tells you which path ran.
+
+Notes on the WebGL path:
+
+- It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present.
+- It always uses the **fast** encoders — the `quality: 'high'` option and the `device` / `adapter` options apply to the WebGPU path only.
+- All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas.
 
 ## Usage
 
@@ -171,9 +183,11 @@ encoder.destroy()
 
 ## Requirements
 
-- A browser with WebGPU support
-- `texture-compression-bc` (desktop) or `texture-compression-astc` (mobile) for compressed output
-- Falls back to uncompressed RGBA8 when neither is available
+- WebGPU (primary) **or** WebGL2 (fallback) — almost every current browser has at least one
+- A compressed-texture capability for compressed output:
+  - WebGPU: `texture-compression-bc` (desktop) or `texture-compression-astc` (mobile)
+  - WebGL2: `EXT_texture_compression_bptc` / `_rgtc`, `WEBGL_compressed_texture_astc`, or `WEBGL_compressed_texture_s3tc`
+- Falls back to uncompressed RGBA8 when no compressed format is available on either backend
 
 ## Device-specific workarounds
 

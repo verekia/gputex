@@ -12,6 +12,12 @@ function fmtBytes(n: number | null | undefined): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+function backendLabel(backend: EncodeInfo['backend']): string {
+  if (backend === 'webgpu') return 'WebGPU (compute)'
+  if (backend === 'webgl') return 'WebGL2 (fragment)'
+  return 'none (uncompressed)'
+}
+
 interface InfoPanelProps {
   file: File | null
   result: EncodeInfo | null
@@ -41,7 +47,9 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
   return (
     <div className="fixed top-4 left-4 z-20 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-white/10 bg-black/80 p-4 text-sm leading-relaxed shadow-xl backdrop-blur-xl">
       <h1 className="mb-0.5 text-[15px] font-semibold text-white">GPUtex</h1>
-      <div className="mb-1 text-[11px] text-gray-400">WebGPU compute shader &middot; BC7 / BC5 / ASTC &middot; R3F</div>
+      <div className="mb-1 text-[11px] text-gray-400">
+        WebGPU compute &middot; WebGL fallback &middot; BC7 / BC5 / ASTC &middot; R3F
+      </div>
 
       {caps && (
         <div className="mb-3 font-mono text-[11px]">
@@ -67,6 +75,7 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
       <div className="border-t border-white/10 pt-2">
         <div className="mb-1 text-[10.5px] tracking-wider text-gray-500 uppercase">GPU-compressed</div>
         <Row label="Format" value={result?.format ?? (encoding ? 'Encoding…' : '—')} />
+        <Row label="Backend" value={result ? backendLabel(result.backend) : '—'} />
         <Row label="VRAM" value={compVram ? fmtBytes(compVram) : '—'} />
         <Row label="Encode time" value={result ? `${result.encodeMs.toFixed(1)} ms` : '—'} />
       </div>
