@@ -3,7 +3,7 @@
 //
 // One fragment per 4×4 block → 16-byte BC5 block as 4 × u32 in outColor.
 // BC5 = two BC4 halves (R then G). This is the *fast* path only: bbox
-// endpoints + a single full-L2 index assignment per channel, no LSQ refit
+// endpoints + an O(1) projection index assignment per channel, no LSQ refit
 // (the WGSL `QUALITY_HIGH` branch). Always emits 6-interpolation mode
 // (red0 > red1). See bc5.wgsl for the full derivation.
 
@@ -16,12 +16,17 @@ uniform int uFlipY;
 
 layout(location = 0) out uvec4 outColor;
 
-// 6-interpolation-mode palette weights: pal[j] = W0_6[j]*r0 + W1_6[j]*r1.
-const float W0_6[8] = float[8](1.0, 0.0, 6.0 / 7.0, 5.0 / 7.0, 4.0 / 7.0, 3.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0);
-const float W1_6[8] = float[8](0.0, 1.0, 1.0 / 7.0, 2.0 / 7.0, 3.0 / 7.0, 4.0 / 7.0, 5.0 / 7.0, 6.0 / 7.0);
-
 uint quantize8(float v) {
   return uint(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
+}
+
+// Map a projection level (0 = nearest r1/min, 7 = nearest r0/max) to the BC4
+// palette index. BC4's index order is non-monotonic: index 0 = r0, index 1 =
+// r1, indices 2..7 descend from just below r0 down to just above r1.
+uint levelToIndex(uint level) {
+  if (level == 0u) { return 1u; }
+  if (level == 7u) { return 0u; }
+  return 8u - level; // levels 1..6 -> 7..2
 }
 
 // Encode 16 single-channel values into an 8-byte BC4 block (two little-endian
@@ -39,24 +44,18 @@ uvec2 encodeBC4(float values[16]) {
     if (r1 > 0u) { r1 = r1 - 1u; } else { r0 = r0 + 1u; }
   }
 
-  float pal[8];
+  // O(1) projection: the 8 6-interp palette entries are uniformly spaced between
+  // r1f and r0f, so the nearest entry is round((v-r1f)/(r0f-r1f)*7) remapped to
+  // BC4's index order — no palette build, no 8-entry search, and error-identical
+  // to the L2 search. r0f > r1f (nudge) guarantees a non-zero span.
   float r0f = float(r0) / 255.0;
   float r1f = float(r1) / 255.0;
-  for (int j = 0; j < 8; j++) {
-    pal[j] = W0_6[j] * r0f + W1_6[j] * r1f;
-  }
+  float inv = 7.0 / (r0f - r1f);
 
   uint indices[16];
   for (int k = 0; k < 16; k++) {
-    float v = values[k];
-    uint bestJ = 0u;
-    float bestD = 1e20;
-    for (int j = 0; j < 8; j++) {
-      float d = pal[j] - v;
-      float d2 = d * d;
-      if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
-    }
-    indices[k] = bestJ;
+    float level = clamp(floor((values[k] - r1f) * inv + 0.5), 0.0, 7.0);
+    indices[k] = levelToIndex(uint(level));
   }
 
   // Pack the 48-bit index field (bytes 2..7) split across two u32 halves.

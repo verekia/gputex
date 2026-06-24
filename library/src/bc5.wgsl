@@ -19,22 +19,28 @@
 // Pipeline per channel:
 //   1. Load 16 single-channel values, find min/max → initial endpoints.
 //   2. Quantize to 8-bit. Nudge apart if equal (forces 6-interp mode).
-//   3. Build palette, assign each texel its nearest entry (full L2).
-//   4. One-pass least-squares refinement: solve the 2×2 normal equations
-//      for the (r0, r1) that minimizes Σ(palette[i_k] − v_k)². Accept
-//      only if quantized endpoints still satisfy r0 > r1 AND total
+//   3. Assign each texel an index: fast projects onto the endpoint line
+//      (O(1) per texel); high does the full 8-entry L2 nearest search.
+//   4. (high only) One-pass least-squares refinement: solve the 2×2 normal
+//      equations for the (r0, r1) that minimizes Σ(palette[i_k] − v_k)².
+//      Accept only if quantized endpoints still satisfy r0 > r1 AND total
 //      squared error decreased.
 //   5. Pack 2 endpoint bytes + 48 bits of indices into the 8-byte block.
 //
-// The candidate endpoints/indices/error are tracked in place — the refit
-// overwrites them only when accepted — so no 16-entry index array is ever
-// copied across a function return.
+// In the high path the candidate endpoints/indices/error are tracked in place
+// — the refit overwrites them only when accepted — so no 16-entry index array
+// is ever copied across a function return.
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): bbox endpoints + a single nearest-search assignment per
-//     channel. The LSQ refit pass below is the bulk of the kernel and buys
-//     only ~0.36 dB, so it is skipped — ~3.8× faster.
-//   high (1): runs the refit, byte-for-byte identical to bc4_ref/bc5_ref.
+//   fast (0, default): bbox endpoints, then an O(1) projection assignment. The
+//     8 palette entries are uniformly spaced between the endpoints, so each
+//     texel's nearest entry is found by projecting it onto the endpoint line
+//     and rounding to one of 8 levels — no palette build, no 8-entry search.
+//     This is error-identical to the full L2 search (only exact-midpoint ties,
+//     which carry equal error, may pick the other of two equidistant entries).
+//     The LSQ refit — the bulk of the kernel, worth ~0.36 dB — is skipped.
+//   high (1): full 8-entry L2 search + the refit, byte-for-byte identical to
+//     bc4_ref/bc5_ref.
 
 // 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
 override QUALITY_HIGH: u32 = 0u;
@@ -117,6 +123,36 @@ fn assign_all(
   return err;
 }
 
+// Map a projection level (0 = nearest r1/min, 7 = nearest r0/max) to the BC4
+// palette index. BC4's index order is non-monotonic: index 0 = r0, index 1 =
+// r1, indices 2..7 descend from just below r0 down to just above r1. So the six
+// interior levels map to 8 - level, with the two endpoints as special cases.
+fn level_to_index(level: u32) -> u32 {
+  switch level {
+    case 0u:  { return 1u; }
+    case 7u:  { return 0u; }
+    default:  { return 8u - level; }   // levels 1..6 → indices 7..2
+  }
+}
+
+// Projection index assignment (fast path). The 8 6-interp palette entries are
+// uniformly spaced scalar values between r1 (min) and r0 (max), so the nearest
+// entry equals projecting v onto [r1, r0] and rounding to one of 8 levels —
+// O(1) per texel, no palette build and no 8-entry search. r0f > r1f is
+// guaranteed by the endpoint nudge, so the span is ≥ 1/255 and the reciprocal
+// is finite.
+fn proj_assign(
+  values:  ptr<function, array<f32, 16>>,
+  r0f: f32, r1f: f32,
+  out_idx: ptr<function, array<u32, 16>>,
+) {
+  let inv = 7.0 / (r0f - r1f);
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let level = clamp(floor(((*values)[k] - r1f) * inv + 0.5), 0.0, 7.0);
+    (*out_idx)[k] = level_to_index(u32(level));
+  }
+}
+
 // Encode 16 single-channel values into an 8-byte BC4 block, packed as
 // two little-endian u32s (u32[0] = bytes 0..3, u32[1] = bytes 4..7).
 fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
@@ -135,17 +171,17 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
     else         { r0 = r0 + 1u; }
   }
 
-  // ---------------- 2. Initial palette + indices + error --------------
-  var pal: array<f32, 8>;
-  build_pal(f32(r0) / 255.0, f32(r1) / 255.0, &pal);
+  // ---------------- 2. Assign indices ---------------------------------
+  // The fast and high branches resolve at pipeline-compile time, so the driver
+  // keeps only one. Fast uses the O(1) projection; high builds the palette and
+  // runs the full 8-entry L2 search (whose error feeds the refit below).
   var indices: array<u32, 16>;
-  var err = assign_all(values, &pal, &indices);
-
-  // ---------------- 3. Refinement: least-squares on (r0, r1) ----------
-  // High-quality only — the refit is the bulk of the per-channel cost and the
-  // branch is resolved at pipeline-compile time, so the fast path skips all of
-  // it (the sums loop included), not just the acceptance test.
   if (QUALITY_HIGH != 0u) {
+    var pal: array<f32, 8>;
+    build_pal(f32(r0) / 255.0, f32(r1) / 255.0, &pal);
+    var err = assign_all(values, &pal, &indices);
+
+    // -------------- 3. Refinement: least-squares on (r0, r1) ----------
     // Normal equations for palette[j] = a_j * r0 + b_j * r1:
     //   [ΣAA  ΣAB] [r0]   [ΣAV]
     //   [ΣAB  ΣBB] [r1] = [ΣBV]
@@ -182,6 +218,8 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
         }
       }
     }
+  } else {
+    proj_assign(values, f32(r0) / 255.0, f32(r1) / 255.0, &indices);
   }
 
   // ---------------- 4. Pack 48-bit index field + 2 endpoint bytes -----
