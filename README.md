@@ -2,7 +2,7 @@
 
 Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
 
-⚠️: This is 100% vibe-coded. The code is completely unreviewed and under-tested. Do not use for anything important.
+⚠️ 100% vibe-coded. The code is completely unreviewed and under-tested. Do not use for anything important.
 
 ## Install
 
