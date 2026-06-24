@@ -11,13 +11,9 @@
 // See `Encoder.ts` for the shared encode pipeline. This file only declares
 // the format metadata and loads `bc1.wgsl`.
 
-import { RGBA_S3TC_DXT1_Format } from 'three'
-
 import shaderSource from './bc1.wgsl'
 import { Encoder, type FormatVariant } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class BC1Encoder extends Encoder {
   static override readonly requiredFeature: GPUFeatureName = WebGPUFeature.BC
@@ -46,11 +42,5 @@ export class BC1Encoder extends Encoder {
     // Three.js's WebGPU backend uses 'bc1-rgba-unorm(-srgb)' for DXT1,
     // even though the shader emits RGB-only blocks with alpha forced to 1.
     return colorSpace === 'srgb' ? 'bc1-rgba-unorm-srgb' : 'bc1-rgba-unorm'
-  }
-
-  override threeTextureFormat(): CompressedPixelFormat {
-    // Three.js has a single format constant for both sRGB / linear BC1.
-    // The sRGB flag is carried separately by `texture.colorSpace`.
-    return RGBA_S3TC_DXT1_Format
   }
 }

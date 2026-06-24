@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 
 import type { EncoderConstructor, EncodeQuality } from 'gputex'
 
+import { encodeToTexture } from 'gputex/three'
+
 import type { Texture } from 'three'
 
 // Encode a single image with ONE specific encoder class, bypassing
@@ -79,9 +81,8 @@ export function useEncodedTexture(url: string, EncoderClass: EncoderConstructor,
         const bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' })
 
         encoder = await EncoderClass.create()
-        const bytes = await encoder.encodeToBytes(bitmap, { flipY, quality })
+        const { texture: built, ...bytes } = await encodeToTexture(encoder, bitmap, { flipY, quality, colorSpace })
         bitmap.close()
-        const built = encoder.buildMippedTexture([bytes], { colorSpace })
         texture = built
 
         if (cancelled) return

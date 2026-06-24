@@ -2,7 +2,7 @@
 
 Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
 
-⚠️: This is 100% vibe-coded. The code is completely unreviewed, under-tested, it will probably crash on many devices, and this library is very likely to go unmaintained. Do not use for anything important.
+⚠️: This is 100% vibe-coded. The code is completely unreviewed and under-tested. Do not use for anything important.
 
 ## Install
 
@@ -14,7 +14,14 @@ pnpm add gputex
 bun add gputex
 ```
 
-`three` is a peer dependency (`>=0.180`).
+### Entry points
+
+`gputex` ships two entry points:
+
+- **`gputex`** — the engine-agnostic core: the `*Encoder` classes, capability / format detection, and mip helpers. Nothing here imports `three`, so it works with Babylon.js, raw WebGPU/WebGL, workers, etc. Encoders return raw compressed block bytes via `encodeToBytes()`.
+- **`gputex/three`** — the Three.js layer. Re-exports the entire core **plus** `compressTexture()`, `GputexLoader`, and `buildCompressedTexture()` / `encodeToTexture()`. This is the only entry that imports `three`.
+
+`three` is an **optional** peer dependency (`>=0.170`): install it only if you import `gputex/three`. Pure-core consumers (e.g. Babylon.js) can skip it entirely.
 
 ## Formats
 
@@ -44,7 +51,7 @@ Notes on the WebGL path:
 ### `compressTexture` — direct API
 
 ```ts
-import { compressTexture } from 'gputex'
+import { compressTexture } from 'gputex/three'
 
 const { texture, format } = await compressTexture('/cobblestone.avif', {
   hint: 'color', // 'color' | 'colorWithAlpha' | 'normal'
@@ -75,7 +82,7 @@ material.map = texture
 ### `GputexLoader` — Three.js Loader
 
 ```ts
-import { GputexLoader } from 'gputex'
+import { GputexLoader } from 'gputex/three'
 
 const loader = new GputexLoader()
 loader.hint = 'normal'
@@ -90,7 +97,7 @@ The `GputexLoader` works with R3F's `useLoader`:
 
 ```tsx
 import { useLoader } from '@react-three/fiber'
-import { GputexLoader } from 'gputex'
+import { GputexLoader } from 'gputex/three'
 
 function Scene() {
   const texture = useLoader(GputexLoader, '/cobblestone.avif', loader => {
@@ -113,7 +120,7 @@ For a reusable hook with metadata access:
 ```tsx
 import { useLayoutEffect } from 'react'
 import { useLoader } from '@react-three/fiber'
-import { GputexLoader } from 'gputex'
+import { GputexLoader } from 'gputex/three'
 import type { TextureHint } from 'gputex'
 
 function useGputex(url: string, options?: { hint?: TextureHint; colorSpace?: 'srgb' | 'linear'; mipmaps?: boolean }) {
@@ -157,16 +164,33 @@ function Scene() {
 }
 ```
 
-### Low-level encoders
+### Low-level encoders (any engine)
 
-Individual encoder classes are exported for direct control:
+The individual encoder classes live in the engine-agnostic core (`gputex`). `encodeToBytes()` returns raw compressed block bytes with no Three.js involvement — feed them into whatever compressed-texture upload your engine exposes (Babylon.js, raw WebGPU/WebGL, …):
 
 ```ts
 import { BC7Encoder, BC5Encoder, ASTC4x4Encoder, BC1Encoder } from 'gputex'
 
 const encoder = await BC7Encoder.create()
-const { data, width, height } = await encoder.encodeToBytes(imageBitmap)
+const { data, width, height, paddedWidth, paddedHeight } = await encoder.encodeToBytes(imageBitmap)
+// `data` is a Uint8Array of BC7 blocks covering paddedWidth × paddedHeight.
 encoder.destroy()
+```
+
+To turn an encoder's output into a Three.js `CompressedTexture` directly, use the helpers in `gputex/three`:
+
+```ts
+import { BC7Encoder, TextureFormat } from 'gputex'
+import { encodeToTexture, buildCompressedTexture } from 'gputex/three'
+
+const encoder = await BC7Encoder.create()
+
+// One-shot: image → CompressedTexture (plus the raw byte metadata)
+const { texture } = await encodeToTexture(encoder, imageBitmap, { colorSpace: 'srgb' })
+
+// …or assemble a texture from bytes you already have (e.g. a mip chain):
+const bytes = await encoder.encodeToBytes(imageBitmap)
+const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 ```
 
 ## Options

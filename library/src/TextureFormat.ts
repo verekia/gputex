@@ -1,8 +1,10 @@
 // Public identifiers for the compressed texture formats this project can emit.
 //
-// These are the *logical* formats the format-selection layer picks from; the
-// concrete WebGPU and Three.js format strings are resolved per-encoder via
-// `Encoder.gpuTextureFormat()` / `Encoder.threeTextureFormat()`.
+// These are the *logical* formats the format-selection layer picks from. The
+// concrete WebGPU format string is resolved per-encoder via
+// `Encoder.gpuTextureFormat()`; the Three.js `CompressedPixelFormat` constant
+// is resolved by `threeFormatFor()` in the `gputex/three` entry (kept out of
+// the core so it carries no `three` import).
 //
 // BC5 has no sRGB variant because it is a 2-channel linear format (tangent-
 // space normals). The other three families have matched UNORM + sRGB pairs.

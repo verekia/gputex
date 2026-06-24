@@ -1,9 +1,9 @@
 import { useLayoutEffect } from 'react'
 
-import { GputexLoader } from 'gputex'
 import type { TextureHint } from 'gputex'
 
 import { useLoader } from '@react-three/fiber'
+import { GputexLoader } from 'gputex/three'
 
 import type { Texture } from 'three'
 

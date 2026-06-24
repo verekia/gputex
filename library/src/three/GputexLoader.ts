@@ -21,8 +21,8 @@ import { compressTexture, type CompressResult } from './compressTexture.js'
 
 import type { Texture } from 'three'
 
-import type { EncodeQuality } from './Encoder.js'
-import type { TextureHint } from './selectFormat.js'
+import type { EncodeQuality } from '../Encoder.js'
+import type { TextureHint } from '../selectFormat.js'
 
 export class GputexLoader extends Loader<Texture> {
   /** Format-selection hint. Default 'color'. */

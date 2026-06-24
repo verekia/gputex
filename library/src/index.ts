@@ -1,10 +1,14 @@
-// Public entry point for the encoder package.
+// Public entry point — the engine-agnostic core.
 //
-// Two surfaces:
-//   • High-level — `compressTexture()` + `GputexLoader`
-//     for drop-in use in Three.js apps.
-//   • Low-level  — the individual `*Encoder` classes and capability /
-//     format utilities for callers that want direct control.
+// Nothing reachable from here imports `three`, so this entry works in any
+// renderer (Babylon.js, raw WebGPU/WebGL, a worker, …). Encoders produce raw
+// compressed block bytes via `encodeToBytes()`; feed them into whatever
+// compressed-texture upload your engine exposes.
+//
+// Three.js users want `gputex/three` instead: it re-exports everything here
+// plus the Three.js-coupled helpers (`compressTexture()`, `GputexLoader`,
+// `buildCompressedTexture()`). That entry is the only one that pulls in
+// `three`, which is why `three` is an optional peer dependency.
 
 // Format / feature identifiers.
 export { TextureFormat, WebGPUFeature } from './TextureFormat.js'
@@ -19,7 +23,6 @@ export {
   type EncoderConstructor,
   type EncodeCallOptions,
   type EncodeQuality,
-  type EncodeResult,
   type EncodeBytesResult,
   type FormatVariant,
 } from './Encoder.js'
@@ -54,15 +57,8 @@ export {
   type WebGLFormatSelection,
 } from './webgl/index.js'
 
-// Format selection + high-level API.
+// Format selection.
 export { selectFormat, type TextureHint, type SelectFormatOptions, type FormatSelection } from './selectFormat.js'
-export {
-  compressTexture,
-  type CompressTextureSource,
-  type CompressOptions,
-  type CompressResult,
-} from './compressTexture.js'
-export { GputexLoader } from './GputexLoader.js'
 
 // Mip-chain helpers (exported so callers can pre-generate a chain once
 // and feed it into `Encoder.encodeToBytes` themselves if they want

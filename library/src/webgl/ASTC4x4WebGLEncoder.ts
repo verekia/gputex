@@ -5,12 +5,8 @@
 // so a 'normal' hint requires the caller to pre-swizzle (surfaced via
 // `astcNormalRemap`). See WebGLBlockEncoder for the pipeline.
 
-import { RGBA_ASTC_4x4_Format } from 'three'
-
 import fragSource from './glsl/astc4x4.frag.glsl'
 import { WebGLBlockEncoder } from './WebGLBlockEncoder.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class ASTC4x4WebGLEncoder extends WebGLBlockEncoder {
   override get label(): string {
@@ -24,8 +20,5 @@ export class ASTC4x4WebGLEncoder extends WebGLBlockEncoder {
   }
   override fragSource(): string {
     return fragSource
-  }
-  override threeTextureFormat(): CompressedPixelFormat {
-    return RGBA_ASTC_4x4_Format
   }
 }

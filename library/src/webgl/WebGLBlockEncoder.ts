@@ -18,11 +18,8 @@
 // input + flipY (same algorithms, same little-endian word order), so the
 // resulting CompressedTexture displays identically under either renderer.
 
-import { assembleCompressedTexture, type EncodedLevel } from '../textureAssembly.js'
 import vertSource from './glsl/fullscreen.vert.glsl'
 import { getSharedWebGLContext } from './webglContext.js'
-
-import type { CompressedPixelFormat, CompressedTexture } from 'three'
 
 /** Raw RGBA8 pixel data (e.g. a CPU-generated mip level). */
 export interface RawPixelSource {
@@ -114,8 +111,6 @@ export abstract class WebGLBlockEncoder {
   abstract get supportsSrgb(): boolean
   /** GLSL ES 3.00 fragment-shader source. */
   abstract fragSource(): string
-  /** Three.js `CompressedPixelFormat` constant; sRGB is carried by colorSpace. */
-  abstract threeTextureFormat(): CompressedPixelFormat
 
   protected _buildProgram(): void {
     const gl = this.gl
@@ -282,17 +277,5 @@ export abstract class WebGLBlockEncoder {
     gl.deleteTexture(srcTex)
 
     return { width, height, paddedWidth, paddedHeight, data, encodeMs }
-  }
-
-  /** Wrap pre-encoded levels into a CompressedTexture. Shared with the WebGPU path. */
-  buildMippedTexture(
-    levels: readonly EncodedLevel[],
-    { colorSpace = 'srgb' }: { colorSpace?: 'srgb' | 'linear' } = {},
-  ): CompressedTexture {
-    if (levels.length === 0) {
-      throw new Error(`${this.label}WebGLEncoder.buildMippedTexture: no levels provided`)
-    }
-    const effectiveSrgb = colorSpace === 'srgb' && this.supportsSrgb
-    return assembleCompressedTexture(levels, this.threeTextureFormat(), effectiveSrgb)
   }
 }

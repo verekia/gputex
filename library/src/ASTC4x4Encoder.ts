@@ -14,14 +14,10 @@
 // function-for-function so WGSL bugs can be localised by swapping one
 // step at a time.
 
-import { RGBA_ASTC_4x4_Format } from 'three'
-
 import shaderSource from './astc4x4.wgsl'
 import shaderSourceF16 from './astc4x4_fast_f16.wgsl'
 import { Encoder, type FormatVariant } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class ASTC4x4Encoder extends Encoder {
   static override readonly requiredFeature: GPUFeatureName = WebGPUFeature.ASTC
@@ -49,10 +45,5 @@ export class ASTC4x4Encoder extends Encoder {
 
   override gpuTextureFormat({ colorSpace }: FormatVariant): GPUTextureFormat {
     return colorSpace === 'srgb' ? 'astc-4x4-unorm-srgb' : 'astc-4x4-unorm'
-  }
-
-  override threeTextureFormat(): CompressedPixelFormat {
-    // Three.js has one ASTC 4×4 constant; sRGB is carried by colorSpace.
-    return RGBA_ASTC_4x4_Format
   }
 }

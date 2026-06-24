@@ -4,12 +4,8 @@
 // format on the WebGL path (matches the WebGPU BC7 choice). See
 // WebGLBlockEncoder for the pipeline.
 
-import { RGBA_BPTC_Format } from 'three'
-
 import fragSource from './glsl/bc7.frag.glsl'
 import { WebGLBlockEncoder } from './WebGLBlockEncoder.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class BC7WebGLEncoder extends WebGLBlockEncoder {
   override get label(): string {
@@ -23,8 +19,5 @@ export class BC7WebGLEncoder extends WebGLBlockEncoder {
   }
   override fragSource(): string {
     return fragSource
-  }
-  override threeTextureFormat(): CompressedPixelFormat {
-    return RGBA_BPTC_Format
   }
 }

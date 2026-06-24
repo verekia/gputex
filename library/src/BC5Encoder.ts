@@ -9,14 +9,10 @@
 // Algorithm lives in `bc5.wgsl`; CPU reference + tests are in
 // `bc4_ref.ts`, `bc5_ref.ts`, and their test files.
 
-import { RED_GREEN_RGTC2_Format } from 'three'
-
 import shaderSource from './bc5.wgsl'
 import shaderSourceF16 from './bc5_fast_f16.wgsl'
 import { Encoder } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class BC5Encoder extends Encoder {
   static override readonly requiredFeature: GPUFeatureName = WebGPUFeature.BC
@@ -44,13 +40,5 @@ export class BC5Encoder extends Encoder {
 
   override gpuTextureFormat(): GPUTextureFormat {
     return 'bc5-rg-unorm'
-  }
-
-  override threeTextureFormat(): CompressedPixelFormat {
-    // Three.js 0.183 maps RED_GREEN_RGTC2_Format → GPUTextureFormat.BC5RGUnorm
-    // in the WebGPU CompressedTexture format switch. (0.170 and earlier
-    // had the constant but no WebGPU mapping — uploading silently failed
-    // with "WebGPURenderer: Unsupported texture format".)
-    return RED_GREEN_RGTC2_Format
   }
 }

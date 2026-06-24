@@ -2,8 +2,11 @@
 //
 // Each concrete encoder (BC1, BC5, BC7, ASTC_4x4) overrides a handful of
 // hooks — shader source, block size, format strings — and inherits the shared
-// `encode()` pipeline: pad → upload → dispatch → readback → wrap as a
-// Three.js CompressedTexture.
+// `encodeToBytes()` pipeline: pad → upload → dispatch → readback into raw
+// compressed bytes. The base class is deliberately Three.js-free; wrapping the
+// bytes into a `CompressedTexture` lives behind the `gputex/three` entry
+// (see ./three/buildTexture.ts), so engines other than Three.js can consume
+// the bytes directly.
 //
 // Every supported format follows the same pattern:
 //   • 4×4-pixel blocks
@@ -15,12 +18,9 @@
 // That's enough shared structure to factor out everything except the shader
 // and the few format metadata getters.
 //
-import { CompressedTexture, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace, RepeatWrapping } from 'three'
-
-import { assembleCompressedTexture } from './textureAssembly.js'
 import { uploadSourceTexture } from './workarounds.js'
 
-import type { CompressedTextureMipmap, CompressedPixelFormat } from 'three'
+import type { TextureFormat } from './TextureFormat.js'
 
 /**
  * Anything `GPUQueue.copyExternalImageToTexture` accepts. Matches the
@@ -57,20 +57,11 @@ export interface EncodeCallOptions {
   quality?: EncodeQuality
 }
 
-export interface EncodeResult {
-  width: number
-  height: number
-  paddedWidth: number
-  paddedHeight: number
-  data: Uint8Array
-  texture: CompressedTexture
-  encodeMs: number
-}
-
 /**
- * Result of a raw bytes-only encode (no wrapping in a `CompressedTexture`).
- * Used by the mipped encode path to bundle multiple levels into a single
- * `CompressedTexture` at the end.
+ * Result of a raw bytes-only encode. This is the encoder's native output: the
+ * compressed block bytes plus dimensions, with no Three.js (or any engine)
+ * involvement. Feed `data` into whatever renderer's compressed-texture upload
+ * you like, or use `buildCompressedTexture()` from `gputex/three`.
  */
 export interface EncodeBytesResult {
   width: number
@@ -97,6 +88,8 @@ export interface FormatVariant {
 export type EncoderConstructor<T extends Encoder = Encoder> = {
   new (opts: EncoderOptions): T
   requiredFeature: GPUFeatureName | null
+  /** Logical formats this encoder can emit (linear first, then sRGB variant). */
+  readonly textureFormats: readonly TextureFormat[]
   create(): Promise<T>
 }
 
@@ -274,9 +267,6 @@ export abstract class Encoder {
   /** e.g. 'bc1-rgba-unorm-srgb'. */
   abstract gpuTextureFormat(opts: FormatVariant): GPUTextureFormat
 
-  /** Three.js `CompressedPixelFormat` constant for `CompressedTexture`. */
-  abstract threeTextureFormat(opts: FormatVariant): CompressedPixelFormat
-
   /**
    * True if the device reports the feature the output texture needs.
    * The encoder itself only writes to a storage buffer, so this is about
@@ -288,54 +278,15 @@ export abstract class Encoder {
   }
 
   // ------------------------------------------------------------------ //
-  // Shared encode() — pad, upload, dispatch, readback, wrap.           //
+  // Shared encodeToBytes() — pad, upload, dispatch, readback.          //
   // ------------------------------------------------------------------ //
 
-  async encode(
-    source: EncoderImageSource,
-    { colorSpace = 'srgb', quality = 'fast' }: EncodeCallOptions = {},
-  ): Promise<EncodeResult> {
-    const effectiveSrgb = colorSpace === 'srgb' && this.supportsSrgb
-    const bytes = await this.encodeToBytes(source, { quality })
-
-    const threeFormat = this.threeTextureFormat({ colorSpace: effectiveSrgb ? 'srgb' : 'linear' })
-    const mip: CompressedTextureMipmap = {
-      data: bytes.data,
-      width: bytes.paddedWidth,
-      height: bytes.paddedHeight,
-    }
-    const texture = new CompressedTexture([mip], bytes.paddedWidth, bytes.paddedHeight, threeFormat)
-    texture.colorSpace = effectiveSrgb ? SRGBColorSpace : LinearSRGBColorSpace
-    texture.magFilter = LinearFilter
-    // Single mip level: using a trilinear min filter would sample a
-    // mip level that doesn't exist.
-    texture.minFilter = LinearFilter
-    texture.generateMipmaps = false
-    texture.wrapS = texture.wrapT = RepeatWrapping
-    texture.needsUpdate = true
-    texture.userData.logicalWidth = bytes.width
-    texture.userData.logicalHeight = bytes.height
-
-    return {
-      width: bytes.width,
-      height: bytes.height,
-      paddedWidth: bytes.paddedWidth,
-      paddedHeight: bytes.paddedHeight,
-      data: bytes.data,
-      texture,
-      encodeMs: bytes.encodeMs,
-    }
-  }
-
   /**
-   * Encode one image source to raw compressed bytes, skipping the
-   * `CompressedTexture` wrap. Used by the public `encode()` above and by
-   * the mipped encode path in `compressTexture()` so N mip levels end up
-   * in a single `CompressedTexture` instead of N throwaway wrappers.
-   *
-   * Public (not protected) because `compressTexture()` calls it across the
-   * encoder boundary. Still safe to call from outside — it just does
-   * less work than `encode()` and the caller assembles the texture.
+   * Encode one image source to raw compressed bytes. This is the encoder's
+   * native, engine-agnostic output. `compressTexture()` and
+   * `encodeToTexture()` (both in `gputex/three`) call it and then wrap the
+   * bytes into a `CompressedTexture`; callers targeting another engine feed
+   * `data` into that engine's compressed-texture upload directly.
    */
   async encodeToBytes(
     source: EncoderImageSource,
@@ -434,29 +385,5 @@ export abstract class Encoder {
     paramsBuffer.destroy()
 
     return { width, height, paddedWidth, paddedHeight, data, encodeMs }
-  }
-
-  /**
-   * Assemble a `CompressedTexture` from pre-encoded mip levels. Called
-   * by `compressTexture()` after it has run each level through
-   * `encodeToBytes()`. Centralised here so the single-level and mipped
-   * paths share the same format / colour-space / wrap settings.
-   *
-   * `levels[0]` is the base level; its padded dimensions become the
-   * texture's overall size. Filter setup assumes at least 2 levels →
-   * trilinear; 1 level → bilinear.
-   */
-  buildMippedTexture(
-    levels: readonly EncodeBytesResult[],
-    { colorSpace = 'srgb' }: EncodeCallOptions = {},
-  ): CompressedTexture {
-    if (levels.length === 0) {
-      throw new Error(`${this.label}Encoder.buildMippedTexture: no levels provided`)
-    }
-    const effectiveSrgb = colorSpace === 'srgb' && this.supportsSrgb
-    const threeFormat = this.threeTextureFormat({ colorSpace: effectiveSrgb ? 'srgb' : 'linear' })
-    // Filter / wrap / colour-space setup is shared with the WebGL fallback
-    // encoders; see textureAssembly.ts.
-    return assembleCompressedTexture(levels, threeFormat, effectiveSrgb)
   }
 }

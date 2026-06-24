@@ -22,17 +22,18 @@
 
 import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Texture } from 'three'
 
-import { Encoder, type EncodeQuality } from './Encoder.js'
-import { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
-import { selectFormat, type TextureHint } from './selectFormat.js'
-import { selectWebGLFormat } from './webgl/selectWebGLFormat.js'
-import { detectWebGLCapabilities } from './webgl/webglCapabilities.js'
-import { getSharedWebGLContext } from './webgl/webglContext.js'
-import { needsWriteTextureWorkaround } from './workarounds.js'
+import { Encoder, type EncodeQuality } from '../Encoder.js'
+import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
+import { selectFormat, type TextureHint } from '../selectFormat.js'
+import { selectWebGLFormat } from '../webgl/selectWebGLFormat.js'
+import { detectWebGLCapabilities } from '../webgl/webglCapabilities.js'
+import { getSharedWebGLContext } from '../webgl/webglContext.js'
+import { needsWriteTextureWorkaround } from '../workarounds.js'
+import { buildCompressedTexture } from './buildTexture.js'
 
 import type { CompressedTexture } from 'three'
 
-import type { TextureFormat } from './TextureFormat.js'
+import type { TextureFormat } from '../TextureFormat.js'
 
 /**
  * Everything `compressTexture()` can take as an image source. A superset
@@ -286,7 +287,7 @@ export async function compressTexture(
         } else {
           bytes = await encoder.encodeToBytes(bitmap, { flipY, quality })
         }
-        const tex = encoder.buildMippedTexture([bytes], { colorSpace })
+        const tex = buildCompressedTexture([bytes], selection.format)
         return {
           texture: tex,
           format: selection.format,
@@ -319,7 +320,7 @@ export async function compressTexture(
         totalEncodeMs += bytes.encodeMs
       }
 
-      const tex = encoder.buildMippedTexture(encodedLevels, { colorSpace })
+      const tex = buildCompressedTexture(encodedLevels, selection.format)
       return {
         texture: tex,
         format: selection.format,
@@ -362,7 +363,7 @@ export async function compressTexture(
     try {
       if (!mipmaps) {
         const bytes = encoder.encodeToBytes(bitmap, { flipY })
-        const tex = encoder.buildMippedTexture([bytes], { colorSpace })
+        const tex = buildCompressedTexture([bytes], selection.format)
         return {
           texture: tex,
           format: selection.format,
@@ -394,7 +395,7 @@ export async function compressTexture(
         totalEncodeMs += bytes.encodeMs
       }
 
-      const tex = encoder.buildMippedTexture(encodedLevels, { colorSpace })
+      const tex = buildCompressedTexture(encodedLevels, selection.format)
       return {
         texture: tex,
         format: selection.format,

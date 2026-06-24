@@ -12,14 +12,10 @@
 // Algorithm lives in `bc7.wgsl`; CPU reference + tests are in
 // `bc7_ref.ts` and its test file.
 
-import { RGBA_BPTC_Format } from 'three'
-
 import shaderSource from './bc7.wgsl'
 import shaderSourceF16 from './bc7_fast_f16.wgsl'
 import { Encoder, type FormatVariant } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class BC7Encoder extends Encoder {
   static override readonly requiredFeature: GPUFeatureName = WebGPUFeature.BC
@@ -47,10 +43,5 @@ export class BC7Encoder extends Encoder {
 
   override gpuTextureFormat({ colorSpace }: FormatVariant): GPUTextureFormat {
     return colorSpace === 'srgb' ? 'bc7-rgba-unorm-srgb' : 'bc7-rgba-unorm'
-  }
-
-  override threeTextureFormat(): CompressedPixelFormat {
-    // Three.js has one BPTC RGBA constant; sRGB is carried by colorSpace.
-    return RGBA_BPTC_Format
   }
 }

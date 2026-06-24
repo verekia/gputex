@@ -1,6 +1,6 @@
 {
   "name": "gputex",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "license": "MIT",
   "files": [
     "dist"
@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./three": {
+      "types": "./dist/three.d.ts",
+      "import": "./dist/three.js"
     }
   },
   "scripts": {
@@ -27,5 +31,10 @@
   },
   "peerDependencies": {
     "three": ">=0.170"
+  },
+  "peerDependenciesMeta": {
+    "three": {
+      "optional": true
+    }
   }
 }

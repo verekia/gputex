@@ -4,12 +4,8 @@
 // variant). Used as the broadly-available last-resort colour format when
 // neither BPTC nor ASTC is present. See WebGLBlockEncoder for the pipeline.
 
-import { RGBA_S3TC_DXT1_Format } from 'three'
-
 import fragSource from './glsl/bc1.frag.glsl'
 import { WebGLBlockEncoder } from './WebGLBlockEncoder.js'
-
-import type { CompressedPixelFormat } from 'three'
 
 export class BC1WebGLEncoder extends WebGLBlockEncoder {
   override get label(): string {
@@ -23,8 +19,5 @@ export class BC1WebGLEncoder extends WebGLBlockEncoder {
   }
   override fragSource(): string {
     return fragSource
-  }
-  override threeTextureFormat(): CompressedPixelFormat {
-    return RGBA_S3TC_DXT1_Format
   }
 }
