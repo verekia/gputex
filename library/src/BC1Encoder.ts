@@ -4,6 +4,10 @@
 // layer never picks it automatically (BC7 is the default desktop
 // choice), but it remains available for callers that want BC1 directly.
 //
+// Like the other block encoders it offers two quality levels: 'fast'
+// (default — bbox endpoints + one least-squares refit) and 'high'
+// (principal-axis seed + iterative refit). See `bc1.wgsl` / `bc1_ref.ts`.
+//
 // See `Encoder.ts` for the shared encode pipeline. This file only declares
 // the format metadata and loads `bc1.wgsl`.
 
@@ -26,6 +30,11 @@ export class BC1Encoder extends Encoder {
     return 8
   }
   override get supportsSrgb(): boolean {
+    return true
+  }
+  override get supportsQuality(): boolean {
+    // The shader declares a `QUALITY_HIGH` pipeline-overridable constant: 'fast'
+    // (bbox + one refit) vs 'high' (principal-axis seed + iterative refit).
     return true
   }
 

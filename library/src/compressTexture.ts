@@ -61,8 +61,9 @@ export interface CompressOptions {
   /**
    * Encode quality / speed trade-off. 'fast' (default) is ~2–4× faster for a
    * ≤0.36 dB PSNR cost; 'high' runs the exhaustive search (output identical to
-   * the CPU reference encoders). No effect on BC1 or on the WebGL fallback
-   * (which always uses the fast encoders).
+   * the CPU reference encoders; for BC1, a principal-axis seed + iterative
+   * refit). No effect on the WebGL fallback (which always uses the fast
+   * encoders).
    */
   quality?: EncodeQuality
   /** Reuse an existing device (e.g. Three.js's renderer device) instead

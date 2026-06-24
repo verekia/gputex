@@ -44,8 +44,9 @@ export interface EncoderOptions {
 /**
  * Encoder quality level. 'fast' (default) uses the cheaper search paths in the
  * shaders — measured ~2–4× faster for ≤0.36 dB PSNR. 'high' runs the exhaustive
- * search, producing output byte-identical to the CPU reference encoders.
- * No effect on BC1 (already single-pass; both levels are identical).
+ * search, producing output byte-identical to the CPU reference encoders (BC5/
+ * BC7/ASTC). BC1's 'high' adds a principal-axis endpoint seed and iterative
+ * refit on top of the 'fast' bbox+refit path.
  */
 export type EncodeQuality = 'fast' | 'high'
 
@@ -246,8 +247,8 @@ export abstract class Encoder {
 
   /**
    * Whether the shader declares a `QUALITY_HIGH` pipeline-overridable constant
-   * (i.e. has distinct fast/high search paths). BC1 is already single-pass and
-   * leaves this false; BC5/BC7/ASTC override it to true.
+   * (i.e. has distinct fast/high search paths). Default false (e.g. a stub or a
+   * format with a single path); BC1/BC5/BC7/ASTC override it to true.
    */
   get supportsQuality(): boolean {
     return false

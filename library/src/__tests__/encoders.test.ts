@@ -27,10 +27,16 @@ describe('BC1Encoder metadata', () => {
     expect(view.label).toBe('bc1')
     expect(view.bytesPerBlock).toBe(8)
     expect(view.supportsSrgb).toBe(true)
+    // BC1 now has distinct fast/high paths driven by a QUALITY_HIGH constant.
+    expect(view.supportsQuality).toBe(true)
     const src: string = view.wgslSource()
     expect(typeof src).toBe('string')
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
+    // Sanity: the shader exposes the quality-related helpers by name.
+    expect(src).toContain('override QUALITY_HIGH')
+    expect(src).toContain('fn refit')
+    expect(src).toContain('fn principal_axis')
   })
 })
 
