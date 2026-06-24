@@ -4,6 +4,8 @@ Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragme
 
 ⚠️ 100% vibe-coded. The code is completely unreviewed and under-tested. Do not use for anything important.
 
+🚀 Used in production on [Mana Blade](https://manablade.com).
+
 ## Install
 
 ```sh
