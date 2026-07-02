@@ -105,8 +105,14 @@ void main() {
   }
   float det = sAA * sBB - sAB * sAB;
   if (abs(det) > 1e-9) {
-    vec3 e0 = clamp((sBB * sAV - sAB * sBV) / det, vec3(0.0), vec3(1.0));
-    vec3 e1 = clamp((sAA * sBV - sAB * sAV) / det, vec3(0.0), vec3(1.0));
+    // Clamp the refit to the block bbox (not [0,1]): on multi-cluster blocks
+    // the unconstrained LSQ solve extrapolates far outside the block's colours
+    // and the per-channel clamp then bends the hue — fringe pixels decode to
+    // colours that exist nowhere in the block. Constraining to the bbox also
+    // measures better in plain SSE (+1.6 dB on the colour test card), so the
+    // accept-if-better guard below keeps more refits.
+    vec3 e0 = clamp((sBB * sAV - sAB * sBV) / det, bbMin, bbMax);
+    vec3 e1 = clamp((sAA * sBV - sAB * sAV) / det, bbMin, bbMax);
     uint nc0 = to565(e0);
     uint nc1 = to565(e1);
     if (nc0 < nc1) { uint t = nc0; nc0 = nc1; nc1 = t; }

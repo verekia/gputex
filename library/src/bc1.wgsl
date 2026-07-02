@@ -306,8 +306,14 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       // the solve would return garbage endpoints. With ≥2 levels
       // det = Σ_i<j (b_j − b_i)² ≥ ~1.67, so 1e-3 is a safe guard.
       if (s_min < s_max && abs(det) > 1e-3) {
-        let e0 = clamp((sBB * sAV - sAB * sBV) / det, vec3<f32>(0.0), vec3<f32>(1.0));
-        let e1 = clamp((sAA * sBV - sAB * sAV) / det, vec3<f32>(0.0), vec3<f32>(1.0));
+        // Clamp the refit to the block bbox (not [0,1]): on multi-cluster
+        // blocks the unconstrained solve extrapolates far outside the block's
+        // colours and the per-channel clamp then bends the hue — fringe pixels
+        // decode to colours that exist nowhere in the block. Constraining to
+        // the bbox also measures better in plain SSE (+1.6 dB on the colour
+        // test card), so the accept-if-better guard below keeps more refits.
+        let e0 = clamp((sBB * sAV - sAB * sBV) / det, bb_min, bb_max);
+        let e1 = clamp((sAA * sBV - sAB * sAV) / det, bb_min, bb_max);
         var nc0 = to565(e0);
         var nc1 = to565(e1);
         if (nc0 == nc1) {

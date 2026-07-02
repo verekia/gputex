@@ -116,12 +116,17 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     pix[i] = px; lo = min(lo, px); hi = max(hi, px);
   }
 
-  // Seed fit from the raw bbox, then quantise the refit endpoints.
+  // Seed fit from the raw bbox, then quantise the refit endpoints. The refit
+  // is clamped to the block bbox: on multi-cluster blocks the unconstrained
+  // solve extrapolates far outside the block's colours and the per-channel
+  // [0,1] clamp then bends the hue — fringe pixels decode to colours that
+  // exist nowhere in the block. Constraining to the bbox also measures better
+  // in plain SSE (+1.3 dB on the colour test card).
   let r = proj_fit(&pix, lo, hi);
   var ep0: Ep;
   var ep1: Ep;
-  if (r.valid) { ep0 = pick_ep(r.e0); ep1 = pick_ep(r.e1); }
-  else         { ep0 = pick_ep(lo);   ep1 = pick_ep(hi);   }
+  if (r.valid) { ep0 = pick_ep(clamp(r.e0, lo, hi)); ep1 = pick_ep(clamp(r.e1, lo, hi)); }
+  else         { ep0 = pick_ep(lo);                  ep1 = pick_ep(hi);                  }
 
   // Final projection against the decoded endpoints, packing the 4-bit indices
   // into two nibble words as we go (pixel k → bits 4k..4k+3 of ilo/ihi).

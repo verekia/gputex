@@ -97,18 +97,18 @@ export type ProgressFn = (message: string) => void
 // ---------------------------------------------------------------------------
 const PSNR_THRESHOLDS: Record<string, number | null> = {
   // `${format}:${quality}:${image}` — measured on the FULL 512² committed test
-  // textures (2026-07, Apple/metal-3: 27.36/32.02, 45.99/46.60, 31.27/33.69,
-  // 28.38/33.20, alpha 34.58/32.84) minus ~0.15 dB. `null` = record only
-  // (used while baselining a change).
-  'bc1:fast:color': 27.2,
+  // textures (2026-07, Apple/metal-3, after the bbox-clamped fast refit:
+  // 28.92/32.02, 45.99/46.60, 32.58/33.69, 30.23/33.20, alpha 34.45/32.86)
+  // minus ~0.15 dB. `null` = record only (used while baselining a change).
+  'bc1:fast:color': 28.75,
   'bc1:high:color': 31.85,
   'bc5:fast:normal': 45.8,
   'bc5:high:normal': 46.45,
-  'bc7:fast:color': 31.1,
+  'bc7:fast:color': 32.4,
   'bc7:high:color': 33.5,
-  'astc:fast:color': 28.2,
+  'astc:fast:color': 30.05,
   'astc:high:color': 33.05,
-  'bc7:fast:alpha': 34.4,
+  'bc7:fast:alpha': 34.3,
   'astc:fast:alpha': 32.7,
 }
 
@@ -122,12 +122,12 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
 // `null` = record only.
 const EASY_BLOCK_SSE = 0.05
 const EXCESS_LIMITS: Record<string, number | null> = {
-  // `${format}:${image}` — ~2–3× the observed values (2026-07, Apple/metal-3:
-  // 0.026, 0.010, 0.066–0.078, 0.071–0.109, alpha 0.011/0.027), still 10×+
-  // below catastrophic-artifact level.
-  'bc1:color': 0.1,
+  // `${format}:${image}` — ~3–5× the observed values (2026-07, Apple/metal-3,
+  // after the bbox-clamped fast refit: 0.020, 0.010, 0.010, 0.066–0.098,
+  // alpha 0.015/0.018), still 10×+ below catastrophic-artifact level.
+  'bc1:color': 0.06,
   'bc5:normal': 0.05,
-  'bc7:color': 0.2,
+  'bc7:color': 0.05,
   'astc:color': 0.25,
   'bc7:alpha': 0.05,
   'astc:alpha': 0.1,

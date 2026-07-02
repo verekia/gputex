@@ -314,11 +314,18 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   } else {
     // Seed the fused LSQ fit from the raw bbox, then quantise the refit
     // endpoints and reproject for the final indices.
+    // The refit is clamped to the block bbox: on multi-cluster blocks (a hard
+    // edge through two-colour noise) the unconstrained solve extrapolates far
+    // outside the block's colours and the per-channel [0,255] clamp then bends
+    // the hue — fringe pixels decode to colours that exist nowhere in the
+    // block. Constraining to the bbox also measures BETTER in plain SSE
+    // (+1.3 dB on the colour test card): the wild endpoints were losing more
+    // after quantisation + reassignment than the extrapolation ever bought.
     let r = proj_fit(&pixels, lo, hi);
     var ep0: Ep;
     var ep1: Ep;
-    if (r.valid) { ep0 = pick_ep(r.e0); ep1 = pick_ep(r.e1); }
-    else         { ep0 = pick_ep(lo);   ep1 = pick_ep(hi);   }
+    if (r.valid) { ep0 = pick_ep(clamp(r.e0, lo, hi)); ep1 = pick_ep(clamp(r.e1, lo, hi)); }
+    else         { ep0 = pick_ep(lo);                  ep1 = pick_ep(hi);                  }
     let dir = vec4<f32>(ep1.eight - ep0.eight);
     let dd = dot(dir, dir);
     if (dd > 0.0) {

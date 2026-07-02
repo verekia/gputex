@@ -120,8 +120,14 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // det = Σ_i<j (b_j − b_i)² ≥ 15·(1/3)² ≈ 1.67, far above the ~0.05 f16
     // noise floor — 0.5 separates the two regimes cleanly.
     if (s_min < s_max && abs(det) > h(0.5)) {
-      let e0 = clamp((sBB * sAV - sAB * sBV) / det, h3(0.0), h3(1.0));
-      let e1 = clamp((sAA * sBV - sAB * sAV) / det, h3(0.0), h3(1.0));
+      // Clamp the refit to the block bbox (not [0,1]): on multi-cluster
+      // blocks the unconstrained solve extrapolates far outside the block's
+      // colours and the per-channel clamp then bends the hue — fringe pixels
+      // decode to colours that exist nowhere in the block. Constraining to
+      // the bbox also measures better in plain SSE (+1.6 dB on the colour
+      // test card), so the accept-if-better guard below keeps more refits.
+      let e0 = clamp((sBB * sAV - sAB * sBV) / det, mn, mxv);
+      let e1 = clamp((sAA * sBV - sAB * sAV) / det, mn, mxv);
       let refit = order565(to565(e0), to565(e1));
       let np0 = from565(refit.x);
       let np1 = from565(refit.y);

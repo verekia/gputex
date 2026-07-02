@@ -100,8 +100,13 @@ void main() {
   ivec4 e1 = hi;
   Fit r = projAssign(e0, e1, true);
   if (r.valid) {
-    e0 = r.e0;
-    e1 = r.e1;
+    // Clamp the refit to the block bbox: on multi-cluster blocks the
+    // unconstrained LSQ solve extrapolates far outside the block's colours and
+    // the per-channel [0,255] clamp then bends the hue — fringe pixels decode
+    // to colours that exist nowhere in the block. Constraining to the bbox
+    // also measures better in plain SSE (+1.8 dB on the colour test card).
+    e0 = clamp(r.e0, lo, hi);
+    e1 = clamp(r.e1, lo, hi);
     projAssign(e0, e1, false);
   }
 
