@@ -4,7 +4,8 @@
 // One fragment per 4×4 block. Output is the 8-byte BC1 block as 2 × u32 in
 // outColor.rg (outColor.ba unused); the encoder reads back RGBA32UI and keeps
 // the low two words per block. This is the *fast* path only (the WGSL
-// `QUALITY_HIGH == 0` branch): bbox endpoints, 1/16 inset, RGB565 quantisation,
+// `QUALITY_HIGH == 0` branch): principal-axis endpoint seed (covariance
+// power-iteration; inset bbox on degenerate blocks), RGB565 quantisation,
 // forced 4-colour mode, full 4-entry L2 index search, then a single
 // least-squares endpoint refit accepted only when it lowers the block's error.
 // See bc1.wgsl for the full derivation.
@@ -48,6 +49,7 @@ void main() {
   vec3 pixels[16];
   vec3 bbMin = vec3(1.0);
   vec3 bbMax = vec3(0.0);
+  vec3 mean = vec3(0.0);
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
@@ -55,13 +57,56 @@ void main() {
     pixels[i] = c;
     bbMin = min(bbMin, c);
     bbMax = max(bbMax, c);
+    mean += c;
   }
+  mean /= 16.0;
 
-  // Inset the bbox by ~half an RGB565 cell (1/16) to tighten the quantised
-  // 4-colour palette around the real data range.
-  vec3 inset = (bbMax - bbMin) / 16.0;
-  vec3 hi = clamp(bbMax - inset, vec3(0.0), vec3(1.0));
-  vec3 lo = clamp(bbMin + inset, vec3(0.0), vec3(1.0));
+  // Seed endpoints from the block's principal colour axis (covariance
+  // power-iteration, seeded with the bbox diagonal — mirrors bc1.wgsl). The
+  // bbox diagonal is sign-blind: on anti-correlated channels (normal maps,
+  // hue edges) it points across the data instead of along it, and the LSQ
+  // refit below — which fits endpoints GIVEN the indices — can't recover.
+  // Degenerate (near-flat) blocks keep the inset-bbox seed. Both seeds inset
+  // by ~half an RGB565 cell (1/16) to tighten the quantised palette.
+  vec3 c0v = vec3(0.0);
+  vec3 c1v = vec3(0.0);
+  vec3 c2v = vec3(0.0);
+  for (int k = 0; k < 16; k++) {
+    vec3 d = pixels[k] - mean;
+    c0v += d.x * d;
+    c1v += d.y * d;
+    c2v += d.z * d;
+  }
+  vec3 hi;
+  vec3 lo;
+  vec3 axis = bbMax - bbMin;
+  float alen = length(axis);
+  bool axisOk = alen > 1e-9;
+  if (axisOk) {
+    axis /= alen;
+    for (int it = 0; it < 8; it++) {
+      vec3 nv = vec3(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis));
+      float nlen = length(nv);
+      if (nlen < 1e-12) { axisOk = false; break; }
+      axis = nv / nlen;
+    }
+  }
+  if (axisOk) {
+    float tMin = 1e30;
+    float tMax = -1e30;
+    for (int k = 0; k < 16; k++) {
+      float t = dot(pixels[k] - mean, axis);
+      tMin = min(tMin, t);
+      tMax = max(tMax, t);
+    }
+    float pad = (tMax - tMin) / 16.0;
+    hi = clamp(mean + (tMax - pad) * axis, vec3(0.0), vec3(1.0));
+    lo = clamp(mean + (tMin + pad) * axis, vec3(0.0), vec3(1.0));
+  } else {
+    vec3 inset = (bbMax - bbMin) / 16.0;
+    hi = clamp(bbMax - inset, vec3(0.0), vec3(1.0));
+    lo = clamp(bbMin + inset, vec3(0.0), vec3(1.0));
+  }
 
   uint c0 = to565(hi);
   uint c1 = to565(lo);

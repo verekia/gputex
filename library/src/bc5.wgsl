@@ -35,8 +35,10 @@
 //     The 8-entry palette in 6-interp mode is colinear and EVENLY spaced from
 //     r0 to r1 (levels 0..7 in palette order 0,2,3,4,5,6,7,1), so the nearest
 //     entry is the rounded projection onto the r0→r1 axis — no 8-entry
-//     search, and the 3-bit indices are packed on the fly. The LSQ refit is
-//     skipped (buys only ~0.36 dB).
+//     search, and the 3-bit indices are packed on the fly. The LSQ refit sums
+//     are accumulated in the same fused pass; the requantised refit is
+//     accepted only if it lowers the block error (worth ~1.3 dB on the
+//     normal-map card).
 //   high (1): full nearest search + refit, matches bc4_ref/bc5_ref.
 
 // 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
@@ -139,26 +141,87 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
   }
 
   if (QUALITY_HIGH == 0u) {
-    // -------- fast: projection assignment, indices packed on the fly ----
-    // level = round(7·(v − r0)/(r1 − r0)); level → BC4 index LUT (0,2,3,4,
-    // 5,6,7,1) packed as 3-bit entries in 0x3F58D0. Pixel k's 3 bits start
-    // at bit 3k+16 of the (w0,w1) pair (bytes 0..1 are the endpoints).
+    // -------- fast: fused projection + LSQ refit, accept-if-better -------
+    // ONE fused pass: level = round(7·(v − r0)/(r1 − r0)) projection
+    // assignment (the 8-entry 6-interp palette is colinear and evenly
+    // spaced, so the rounded projection IS the nearest-entry search), the
+    // seed solution's packed indices and squared error, and the least-
+    // squares normal-equation sums. The refit endpoints are re-quantised,
+    // reprojected, and accepted only if the block error decreases — worth
+    // ~1.3 dB on the normal-map card over the refit-free seed.
+    // Level → BC4 index LUT (0,2,3,4,5,6,7,1) packed as 3-bit entries in
+    // 0x3F58D0. Pixel k's 3 bits start at bit 3k+16 of the (w0,w1) pair
+    // (bytes 0..1 are the endpoints); k = 5 straddles the word boundary.
     let r0f = f32(r0) / 255.0;
-    let scale = 7.0 / (f32(r1) / 255.0 - r0f);
+    let dir = f32(r1) / 255.0 - r0f;
+    let scale = 7.0 / dir;
     var w0 = r0 | (r1 << 8u);
     var w1 = 0u;
+    var sAA = 0.0; var sBB = 0.0; var sAB = 0.0;
+    var sAV = 0.0; var sBV = 0.0;
+    var s_min = 7.0; var s_max = 0.0;
+    var seed_err = 0.0;
     for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      let L = u32(clamp(floor(((*values)[k] - r0f) * scale + 0.5), 0.0, 7.0));
-      let idx = (0x3F58D0u >> (L * 3u)) & 7u;
+      let vr = (*values)[k] - r0f;
+      let L = clamp(floor(vr * scale + 0.5), 0.0, 7.0);
+      s_min = min(s_min, L); s_max = max(s_max, L);
+      let b = L * (1.0 / 7.0); let a = 1.0 - b;
+      sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
+      sAV = sAV + a * vr; sBV = sBV + b * vr;
+      let e = vr - b * dir;
+      seed_err = seed_err + e * e;
+      let idx = (0x3F58D0u >> (u32(L) * 3u)) & 7u;
       let bit = 3u * k + 16u;
       if (bit <= 29u) {
         w0 = w0 | (idx << bit);
       } else if (bit >= 32u) {
         w1 = w1 | (idx << (bit - 32u));
       } else {
-        // k = 5 straddles the word boundary (bits 31..33).
         w0 = w0 | (idx << bit);
         w1 = w1 | (idx >> (32u - bit));
+      }
+    }
+
+    // Rank-1 guard: with every pixel on ONE level the system is singular
+    // (det is float rounding noise); with ≥2 distinct levels
+    // det = Σ_i<j (b_j − b_i)² ≥ 15/49 ≈ 0.306.
+    if (s_min < s_max) {
+      let det = sAA * sBB - sAB * sAB;
+      if (abs(det) > 1e-3) {
+        // Clamp the refit to the block's value range (a strict-SSE win vs
+        // clamping to [0,1], same as the other formats' fast paths).
+        let e0 = clamp(r0f + (sBB * sAV - sAB * sBV) / det, vmin, vmax);
+        let e1 = clamp(r0f + (sAA * sBV - sAB * sAV) / det, vmin, vmax);
+        let n0 = quantize8(e0);
+        let n1 = quantize8(e1);
+        // Keep 6-interp mode (r0 > r1 strictly); skip the no-op refit.
+        if (n0 > n1 && !(n0 == r0 && n1 == r1)) {
+          let n0f = f32(n0) / 255.0;
+          let ndir = f32(n1) / 255.0 - n0f;
+          let nscale = 7.0 / ndir;
+          var nw0 = n0 | (n1 << 8u);
+          var nw1 = 0u;
+          var refit_err = 0.0;
+          for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+            let vr = (*values)[k] - n0f;
+            let L = clamp(floor(vr * nscale + 0.5), 0.0, 7.0);
+            let e = vr - L * (1.0 / 7.0) * ndir;
+            refit_err = refit_err + e * e;
+            let idx = (0x3F58D0u >> (u32(L) * 3u)) & 7u;
+            let bit = 3u * k + 16u;
+            if (bit <= 29u) {
+              nw0 = nw0 | (idx << bit);
+            } else if (bit >= 32u) {
+              nw1 = nw1 | (idx << (bit - 32u));
+            } else {
+              nw0 = nw0 | (idx << bit);
+              nw1 = nw1 | (idx >> (32u - bit));
+            }
+          }
+          if (refit_err < seed_err) {
+            return vec2<u32>(nw0, nw1);
+          }
+        }
       }
     }
     return vec2<u32>(w0, w1);

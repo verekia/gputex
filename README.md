@@ -77,17 +77,21 @@ material.map = texture
 
 `quality` trades encode speed against compression accuracy:
 
-- **`'fast'` (default)** — a bounding-box endpoint seed plus projection-based
-  index assignment (each pixel is projected onto the colinear endpoint line in
-  O(1) instead of searching every palette entry) with a single fused
-  least-squares refit (accepted per block only when it lowers the error), and
-  the block bits packed with straight-line constant shifts. On GPUs that
-  report the `shader-f16` feature the whole fast path (all four formats, BC1
-  included) runs in f16 — the f32 path is the automatic fallback. Net vs
-  `'high'` on an Apple GPU: roughly **10–30× faster** depending on format,
-  for a PSNR cost of **≤0.65 dB on smooth/flat content** (imperceptible) and
-  up to a few dB on adversarial high-frequency noise, where the bbox seed
-  trails `'high'`'s exhaustive search. See the benchmark table below.
+- **`'fast'` (default)** — a principal-axis endpoint seed (per-block
+  covariance power-iteration — unlike a bbox diagonal it follows
+  anti-correlated channels, worth **+2–4 dB on normal-map-like content**)
+  plus projection-based index assignment (each pixel is projected onto the
+  colinear endpoint line in O(1) instead of searching every palette entry)
+  with a single fused least-squares refit (accepted per block only when it
+  lowers the error), and the block bits packed with straight-line constant
+  shifts. On GPUs that report the `shader-f16` feature the whole fast path
+  (all four formats, BC1 included) runs in f16 — the f32 path is the
+  automatic fallback. Net vs `'high'` on an Apple GPU: roughly **10–30×
+  faster** depending on format, for a PSNR cost of **≤0.35 dB on the test
+  cards** (BC7 within 0.05 dB of `'high'`; ASTC fast actually measures
+  slightly above it) and up to a few dB on adversarial high-frequency noise,
+  where any single-line seed trails `'high'`'s exhaustive search. See the
+  benchmark table below.
 - **`'high'`** — exhaustive endpoint search (farthest-pair seed, full nearest
   search, p-bit search); matches the CPU reference encoders block-for-block
   (byte-identical on >96% of blocks; the rest are equal-error FP tie-breaks,
@@ -252,25 +256,30 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 Measured with the repo's GPU test suite (see below) on an Apple Silicon GPU
 (`metal-3`) in Chrome, encoding a 2048×2048 image. **GPU pass** is the compute
 shader alone (WebGPU timestamp queries, median of 20 runs); end-to-end wall
-time adds ~3–4 ms of image upload + result readback regardless of format.
+time adds ~2–4 ms of image upload + result readback regardless of format.
+Each encoder caches its GPU resources (source texture, output/staging
+buffers, bind group) across encodes, so repeated encodes — including mip
+chains — skip per-call allocation: in an interleaved A/B this cuts BC7
+end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 
 | Format   | Quality        | Shader | GPU pass    |
 | -------- | -------------- | ------ | ----------- |
 | BC1      | fast (default) | f16    | **0.26 ms** |
-| BC1      | fast           | f32    | 0.33 ms     |
-| BC5      | fast (default) | f16    | **0.20 ms** |
-| BC5      | fast           | f32    | 0.39 ms     |
-| BC7      | fast (default) | f16    | **0.52 ms** |
-| BC7      | fast           | f32    | 1.70 ms     |
-| ASTC 4×4 | fast (default) | f16    | **0.20 ms** |
-| ASTC 4×4 | fast           | f32    | 0.66 ms     |
-| BC1      | high           | f32    | 3.0 ms      |
-| BC5      | high           | f32    | 3.4 ms      |
-| BC7      | high           | f32    | 14.1 ms     |
-| ASTC 4×4 | high           | f32    | 2.4 ms      |
+| BC1      | fast           | f32    | 0.46 ms     |
+| BC5      | fast (default) | f16    | **0.26 ms** |
+| BC5      | fast           | f32    | 0.26 ms     |
+| BC7      | fast (default) | f16    | **0.26 ms** |
+| BC7      | fast           | f32    | 0.59 ms     |
+| ASTC 4×4 | fast (default) | f16    | **0.26 ms** |
+| ASTC 4×4 | fast           | f32    | 0.56 ms     |
+| BC1      | high           | f32    | 2.7 ms      |
+| BC5      | high           | f32    | 1.0 ms      |
+| BC7      | high           | f32    | 10.4 ms     |
+| ASTC 4×4 | high           | f32    | 1.6 ms      |
 
-Timestamps are quantised to 100 µs by Chrome, so sub-millisecond figures are
-±0.05–0.1 ms.
+Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
+timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare
+variants only within a single session.
 
 ## Testing
 
@@ -283,6 +292,11 @@ test + benchmark suite at `example/pages/test.tsx` (logic in
 bun run --filter gputex build   # build the library the example consumes
 cd example && bunx next dev     # then open http://localhost:3000/test
 ```
+
+A second page, `/bench`, measures median end-to-end `encodeToBytes()` wall
+time per format across image sizes (256²–4096²) at fast quality — the
+numbers that matter for runtime streaming, where host overhead dominates
+small textures (results on `window.__GPUTEX_BENCH__`).
 
 The page runs three groups against the live WebGPU device and renders
 PASS/FAIL tables (machine-readable copy on `window.__GPUTEX_TESTS__`):

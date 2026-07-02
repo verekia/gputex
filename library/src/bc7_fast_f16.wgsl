@@ -1,7 +1,7 @@
 // bc7 "fast" encoder — f16 variant (requires the shader-f16 feature).
-// Same algorithm family as the f32 fast path in bc7.wgsl (bbox seed →
-// projection-based index assignment with a fused least-squares refit →
-// reproject), tuned for throughput:
+// Same algorithm family as the f32 fast path in bc7.wgsl (principal-axis
+// seed → projection-based index assignment with a fused least-squares
+// refit → reproject), tuned for throughput:
 //
 //   • All projection / refit math in f16 ([0,1] domain). ~2× ALU throughput
 //     on f16-capable GPUs. The projection direction is pre-scaled by 32:
@@ -110,19 +110,67 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var pix: array<h4, 16>;
   var lo = h4(1.0);
   var hi = h4(0.0);
+  var mean = h4(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
     let px = h4(textureLoad(src_tex, p, 0));
     pix[i] = px; lo = min(lo, px); hi = max(hi, px);
+    mean = mean + px;
+  }
+  mean = mean * h(1.0 / 16.0);
+
+  // Seed endpoints from the block's principal colour axis (covariance
+  // power-iteration, seeded with the bbox diagonal — same family as the BC1
+  // 'high' path). The bbox diagonal is sign-blind: on anti-correlated
+  // channels (normal maps, hue edges) it points across the data instead of
+  // along it, and the LSQ refit — which fits endpoints GIVEN the projection
+  // indices — can't recover from a wrong axis. Deviations are pre-scaled ×16
+  // so covariance entries for shallow blocks stay in f16's normal range
+  // (span ~1/255 → d² ≈ 1e-3) while full-range sums stay ≤4096; the
+  // iteration renormalises by the max component (a plain length() of the
+  // matvec output could overflow f16), so only the direction survives.
+  var seed_lo = lo;
+  var seed_hi = hi;
+  var c0v = h4(0.0);
+  var c1v = h4(0.0);
+  var c2v = h4(0.0);
+  var c3v = h4(0.0);
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let d = (pix[k] - mean) * h(16.0);
+    c0v = c0v + d.x * d;
+    c1v = c1v + d.y * d;
+    c2v = c2v + d.z * d;
+    c3v = c3v + d.w * d;
+  }
+  var axis = hi - lo;
+  var axis_ok = true;
+  for (var it: u32 = 0u; it < 4u; it = it + 1u) {
+    let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
+    let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
+    if (m < h(1e-4)) { axis_ok = false; break; }
+    axis = nv / m;
+  }
+  if (axis_ok) {
+    axis = axis / length(axis);
+    var t_min = h(4.0);
+    var t_max = h(-4.0);
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let t = dot(pix[k] - mean, axis);
+      t_min = min(t_min, t);
+      t_max = max(t_max, t);
+    }
+    seed_lo = clamp(mean + t_min * axis, h4(0.0), h4(1.0));
+    seed_hi = clamp(mean + t_max * axis, h4(0.0), h4(1.0));
   }
 
-  // Seed fit from the raw bbox, then quantise the refit endpoints. The refit
-  // is clamped to the block bbox: on multi-cluster blocks the unconstrained
-  // solve extrapolates far outside the block's colours and the per-channel
-  // [0,1] clamp then bends the hue — fringe pixels decode to colours that
-  // exist nowhere in the block. Constraining to the bbox also measures better
-  // in plain SSE (+1.3 dB on the colour test card).
-  let r = proj_fit(&pix, lo, hi);
+  // Fit from the principal-axis seed (bbox on degenerate blocks), then
+  // quantise the refit endpoints. The refit is clamped to the block bbox: on
+  // multi-cluster blocks the unconstrained solve extrapolates far outside
+  // the block's colours and the per-channel [0,1] clamp then bends the hue —
+  // fringe pixels decode to colours that exist nowhere in the block.
+  // Constraining to the bbox also measures better in plain SSE (+1.3 dB on
+  // the colour test card).
+  let r = proj_fit(&pix, seed_lo, seed_hi);
   var ep0: Ep;
   var ep1: Ep;
   if (r.valid) { ep0 = pick_ep(clamp(r.e0, lo, hi)); ep1 = pick_ep(clamp(r.e1, lo, hi)); }

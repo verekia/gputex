@@ -98,21 +98,27 @@ export type ProgressFn = (message: string) => void
 const PSNR_THRESHOLDS: Record<string, number | null> = {
   // `${format}:${quality}:${image}` — measured on the FULL 1024² committed
   // test cards (2026-07, Apple/metal-3, 16-tile colour card + structured
-  // normal map: 28.73/29.34, 51.85/53.18, 31.18/31.93, 30.05/30.53, alpha
-  // 34.45/32.86) minus ~0.15 dB. The colour card is deliberately harder than
-  // the old 512² one (Nyquist checkers, zone plate), so floors sit lower and
-  // the fast↔high gap is narrower. `null` = record only (used while
-  // baselining a change).
-  'bc1:fast:color': 28.55,
+  // normal map) minus ~0.15 dB. Fast baselines re-measured 2026-07 after the
+  // fast paths gained PCA endpoint seeding (BC1/BC7/ASTC) and the LSQ refit
+  // (BC5): 29.22/29.34, 52.86/53.18, 31.89/31.93, 30.57/30.53 (fast/high;
+  // ASTC fast now edges out the farthest-pair-seeded high), alpha
+  // 34.68/33.22. The colour card is deliberately harder than the old 512²
+  // one (Nyquist checkers, zone plate). `null` = record only (used while
+  // baselining a change; the `:normal` colour-format entries track the
+  // cross-card matrix without gating).
+  'bc1:fast:color': 29.05,
   'bc1:high:color': 29.2,
-  'bc5:fast:normal': 51.7,
+  'bc5:fast:normal': 52.7,
   'bc5:high:normal': 53.0,
-  'bc7:fast:color': 31.0,
+  'bc7:fast:color': 31.75,
   'bc7:high:color': 31.8,
-  'astc:fast:color': 29.9,
+  'astc:fast:color': 30.4,
   'astc:high:color': 30.4,
-  'bc7:fast:alpha': 34.3,
-  'astc:fast:alpha': 32.7,
+  'bc7:fast:alpha': 34.5,
+  'astc:fast:alpha': 33.05,
+  'bc1:fast:normal': null,
+  'bc7:fast:normal': null,
+  'astc:fast:normal': null,
 }
 
 // Worst-EASY-block gate for the fast paths: over blocks that 'high' encodes
@@ -125,9 +131,12 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
 // `null` = record only.
 const EASY_BLOCK_SSE = 0.05
 const EXCESS_LIMITS: Record<string, number | null> = {
-  // `${format}:${image}` — ~2–3× the observed values (2026-07, Apple/metal-3,
-  // 1024² 16-tile card: 0.061, 0.015, 0.045, 0.050, alpha 0.015/0.018),
-  // still 10×+ below catastrophic-artifact level.
+  // `${format}:${image}` — set from the pre-PCA observed values (2026-07,
+  // Apple/metal-3, 1024² 16-tile card: 0.061, 0.015, 0.045, 0.050, alpha
+  // 0.015/0.018) at ~2–3×; the PCA-seeded fast paths measure at or below
+  // those (0.061, 0.006, 0.011, 0.050, alpha 0.004/0.004), so the limits now
+  // carry extra cross-GPU headroom while staying 10×+ below
+  // catastrophic-artifact level.
   'bc1:color': 0.15,
   'bc5:normal': 0.05,
   'bc7:color': 0.12,
@@ -539,6 +548,13 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     { format: 'astc', image: 'color', img: colorFull, qualities: ['fast', 'high'] },
     { format: 'bc7', image: 'alpha', img: alpha, qualities: ['fast'] },
     { format: 'astc', image: 'alpha', img: alpha, qualities: ['fast'] },
+    // Cross-card matrix (record-only, null thresholds): the colour formats on
+    // the normal-map card. Anti-correlated R/G is exactly where a bbox-
+    // diagonal endpoint seed collapses, so these track the PCA seeding's
+    // headline win even though nothing gates on them yet.
+    { format: 'bc1', image: 'normal', img: normalFull, qualities: ['fast'] },
+    { format: 'bc7', image: 'normal', img: normalFull, qualities: ['fast'] },
+    { format: 'astc', image: 'normal', img: normalFull, qualities: ['fast'] },
   ]
 
   for (const { format, image, img, qualities } of qualityCases) {

@@ -2,7 +2,8 @@
 // BC7 (BPTC) mode-6 fragment-shader encoder — WebGL2 port of bc7.wgsl (fast).
 //
 // One fragment per 4×4 block → 16-byte block as 4 × u32 in outColor. Fast path
-// only: O(N) bbox seed → endpoints fitted by a single least-squares pass whose
+// only: principal-axis seed (covariance power-iteration; bbox on degenerate
+// blocks) → endpoints fitted by a single least-squares pass whose
 // normal-equation sums are accumulated during a projection-based index
 // assignment (palette is colinear, so the nearest entry is found by projecting
 // onto the endpoint line — O(1) per pixel). Mirrors the `QUALITY_HIGH == 0`
@@ -57,6 +58,35 @@ Ep pickEp(ivec4 ideal) {
     return Ep(b.seven, b.eight, 1u);
   }
   return Ep(a.seven, a.eight, 0u);
+}
+
+// Principal colour axis of gPixels via covariance power-iteration, seeded
+// with the bbox diagonal. Returns a unit axis, or vec4(0.0) for a degenerate
+// (constant) block. The bbox diagonal alone is sign-blind and points across
+// anti-correlated data (normal maps, hue edges) instead of along it.
+vec4 principalAxis(vec4 mean, vec4 seed) {
+  vec4 c0v = vec4(0.0);
+  vec4 c1v = vec4(0.0);
+  vec4 c2v = vec4(0.0);
+  vec4 c3v = vec4(0.0);
+  for (int k = 0; k < 16; k++) {
+    vec4 d = vec4(gPixels[k]) - mean;
+    c0v += d.x * d;
+    c1v += d.y * d;
+    c2v += d.z * d;
+    c3v += d.w * d;
+  }
+  vec4 v = seed;
+  float len = length(v);
+  if (len < 1e-9) { return vec4(0.0); }
+  v /= len;
+  for (int it = 0; it < 8; it++) {
+    vec4 nv = vec4(dot(c0v, v), dot(c1v, v), dot(c2v, v), dot(c3v, v));
+    len = length(nv);
+    if (len < 1e-12) { return vec4(0.0); }
+    v = nv / len;
+  }
+  return v;
 }
 
 // Projection index assignment over gPixels → gIdx. When `fit`, accumulate the
@@ -117,6 +147,7 @@ void main() {
 
   ivec4 lo = ivec4(255);
   ivec4 hi = ivec4(0);
+  ivec4 isum = ivec4(0);
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
@@ -124,10 +155,27 @@ void main() {
     gPixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
+    isum += px;
+  }
+  vec4 mean = vec4(isum) / 16.0;
+
+  ivec4 seed0 = lo;
+  ivec4 seed1 = hi;
+  vec4 axis = principalAxis(mean, vec4(hi - lo));
+  if (dot(axis, axis) > 0.0) {
+    float tMin = 1e30;
+    float tMax = -1e30;
+    for (int k = 0; k < 16; k++) {
+      float t = dot(vec4(gPixels[k]) - mean, axis);
+      tMin = min(tMin, t);
+      tMax = max(tMax, t);
+    }
+    seed0 = ivec4(clamp(floor(mean + tMin * axis + 0.5), vec4(0.0), vec4(255.0)));
+    seed1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
   }
 
-  Ep ep0 = pickEp(lo);
-  Ep ep1 = pickEp(hi);
+  Ep ep0 = pickEp(seed0);
+  Ep ep1 = pickEp(seed1);
   Fit r = projAssign(ep0.eight, ep1.eight, true);
   if (r.valid) {
     // Clamp the refit to the block bbox: on multi-cluster blocks the

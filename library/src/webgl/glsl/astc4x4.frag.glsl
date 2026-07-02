@@ -4,7 +4,8 @@
 // One fragment per 4×4 block → 16-byte block as 4 × u32 in outColor. Restricted
 // subset: single partition, no dual-plane, CEM 12 (LDR RGBA direct), 4×4 weight
 // grid with 2-bit weights (QUANT_4), 8-bit endpoints (QUANT_256). Fast path:
-// bbox seed → one LSQ refit fused into a projection weight assignment (4 colinear
+// principal-axis seed (covariance power-iteration; bbox on degenerate blocks)
+// → one LSQ refit fused into a projection weight assignment (4 colinear
 // levels). Mirrors the `QUALITY_HIGH == 0` branch of astc4x4.wgsl; see that file
 // for the 128-bit block layout.
 //
@@ -27,6 +28,35 @@ struct Fit { ivec4 e0; ivec4 e1; bool valid; };
 
 ivec4 to8(vec4 v) {
   return ivec4(clamp(floor(v * 255.0 + 0.5), vec4(0.0), vec4(255.0)));
+}
+
+// Principal colour axis of gPixels via covariance power-iteration, seeded
+// with the bbox diagonal. Returns a unit axis, or vec4(0.0) for a degenerate
+// (constant) block. The bbox diagonal alone is sign-blind and points across
+// anti-correlated data (normal maps, hue edges) instead of along it.
+vec4 principalAxis(vec4 mean, vec4 seed) {
+  vec4 c0v = vec4(0.0);
+  vec4 c1v = vec4(0.0);
+  vec4 c2v = vec4(0.0);
+  vec4 c3v = vec4(0.0);
+  for (int k = 0; k < 16; k++) {
+    vec4 d = vec4(gPixels[k]) - mean;
+    c0v += d.x * d;
+    c1v += d.y * d;
+    c2v += d.z * d;
+    c3v += d.w * d;
+  }
+  vec4 v = seed;
+  float len = length(v);
+  if (len < 1e-9) { return vec4(0.0); }
+  v /= len;
+  for (int it = 0; it < 8; it++) {
+    vec4 nv = vec4(dot(c0v, v), dot(c1v, v), dot(c2v, v), dot(c3v, v));
+    len = length(nv);
+    if (len < 1e-12) { return vec4(0.0); }
+    v = nv / len;
+  }
+  return v;
 }
 
 // Projection weight assignment over 4 levels (QUANT_4 ≈ thirds), with the LSQ
@@ -87,6 +117,7 @@ void main() {
 
   ivec4 lo = ivec4(255);
   ivec4 hi = ivec4(0);
+  ivec4 isum = ivec4(0);
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
@@ -94,10 +125,24 @@ void main() {
     gPixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
+    isum += px;
   }
+  vec4 mean = vec4(isum) / 16.0;
 
   ivec4 e0 = lo;
   ivec4 e1 = hi;
+  vec4 axis = principalAxis(mean, vec4(hi - lo));
+  if (dot(axis, axis) > 0.0) {
+    float tMin = 1e30;
+    float tMax = -1e30;
+    for (int k = 0; k < 16; k++) {
+      float t = dot(vec4(gPixels[k]) - mean, axis);
+      tMin = min(tMin, t);
+      tMax = max(tMax, t);
+    }
+    e0 = ivec4(clamp(floor(mean + tMin * axis + 0.5), vec4(0.0), vec4(255.0)));
+    e1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
+  }
   Fit r = projAssign(e0, e1, true);
   if (r.valid) {
     // Clamp the refit to the block bbox: on multi-cluster blocks the

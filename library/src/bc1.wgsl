@@ -14,12 +14,14 @@
 //   idx 3 -> (  color0 + 2*color1) / 3
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): bounding-box endpoints inset by ~half a 565 cell, then
-//     ONE fused pass that projects every pixel onto the decoded-endpoint line
-//     (the 4 palette entries are colinear and evenly spaced, so the nearest
-//     entry is the rounded projection — no 4-entry search) while accumulating
-//     the least-squares refit sums; the refit endpoints are re-quantised and a
-//     final projection pass assigns the indices, packed on the fly.
+//   fast (0, default): principal-axis endpoint seed (the high path's
+//     covariance power-iteration; inset bbox on degenerate blocks), inset by
+//     ~half a 565 cell along the axis, then ONE fused pass that projects
+//     every pixel onto the decoded-endpoint line (the 4 palette entries are
+//     colinear and evenly spaced, so the nearest entry is the rounded
+//     projection — no 4-entry search) while accumulating the least-squares
+//     refit sums; the refit endpoints are re-quantised and a final projection
+//     pass assigns the indices, packed on the fly.
 //   high (1): endpoints are seeded from the block's principal colour axis
 //     (covariance power-iteration) as well as the bbox diagonal, each refined by
 //     several least-squares passes with full 4-entry searches; the lower-error
@@ -265,9 +267,32 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let bbox_lo = clamp(bb_min + inset, vec3<f32>(0.0), vec3<f32>(1.0));
 
   if (QUALITY_HIGH == 0u) {
-    // -------- fast: projection + fused LSQ refit + reprojection --------
-    var c0 = to565(bbox_hi);
-    var c1 = to565(bbox_lo);
+    // -------- fast: PCA seed + projection + fused LSQ refit + reprojection
+    // Seed endpoints from the block's principal colour axis (same
+    // power-iteration as the high path). The bbox diagonal is sign-blind: on
+    // anti-correlated channels (normal maps, hue edges) it points across the
+    // data instead of along it, and the LSQ refit — which fits endpoints
+    // GIVEN the projection indices — can't recover from a wrong axis.
+    // Degenerate (near-flat) blocks keep the inset-bbox seed.
+    var seed_hi = bbox_hi;
+    var seed_lo = bbox_lo;
+    let axis = principal_axis(&pixels, mean, bb_max - bb_min);
+    if (dot(axis, axis) > 0.0) {
+      var t_min: f32 = 1e30;
+      var t_max: f32 = -1e30;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let t = dot(pixels[k] - mean, axis);
+        t_min = min(t_min, t);
+        t_max = max(t_max, t);
+      }
+      // Inset along the axis by ~half a 565 cell (stb_dxt heuristic,
+      // matching the bbox inset).
+      let pad = (t_max - t_min) / 16.0;
+      seed_hi = clamp(mean + (t_max - pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
+      seed_lo = clamp(mean + (t_min + pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    var c0 = to565(seed_hi);
+    var c1 = to565(seed_lo);
     if (c0 == c1) {
       if (c1 > 0u) { c1 = c1 - 1u; } else { c0 = c0 + 1u; }
     } else if (c0 < c1) {

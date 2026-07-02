@@ -3,8 +3,10 @@
 //
 // One fragment per 4×4 block → 16-byte BC5 block as 4 × u32 in outColor.
 // BC5 = two BC4 halves (R then G). This is the *fast* path only: bbox
-// endpoints + a single full-L2 index assignment per channel, no LSQ refit
-// (the WGSL `QUALITY_HIGH` branch). Always emits 6-interpolation mode
+// endpoints + a full-L2 index assignment per channel with the least-squares
+// refit sums accumulated in the same pass, then one refit accepted only when
+// it lowers the block's error (mirrors bc5.wgsl's fast branch — worth
+// ~1.3 dB on the normal-map card). Always emits 6-interpolation mode
 // (red0 > red1). See bc5.wgsl for the full derivation.
 
 precision highp float;
@@ -24,8 +26,33 @@ uint quantize8(float v) {
   return uint(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
 }
 
+// Nearest-palette assignment with the LSQ normal-equation sums and total
+// squared error accumulated in the same pass. Sums are only consumed by the
+// caller's refit; err drives the accept-if-better test.
+struct Assign { float err; float sAA; float sBB; float sAB; float sAV; float sBV; };
+Assign assignAll(float values[16], float pal[8], out uint indices[16]) {
+  Assign r = Assign(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+  for (int k = 0; k < 16; k++) {
+    float v = values[k];
+    uint bestJ = 0u;
+    float bestD = 1e20;
+    for (int j = 0; j < 8; j++) {
+      float d = pal[j] - v;
+      float d2 = d * d;
+      if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
+    }
+    indices[k] = bestJ;
+    r.err += bestD;
+    float a = W0_6[int(bestJ)];
+    float b = W1_6[int(bestJ)];
+    r.sAA += a * a; r.sBB += b * b; r.sAB += a * b; r.sAV += a * v; r.sBV += b * v;
+  }
+  return r;
+}
+
 // Encode 16 single-channel values into an 8-byte BC4 block (two little-endian
-// u32s). Mirrors encode_bc4() in bc5.wgsl with the refit pass omitted.
+// u32s). Mirrors encode_bc4() in bc5.wgsl's fast branch: bbox seed, fused
+// assignment + LSQ sums, refit accepted only if the error drops.
 uvec2 encodeBC4(float values[16]) {
   float vmin = 1.0;
   float vmax = 0.0;
@@ -47,16 +74,32 @@ uvec2 encodeBC4(float values[16]) {
   }
 
   uint indices[16];
-  for (int k = 0; k < 16; k++) {
-    float v = values[k];
-    uint bestJ = 0u;
-    float bestD = 1e20;
-    for (int j = 0; j < 8; j++) {
-      float d = pal[j] - v;
-      float d2 = d * d;
-      if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
+  Assign seed = assignAll(values, pal, indices);
+
+  // One least-squares refit, accepted only if the requantised endpoints lower
+  // the block error. Clamp to the block's value range (a strict-SSE win vs
+  // clamping to [0,1], same as the other formats' fast paths); keep 6-interp
+  // mode (r0 > r1 strictly).
+  float det = seed.sAA * seed.sBB - seed.sAB * seed.sAB;
+  if (abs(det) > 1e-9) {
+    float e0 = clamp((seed.sBB * seed.sAV - seed.sAB * seed.sBV) / det, vmin, vmax);
+    float e1 = clamp((seed.sAA * seed.sBV - seed.sAB * seed.sAV) / det, vmin, vmax);
+    uint n0 = quantize8(e0);
+    uint n1 = quantize8(e1);
+    if (n0 > n1 && !(n0 == r0 && n1 == r1)) {
+      float pal2[8];
+      float n0f = float(n0) / 255.0;
+      float n1f = float(n1) / 255.0;
+      for (int j = 0; j < 8; j++) {
+        pal2[j] = W0_6[j] * n0f + W1_6[j] * n1f;
+      }
+      uint idx2[16];
+      Assign refit = assignAll(values, pal2, idx2);
+      if (refit.err < seed.err) {
+        r0 = n0; r1 = n1;
+        for (int k = 0; k < 16; k++) indices[k] = idx2[k];
+      }
     }
-    indices[k] = bestJ;
   }
 
   // Pack the 48-bit index field (bytes 2..7) split across two u32 halves.

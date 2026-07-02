@@ -166,6 +166,27 @@ export abstract class Encoder {
   protected _pipeline!: GPUComputePipeline
   protected _pipelineCache = new Map<EncodeQuality, GPUComputePipeline>()
 
+  // -------------------------------------------------------------------- //
+  // Per-encoder GPU resource cache. Creating the source texture, output/
+  // staging buffers and bind group on every encode costs ~1ms of host time
+  // per call — for small/medium images that overhead dominates the encode
+  // (the compute pass itself is tens of µs at 512²). Sequential encodes
+  // (the common case: one texture after another, or a mip chain) reuse
+  // these; concurrent encodes on the same encoder see `_resourcesBusy` and
+  // fall back to transient resources, keeping the API contract unchanged.
+  // Buffers are grow-only, the texture is recreated on size change, and the
+  // bind group is cached per pipeline (with `layout: 'auto'` each pipeline
+  // has its own layout) until any bound resource is recreated.
+  private _cachedSrcTex: GPUTexture | null = null
+  private _cachedSrcW = 0
+  private _cachedSrcH = 0
+  private _cachedDst: GPUBuffer | null = null
+  private _cachedStaging: GPUBuffer | null = null
+  private _cachedParams: GPUBuffer | null = null
+  private _lastParams: [number, number, number, number] | null = null
+  private _bindGroupCache = new Map<GPUComputePipeline, GPUBindGroup>()
+  private _resourcesBusy = false
+
   constructor({ device, adapter, ownsDevice = false, disableF16 = false }: EncoderOptions) {
     this.device = device
     this.adapter = adapter
@@ -236,6 +257,15 @@ export abstract class Encoder {
   }
 
   destroy(): void {
+    this._cachedSrcTex?.destroy()
+    this._cachedDst?.destroy()
+    this._cachedStaging?.destroy()
+    this._cachedParams?.destroy()
+    this._cachedSrcTex = null
+    this._cachedDst = null
+    this._cachedStaging = null
+    this._cachedParams = null
+    this._bindGroupCache.clear()
     if (this.ownsDevice) this.device.destroy()
   }
 
@@ -336,121 +366,195 @@ export abstract class Encoder {
     const blockCount = blocksX * blocksY
     const outByteLen = blockCount * this.bytesPerBlock
 
-    // 1. Source texture sized to the padded block grid.
-    const srcTex = device.createTexture({
-      label: `${this.label}-src`,
-      size: [paddedWidth, paddedHeight, 1],
-      format: 'rgba8unorm',
-      // RENDER_ATTACHMENT is required by copyExternalImageToTexture
-      // (internally a blit) even though we never render into this texture.
-      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
-    })
-    uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
+    // Acquire GPU resources — from the per-encoder cache when it's free (the
+    // common sequential case), transiently when another encode on this
+    // encoder is still in flight.
+    const useCache = !this._resourcesBusy
+    if (useCache) this._resourcesBusy = true
 
-    // 2. Output storage buffer.
-    const dstBuffer = device.createBuffer({
-      label: `${this.label}-dst`,
-      size: outByteLen,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-    })
+    let srcTex: GPUTexture | undefined
+    let dstBuffer: GPUBuffer | undefined
+    let paramsBuffer: GPUBuffer | undefined
+    let staging: GPUBuffer | undefined
 
-    // 3. Uniform params buffer — 4 × u32 canonical header.
-    const paramsBuffer = device.createBuffer({
-      label: `${this.label}-params`,
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    })
-    // width/height are the SOURCE dimensions, not the padded ones: the shaders
-    // clamp texel reads to (width-1, height-1), which must be the last real
-    // texel. Clamping to the padded size would read the zero-initialized
-    // padding strip and bleed black into the edge blocks' palettes.
-    device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
-
-    // 4. Pipeline + bind group. The pipeline is specialised for the requested
-    //    quality level; its `layout: 'auto'` bind group layout is identical
-    //    across levels (same bindings), but we source it from the selected
-    //    pipeline to keep them provably compatible.
-    const pipeline = this._getPipeline(quality)
-    const bindGroup = device.createBindGroup({
-      label: `${this.label}-bg`,
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: srcTex.createView() },
-        { binding: 1, resource: { buffer: dstBuffer } },
-        { binding: 2, resource: { buffer: paramsBuffer } },
-      ],
-    })
-
-    // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When asked
-    //    (and the device has 'timestamp-query'), bracket the pass with
-    //    timestamps so the caller gets shader-only GPU time.
-    const useTimestamps = withGpuTime && device.features.has('timestamp-query')
-    const querySet = useTimestamps ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null
-    const queryBuffer = useTimestamps
-      ? device.createBuffer({
-          label: `${this.label}-ts-resolve`,
-          size: 16,
-          usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    try {
+      // 1. Source texture sized to the padded block grid. Reused while the
+      //    padded size is stable (repeated encodes, same-sized textures).
+      let srcTexIsNew = true
+      if (useCache && this._cachedSrcTex && this._cachedSrcW === paddedWidth && this._cachedSrcH === paddedHeight) {
+        srcTex = this._cachedSrcTex
+        srcTexIsNew = false
+      } else {
+        srcTex = device.createTexture({
+          label: `${this.label}-src`,
+          size: [paddedWidth, paddedHeight, 1],
+          format: 'rgba8unorm',
+          // RENDER_ATTACHMENT is required by copyExternalImageToTexture
+          // (internally a blit) even though we never render into this texture.
+          usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
         })
-      : null
+        if (useCache) {
+          this._cachedSrcTex?.destroy()
+          this._cachedSrcTex = srcTex
+          this._cachedSrcW = paddedWidth
+          this._cachedSrcH = paddedHeight
+        }
+      }
+      uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
 
-    const [wgX, wgY] = this.workgroupSize
-    const t0 = performance.now()
-    const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
-    const pass = enc.beginComputePass(
-      querySet ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
-    )
-    pass.setPipeline(pipeline)
-    pass.setBindGroup(0, bindGroup)
-    pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(blocksY / wgY), 1)
-    pass.end()
-    if (querySet && queryBuffer) enc.resolveQuerySet(querySet, 0, 2, queryBuffer, 0)
+      // 2. Output storage buffer + readback staging buffer (grow-only: a
+      //    larger cached buffer serves smaller encodes, e.g. mip levels).
+      let dstIsNew = true
+      if (useCache && this._cachedDst && this._cachedDst.size >= outByteLen) {
+        dstBuffer = this._cachedDst
+        dstIsNew = false
+      } else {
+        dstBuffer = device.createBuffer({
+          label: `${this.label}-dst`,
+          size: outByteLen,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        })
+        if (useCache) {
+          this._cachedDst?.destroy()
+          this._cachedDst = dstBuffer
+        }
+      }
+      if (useCache && this._cachedStaging && this._cachedStaging.size >= outByteLen) {
+        staging = this._cachedStaging
+      } else {
+        staging = device.createBuffer({
+          label: `${this.label}-staging`,
+          size: outByteLen,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        })
+        if (useCache) {
+          this._cachedStaging?.destroy()
+          this._cachedStaging = staging
+        }
+      }
 
-    // 6. Buffer readback. We go through a MAP_READ staging buffer rather
-    //    than copyBufferToTexture: the encoder owns its own adapter/device,
-    //    separate from the Three.js renderer's, so the compressed bytes
-    //    have to transit CPU anyway before the renderer uploads them.
-    const staging = device.createBuffer({
-      label: `${this.label}-staging`,
-      size: outByteLen,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    })
-    enc.copyBufferToBuffer(dstBuffer, 0, staging, 0, outByteLen)
-    const tsStaging =
-      querySet && queryBuffer
-        ? device.createBuffer({
-            label: `${this.label}-ts-staging`,
+      // 3. Uniform params buffer — 4 × u32 canonical header.
+      // width/height are the SOURCE dimensions, not the padded ones: the
+      // shaders clamp texel reads to (width-1, height-1), which must be the
+      // last real texel. Clamping to the padded size would read the zero-
+      // initialized padding strip and bleed black into the edge blocks'
+      // palettes.
+      if (useCache) {
+        if (!this._cachedParams) {
+          this._cachedParams = device.createBuffer({
+            label: `${this.label}-params`,
             size: 16,
-            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          })
+          this._lastParams = null
+        }
+        paramsBuffer = this._cachedParams
+        const lp = this._lastParams
+        if (!lp || lp[0] !== blocksX || lp[1] !== blocksY || lp[2] !== width || lp[3] !== height) {
+          device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
+          this._lastParams = [blocksX, blocksY, width, height]
+        }
+      } else {
+        paramsBuffer = device.createBuffer({
+          label: `${this.label}-params`,
+          size: 16,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+        device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
+      }
+
+      // 4. Pipeline + bind group. The pipeline is specialised for the
+      //    requested quality level; with `layout: 'auto'` every pipeline has
+      //    its own bind group layout, so cached bind groups are keyed by
+      //    pipeline and dropped whenever a bound resource was recreated.
+      const pipeline = this._getPipeline(quality)
+      if (useCache && (srcTexIsNew || dstIsNew)) this._bindGroupCache.clear()
+      let bindGroup = useCache ? this._bindGroupCache.get(pipeline) : undefined
+      if (!bindGroup) {
+        bindGroup = device.createBindGroup({
+          label: `${this.label}-bg`,
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: srcTex.createView() },
+            { binding: 1, resource: { buffer: dstBuffer } },
+            { binding: 2, resource: { buffer: paramsBuffer } },
+          ],
+        })
+        if (useCache) this._bindGroupCache.set(pipeline, bindGroup)
+      }
+
+      // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When
+      //    asked (and the device has 'timestamp-query'), bracket the pass
+      //    with timestamps so the caller gets shader-only GPU time.
+      const useTimestamps = withGpuTime && device.features.has('timestamp-query')
+      const querySet = useTimestamps ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null
+      const queryBuffer = useTimestamps
+        ? device.createBuffer({
+            label: `${this.label}-ts-resolve`,
+            size: 16,
+            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
           })
         : null
-    if (tsStaging && queryBuffer) enc.copyBufferToBuffer(queryBuffer, 0, tsStaging, 0, 16)
-    device.queue.submit([enc.finish()])
 
-    await staging.mapAsync(GPUMapMode.READ)
-    const data = new Uint8Array(staging.getMappedRange().slice(0))
-    staging.unmap()
-    const encodeMs = performance.now() - t0
+      const [wgX, wgY] = this.workgroupSize
+      const t0 = performance.now()
+      const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
+      const pass = enc.beginComputePass(
+        querySet ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
+      )
+      pass.setPipeline(pipeline)
+      pass.setBindGroup(0, bindGroup)
+      pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(blocksY / wgY), 1)
+      pass.end()
+      if (querySet && queryBuffer) enc.resolveQuerySet(querySet, 0, 2, queryBuffer, 0)
 
-    let gpuMs: number | undefined
-    if (tsStaging) {
-      await tsStaging.mapAsync(GPUMapMode.READ)
-      const [begin, end] = new BigUint64Array(tsStaging.getMappedRange().slice(0))
-      tsStaging.unmap()
-      tsStaging.destroy()
-      // Timestamps are u64 nanoseconds.
-      if (end !== undefined && begin !== undefined && end > begin) {
-        gpuMs = Number(end - begin) / 1e6
+      // 6. Buffer readback. We go through a MAP_READ staging buffer rather
+      //    than copyBufferToTexture: the encoder owns its own adapter/device,
+      //    separate from the Three.js renderer's, so the compressed bytes
+      //    have to transit CPU anyway before the renderer uploads them.
+      enc.copyBufferToBuffer(dstBuffer, 0, staging, 0, outByteLen)
+      const tsStaging =
+        querySet && queryBuffer
+          ? device.createBuffer({
+              label: `${this.label}-ts-staging`,
+              size: 16,
+              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            })
+          : null
+      if (tsStaging && queryBuffer) enc.copyBufferToBuffer(queryBuffer, 0, tsStaging, 0, 16)
+      device.queue.submit([enc.finish()])
+
+      // Map only the bytes this encode produced — the cached staging buffer
+      // may be larger.
+      await staging.mapAsync(GPUMapMode.READ, 0, outByteLen)
+      const data = new Uint8Array(staging.getMappedRange(0, outByteLen).slice(0))
+      staging.unmap()
+      const encodeMs = performance.now() - t0
+
+      let gpuMs: number | undefined
+      if (tsStaging) {
+        await tsStaging.mapAsync(GPUMapMode.READ)
+        const [begin, end] = new BigUint64Array(tsStaging.getMappedRange().slice(0))
+        tsStaging.unmap()
+        tsStaging.destroy()
+        // Timestamps are u64 nanoseconds.
+        if (end !== undefined && begin !== undefined && end > begin) {
+          gpuMs = Number(end - begin) / 1e6
+        }
+      }
+      querySet?.destroy()
+      queryBuffer?.destroy()
+
+      return { width, height, paddedWidth, paddedHeight, data, encodeMs, gpuMs }
+    } finally {
+      if (useCache) {
+        this._resourcesBusy = false
+      } else {
+        srcTex?.destroy()
+        dstBuffer?.destroy()
+        staging?.destroy()
+        paramsBuffer?.destroy()
       }
     }
-    querySet?.destroy()
-    queryBuffer?.destroy()
-
-    srcTex.destroy()
-    dstBuffer.destroy()
-    staging.destroy()
-    paramsBuffer.destroy()
-
-    return { width, height, paddedWidth, paddedHeight, data, encodeMs, gpuMs }
   }
 }

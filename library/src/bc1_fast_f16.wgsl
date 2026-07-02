@@ -5,7 +5,8 @@
 // f16 ([0,1] domain). The algorithm is the same family as the BC7/ASTC fast
 // paths rather than a port of bc1.wgsl's fast branch:
 //
-//   1. bbox endpoints, inset by ~half a 565 cell (stb_dxt heuristic)
+//   1. principal-axis endpoint seed (covariance power-iteration; inset bbox
+//      on degenerate blocks), inset by ~half a 565 cell (stb_dxt heuristic)
 //   2. quantise to 565, force 4-colour mode (c0 > c1)
 //   3. ONE fused pass: project every pixel onto the decoded-endpoint line
 //      (the 4 palette entries are colinear and evenly spaced, so the nearest
@@ -72,15 +73,66 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var pix: array<h3, 16>;
   var mn = h3(1.0);
   var mxv = h3(0.0);
+  var mean = h3(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
     let px = h3(textureLoad(src_tex, p, 0).rgb);
     pix[i] = px; mn = min(mn, px); mxv = max(mxv, px);
+    mean = mean + px;
   }
+  mean = mean * h(1.0 / 16.0);
 
-  // Inset bbox by ~half a 565 cell so the quantised palette hugs the data.
-  let inset = (mxv - mn) * h(1.0 / 16.0);
-  let seed = order565(to565(clamp(mxv - inset, h3(0.0), h3(1.0))), to565(clamp(mn + inset, h3(0.0), h3(1.0))));
+  // Seed endpoints from the block's principal colour axis (covariance
+  // power-iteration, seeded with the bbox diagonal — same family as the
+  // 'high' path). The bbox diagonal is sign-blind: on anti-correlated
+  // channels (normal maps, hue edges) it points across the data instead of
+  // along it, the projection indices come out garbage, and the LSQ refit —
+  // which fits endpoints GIVEN those indices — can't recover. Deviations are
+  // pre-scaled ×16 so covariance entries for shallow blocks stay in f16's
+  // normal range (span ~1/255 → d² ≈ 1e-3) while full-range sums stay ≤4096;
+  // the iteration renormalises by the max component (a plain length() of the
+  // matvec output could overflow f16), so only the direction survives — the
+  // ×256 covariance scale is irrelevant.
+  var seed_hi: h3;
+  var seed_lo: h3;
+  var c0v = h3(0.0);
+  var c1v = h3(0.0);
+  var c2v = h3(0.0);
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let d = (pix[k] - mean) * h(16.0);
+    c0v = c0v + d.x * d;
+    c1v = c1v + d.y * d;
+    c2v = c2v + d.z * d;
+  }
+  var axis = mxv - mn;
+  var axis_ok = true;
+  for (var it: u32 = 0u; it < 4u; it = it + 1u) {
+    let nv = h3(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis));
+    let m = max(max(abs(nv.x), abs(nv.y)), abs(nv.z));
+    if (m < h(1e-4)) { axis_ok = false; break; }
+    axis = nv / m;
+  }
+  if (axis_ok) {
+    axis = axis / length(axis);
+    var t_min = h(4.0);
+    var t_max = h(-4.0);
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let t = dot(pix[k] - mean, axis);
+      t_min = min(t_min, t);
+      t_max = max(t_max, t);
+    }
+    // Inset along the axis by ~half a 565 cell (stb_dxt heuristic, matching
+    // the degenerate-case bbox inset below).
+    let pad = (t_max - t_min) * h(1.0 / 16.0);
+    seed_hi = clamp(mean + (t_max - pad) * axis, h3(0.0), h3(1.0));
+    seed_lo = clamp(mean + (t_min + pad) * axis, h3(0.0), h3(1.0));
+  } else {
+    // Degenerate (near-flat) block: inset bbox seed, as before.
+    let inset = (mxv - mn) * h(1.0 / 16.0);
+    seed_hi = clamp(mxv - inset, h3(0.0), h3(1.0));
+    seed_lo = clamp(mn + inset, h3(0.0), h3(1.0));
+  }
+  let seed = order565(to565(seed_hi), to565(seed_lo));
   var c0 = seed.x;
   var c1 = seed.y;
   let p0 = from565(c0);
