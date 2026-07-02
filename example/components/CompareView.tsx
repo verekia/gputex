@@ -174,7 +174,7 @@ const CompareView = ({
           enableRotate={false}
           enablePan
           enableZoom
-          minDistance={0.6}
+          minDistance={0.1}
           maxDistance={8}
           mouseButtons={{ LEFT: MOUSE.PAN, MIDDLE: MOUSE.DOLLY, RIGHT: MOUSE.PAN }}
         />
