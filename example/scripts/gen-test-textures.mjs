@@ -4,23 +4,33 @@
 //   node scripts/gen-test-textures.mjs
 //
 // Outputs into public/textures/:
-//   • color.png  — RGB test card used by the BC1 and BC7 pages. Designed to
-//     expose codec weaknesses: smooth gradients (banding), saturated colour
-//     edges (block/endpoint artifacts), and a high-frequency region (detail
-//     loss). Encoding the SAME image with BC1 vs BC7 makes BC7's quality edge
-//     obvious side by side.
-//   • normal.png — a tangent-space normal map (bump field) used by the BC5
-//     page. Smoothly varying R/G (normal x/y) is exactly what BC5 targets.
+//   • color.png  — 1024² RGB test card used by the BC1/BC7/ASTC pages: a 4×4
+//     grid of 256² tiles, each stressing ONE codec failure mode so artifacts
+//     are attributable at a glance. Row 1: smooth gradients (banding). Row 2:
+//     hard edges (block/endpoint artifacts — includes the disc-over-checker
+//     probe that catches invented-hue fringes on multi-cluster blocks).
+//     Row 3: high-frequency detail (detail loss, chroma collapse). Row 4:
+//     natural-ish content (what real assets look like). Encoding the SAME
+//     card with BC1 vs BC7 makes BC7's quality edge obvious side by side.
+//   • normal.png — 1024² tangent-space normal map for the BC5 page, four
+//     quadrants: hemisphere domes (smooth full-range normals), pyramids
+//     (flat faces + hard creases — flat faces must stay flat), a bevelled
+//     brick wall (fine structured detail), and a ripple frequency sweep with
+//     a flat strip (banding on a flat normal shows as lighting blotches).
 //
 // These are committed defaults so the pages render out of the box. Drop your
 // own color.png / normal.png in public/textures/ to test real assets.
+//
+// NOTE: the /test suite's PSNR floors and excess limits (gpuTestSuite.ts) are
+// measured against these exact images — regenerate them and the thresholds
+// must be re-baselined.
 
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { deflateSync } from 'node:zlib'
 
-const SIZE = 512
+const SIZE = 1024
 const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'textures')
 
 // ---------------------------------------------------------------- PNG writer
@@ -78,6 +88,8 @@ const encodePNG = (width, height, rgba) => {
 
 const clamp01 = v => (v < 0 ? 0 : v > 1 ? 1 : v)
 const to255 = v => Math.max(0, Math.min(255, Math.round(v * 255)))
+const lerp = (a, b, t) => a + (b - a) * t
+const mix3 = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
 
 // Deterministic value noise (hash-based) so runs are reproducible.
 const hash = (x, y) => {
@@ -85,6 +97,34 @@ const hash = (x, y) => {
   h = (h ^ (h >>> 13)) >>> 0
   h = Math.imul(h, 1274126177) >>> 0
   return ((h ^ (h >>> 16)) >>> 0) / 0xffffffff
+}
+
+// Smooth value noise: bilinear hash-lattice interpolation with smoothstep.
+const smoothNoise = (x, y) => {
+  const xi = Math.floor(x)
+  const yi = Math.floor(y)
+  const fx = x - xi
+  const fy = y - yi
+  const sx = fx * fx * (3 - 2 * fx)
+  const sy = fy * fy * (3 - 2 * fy)
+  const n00 = hash(xi, yi)
+  const n10 = hash(xi + 1, yi)
+  const n01 = hash(xi, yi + 1)
+  const n11 = hash(xi + 1, yi + 1)
+  return lerp(lerp(n00, n10, sx), lerp(n01, n11, sx), sy)
+}
+
+// Fractional Brownian motion — 4 octaves of smooth value noise in [0,1).
+const fbm = (x, y) => {
+  let sum = 0
+  let amp = 0.5
+  let freq = 1
+  for (let o = 0; o < 4; o++) {
+    sum += amp * smoothNoise(x * freq, y * freq)
+    amp *= 0.5
+    freq *= 2
+  }
+  return sum / 0.9375
 }
 
 const hsv2rgb = (h, s, v) => {
@@ -110,86 +150,161 @@ const hsv2rgb = (h, s, v) => {
 }
 
 // ---------------------------------------------------------------- color card
+//
+// 4×4 grid of 256² tiles separated by 2px near-black rules (crisp edges are
+// themselves a stressor, and the rules make the card read as deliberate).
+// Every tile function gets tile-local (u, v) in [0,1) plus the absolute pixel
+// (x, y) for pixel-exact patterns, and returns [r, g, b] in [0,1].
+
+const TILE = 256
+
+const TILES = [
+  // ---- Row 1: smooth gradients — banding. ----
+  // Hue sweep × saturation ramp.
+  (u, v) => hsv2rgb(u, 0.35 + 0.65 * v, 0.95),
+  // Very shallow grayscale dome — the classic banding killer (span ~0.14).
+  (u, v) => {
+    const d = Math.hypot(u - 0.5, v - 0.5) / 0.7071
+    const g = 0.36 + 0.14 * (1 - clamp01(d))
+    return [g, g, g]
+  },
+  // Deep shadow gradient: black → dark blue, where 565/endpoint quantisation
+  // bands are most visible.
+  (u, v) => mix3([0.0, 0.01, 0.03], [0.16, 0.2, 0.52], v * (0.7 + 0.3 * u)),
+  // Duotone diagonal: orange → teal through neutral (chroma axis banding).
+  (u, v) => mix3([0.93, 0.52, 0.13], [0.09, 0.5, 0.58], (u + v) / 2),
+
+  // ---- Row 2: hard edges — block/endpoint artifacts. ----
+  // Saturated tile grid with thin dark rules (per-tile flatness + edges).
+  (u, v) => {
+    const PALETTE = [
+      [0.9, 0.1, 0.1],
+      [0.1, 0.8, 0.2],
+      [0.1, 0.3, 0.95],
+      [0.95, 0.85, 0.1],
+      [0.95, 0.45, 0.1],
+      [0.6, 0.1, 0.8],
+      [0.1, 0.85, 0.85],
+      [0.95, 0.95, 0.95],
+    ]
+    const fx = u * 4
+    const fy = v * 4
+    if (fx - Math.floor(fx) < 0.04 || fy - Math.floor(fy) < 0.04) return [0.03, 0.03, 0.03]
+    return PALETTE[(Math.floor(fx) + Math.floor(fy) * 4) % PALETTE.length]
+  },
+  // Radial-gradient disc over a crisp 2px pink/teal checker — the
+  // multi-cluster edge probe (blocks on the rim hold 3 colour clusters; an
+  // encoder that extrapolates endpoints paints fringe hues here).
+  (u, v, x, y) => {
+    const d = Math.hypot(u - 0.5, v - 0.5) / 0.42
+    if (d < 1) {
+      const t = 1 - d
+      return [0.95 * t, 0.7 * t + 0.1, 0.2 + 0.7 * (1 - t)]
+    }
+    return ((x >> 1) + (y >> 1)) & 1 ? [0.85, 0.2, 0.5] : [0.15, 0.6, 0.85]
+  },
+  // 45° chevron bars in complementary red/cyan — diagonal edges cut every
+  // block, the worst orientation for a 4×4 grid.
+  (u, v, x, y) => (Math.floor((x + y) / 8) & 1 ? [0.88, 0.12, 0.14] : [0.1, 0.78, 0.84]),
+  // Zone plate: sin(r²) rings sweep every frequency and orientation up to
+  // ~Nyquist at the corners — detail loss shows as ring dropout/moiré.
+  (u, v) => {
+    const dx = (u - 0.5) * TILE
+    const dy = (v - 0.5) * TILE
+    const g = 0.5 + 0.45 * Math.sin((dx * dx + dy * dy) / 170)
+    return [g, g, g]
+  },
+
+  // ---- Row 3: highest frequency — detail loss, chroma collapse. ----
+  // 1px black/white checker — Nyquist luma.
+  (u, v, x, y) => ((x + y) & 1 ? [0.95, 0.95, 0.95] : [0.05, 0.05, 0.05]),
+  // 1px red/blue checker — Nyquist chroma (BC1's classic failure: collapses
+  // to purple mush).
+  (u, v, x, y) => ((x + y) & 1 ? [0.88, 0.1, 0.14] : [0.12, 0.18, 0.88]),
+  // Pinstripe frequency sweep: stripe width doubles per column band (1→32px);
+  // top half vertical, bottom half horizontal.
+  (u, v, x, y) => {
+    const w = 1 << Math.min(Math.floor(u * 6), 5)
+    const on = (Math.floor((v < 0.5 ? x : y) / w) & 1) === 1
+    return on ? [0.92, 0.9, 0.85] : [0.16, 0.14, 0.2]
+  },
+  // Contained noise patch — worst-case entropy. Left half grayscale, right
+  // half independent RGB (chroma entropy).
+  (u, v, x, y) => {
+    if (u < 0.5) {
+      const g = 0.15 + 0.7 * hash(x, y)
+      return [g, g, g]
+    }
+    return [0.15 + 0.7 * hash(x, y), 0.15 + 0.7 * hash(x + 7919, y), 0.15 + 0.7 * hash(x, y + 4483)]
+  },
+
+  // ---- Row 4: natural-ish content — what real assets degrade like. ----
+  // Marble: fBm-warped sine veins, warm stone tint.
+  (u, v, x, y) => {
+    const t = fbm(x / 48, y / 48)
+    const vein = 0.5 + 0.5 * Math.sin((u * 6 + t * 5) * Math.PI)
+    return mix3([0.23, 0.2, 0.28], [0.88, 0.84, 0.78], vein)
+  },
+  // Plasma: layered sines — smooth, colourful, every hue direction at once.
+  (u, v) => {
+    const a = Math.sin(u * 5.1 + Math.sin(v * 3.7)) + Math.sin(Math.hypot(u - 0.7, v - 0.3) * 9)
+    const b = Math.sin(v * 4.3 + Math.sin(u * 2.9)) + Math.sin(Math.hypot(u - 0.2, v - 0.8) * 7)
+    return [
+      0.5 + 0.4 * Math.sin(a * 1.7),
+      0.5 + 0.4 * Math.sin(b * 1.9 + 2.1),
+      0.5 + 0.4 * Math.sin((a + b) * 1.3 + 4.2),
+    ]
+  },
+  // Voronoi cells: pastel flats with darkened borders — organic hard edges.
+  (u, v) => {
+    let d1 = Infinity
+    let d2 = Infinity
+    let cell = 0
+    for (let i = 0; i < 20; i++) {
+      const px = hash(i * 3 + 1, 17)
+      const py = hash(31, i * 5 + 2)
+      const d = Math.hypot(u - px, v - py)
+      if (d < d1) {
+        d2 = d1
+        d1 = d
+        cell = i
+      } else if (d < d2) {
+        d2 = d
+      }
+    }
+    const base = hsv2rgb(hash(cell, 97), 0.35, 0.6 + 0.35 * hash(cell, 131))
+    const edge = clamp01((d2 - d1) * 22) // 0 at borders → 1 inside
+    return mix3([0.08, 0.07, 0.1], base, 0.25 + 0.75 * edge)
+  },
+  // Soft additive blobs on a dark ground — smooth multi-hue gradients.
+  (u, v) => {
+    let r = 0.06
+    let g = 0.06
+    let b = 0.09
+    for (let i = 0; i < 7; i++) {
+      const px = hash(i + 3, 211)
+      const py = hash(223, i + 5)
+      const w = Math.exp(-(((u - px) ** 2 + (v - py) ** 2) / 0.022))
+      const c = hsv2rgb(hash(i, 241), 0.65, 0.8)
+      r += c[0] * w * 0.6
+      g += c[1] * w * 0.6
+      b += c[2] * w * 0.6
+    }
+    return [clamp01(r), clamp01(g), clamp01(b)]
+  },
+]
 
 const genColor = () => {
   const px = new Uint8Array(SIZE * SIZE * 4)
-  const half = SIZE / 2
   for (let y = 0; y < SIZE; y++) {
     for (let x = 0; x < SIZE; x++) {
-      let r, g, b
-      const left = x < half
-      const top = y < half
-      if (left && top) {
-        // TL: smooth hue × saturation gradient → banding test.
-        const lu = x / (half - 1)
-        const lv = y / (half - 1)
-        ;[r, g, b] = hsv2rgb(lu, 0.35 + 0.65 * lv, 0.95)
-      } else if (!left && top) {
-        // TR: hard-edged saturated colour blocks → block/edge test.
-        const bx = Math.floor(((x - half) / half) * 4)
-        const by = Math.floor((y / half) * 4)
-        const palette = [
-          [0.9, 0.1, 0.1],
-          [0.1, 0.8, 0.2],
-          [0.1, 0.3, 0.95],
-          [0.95, 0.85, 0.1],
-          [0.95, 0.45, 0.1],
-          [0.6, 0.1, 0.8],
-          [0.1, 0.85, 0.85],
-          [0.95, 0.95, 0.95],
-        ]
-        const c = palette[(bx + by * 4) % palette.length]
-        ;[r, g, b] = c
-        // thin black grid lines between blocks → high-contrast edges.
-        const fx = ((x - half) / half) * 4
-        const fy = (y / half) * 4
-        if (fx - Math.floor(fx) < 0.04 || fy - Math.floor(fy) < 0.04) {
-          r = g = b = 0.03
-        }
-      } else if (left && !top) {
-        // BL: grayscale + per-channel ramps → endpoint/banding test.
-        const lv = (y - half) / (half - 1)
-        const band = Math.floor(lv * 4)
-        const lu = x / (half - 1)
-        if (band === 0) {
-          r = g = b = lu
-        } else if (band === 1) {
-          r = lu
-          g = 0.1
-          b = 0.1
-        } else if (band === 2) {
-          r = 0.1
-          g = lu
-          b = 0.1
-        } else {
-          r = 0.1
-          g = 0.1
-          b = lu
-        }
-      } else {
-        // BR: high-frequency checker + noise → detail-loss test, with a smooth
-        // radial gradient disc overlaid in the centre (banding on curves).
-        const cx = (x - half) / half
-        const cy = (y - half) / half
-        const checker = ((x >> 1) + (y >> 1)) & 1
-        const n = hash(x, y) * 0.25
-        if (checker) {
-          r = 0.85 + n
-          g = 0.2 + n
-          b = 0.5 + n
-        } else {
-          r = 0.15 + n
-          g = 0.6 + n
-          b = 0.85 - n
-        }
-        const dx = cx - 0.5
-        const dy = cy - 0.5
-        const d = Math.sqrt(dx * dx + dy * dy)
-        if (d < 0.42) {
-          const t = clamp01(1 - d / 0.42)
-          ;[r, g, b] = [0.95 * t, 0.7 * t + 0.1, 0.2 + 0.7 * (1 - t)]
-        }
-      }
+      const tx = Math.floor(x / TILE)
+      const ty = Math.floor(y / TILE)
+      const lx = x - tx * TILE
+      const ly = y - ty * TILE
+      // 2px separator rules between tiles (not on the outer border).
+      const onRule = (lx < 2 && tx > 0) || (ly < 2 && ty > 0)
+      const [r, g, b] = onRule ? [0.04, 0.04, 0.05] : TILES[ty * 4 + tx](lx / TILE, ly / TILE, x, y)
       const o = (y * SIZE + x) * 4
       px[o] = to255(clamp01(r))
       px[o + 1] = to255(clamp01(g))
@@ -201,39 +316,94 @@ const genColor = () => {
 }
 
 // ---------------------------------------------------------------- normal map
+//
+// Height field in pixel units → tangent-space normals via central
+// differences. Four 512² quadrants, each a different BC5 stressor:
+//   TL domes      — hemispheres, smooth normals through the full x/y range
+//   TR pyramids   — flat faces (must stay flat) meeting in hard creases
+//   BL bricks     — bevelled grooves, fine structured detail at block scale
+//   BR ripples    — frequency sweep (64→6px) + a dead-flat strip at the
+//                   bottom (any banding there shows as lighting blotches)
+
+const HALF = SIZE / 2
+
+// Quadrant-local height functions, (lx, ly) in [0, HALF).
+const domeHeight = (lx, ly) => {
+  const cells = 4
+  const cs = HALF / cells
+  const cx = Math.floor(lx / cs)
+  const cy = Math.floor(ly / cs)
+  const R = cs * 0.42
+  const dx = lx - (cx + 0.5) * cs
+  const dy = ly - (cy + 0.5) * cs
+  const d2 = dx * dx + dy * dy
+  const r = R * (0.75 + 0.25 * hash(cx + 51, cy + 87))
+  return d2 < r * r ? Math.sqrt(r * r - d2) : 0
+}
+
+const pyramidHeight = (lx, ly) => {
+  const cells = 4
+  const cs = HALF / cells
+  const cx = Math.floor(lx / cs)
+  const cy = Math.floor(ly / cs)
+  const dx = Math.abs(lx - (cx + 0.5) * cs)
+  const dy = Math.abs(ly - (cy + 0.5) * cs)
+  const R = cs * 0.44
+  // Alternate square (chessboard-axis) and diamond (45°) pyramids.
+  const d = (cx + cy) & 1 ? dx + dy : Math.max(dx, dy)
+  return Math.max(0, R - d) * 0.9
+}
+
+const brickHeight = (lx, ly) => {
+  const bw = 128
+  const bh = 64
+  const groove = 8 // full groove width
+  const bevel = 7 // bevel ramp on each side of the groove
+  const row = Math.floor(ly / bh)
+  const ox = row & 1 ? bw / 2 : 0
+  const bx = (((lx + ox) % bw) + bw) % bw
+  const by = ((ly % bh) + bh) % bh
+  // Distance to the nearest brick border along each axis.
+  const ex = Math.min(bx, bw - bx)
+  const ey = Math.min(by, bh - by)
+  const e = Math.min(ex, ey)
+  const h = clamp01((e - groove / 2) / bevel) * 10
+  // Subtle per-brick height variation so faces aren't all identical.
+  const col = Math.floor((lx + ox) / bw)
+  return h * (0.8 + 0.2 * hash(col + 13, row + 29))
+}
+
+const rippleHeight = (lx, ly) => {
+  if (ly > HALF * 0.8) return 0 // dead-flat strip
+  const band = Math.floor(ly / ((HALF * 0.8) / 5)) // 5 frequency bands
+  const wavelength = 64 / 1.6 ** band // 64 → ~9.8px
+  const slope = 0.55
+  const amp = (wavelength * slope) / (2 * Math.PI)
+  return amp * Math.sin((2 * Math.PI * lx) / wavelength)
+}
+
+const height = (x, y) => {
+  // Clamp into the owning quadrant so central differences never sample across
+  // a quadrant seam (which would smear one stressor into another).
+  const qx = x < HALF ? 0 : 1
+  const qy = y < HALF ? 0 : 1
+  const lx = Math.min(Math.max(x - qx * HALF, 0), HALF - 1)
+  const ly = Math.min(Math.max(y - qy * HALF, 0), HALF - 1)
+  if (qy === 0) return qx === 0 ? domeHeight(lx, ly) : pyramidHeight(lx, ly)
+  return qx === 0 ? brickHeight(lx, ly) : rippleHeight(lx, ly)
+}
 
 const genNormal = () => {
   const px = new Uint8Array(SIZE * SIZE * 4)
-  // Height field: a grid of rounded bumps + a couple of diagonal ripples.
-  const height = (x, y) => {
-    const u = x / SIZE
-    const v = y / SIZE
-    let h = 0
-    const cells = 5
-    for (let gy = 0; gy < cells; gy++) {
-      for (let gx = 0; gx < cells; gx++) {
-        const cxp = (gx + 0.5) / cells
-        const cyp = (gy + 0.5) / cells
-        const dx = u - cxp
-        const dy = v - cyp
-        const r2 = (dx * dx + dy * dy) * cells * cells
-        h += Math.exp(-r2 * 3.0) * (0.6 + 0.4 * hash(gx + 1, gy + 1))
-      }
-    }
-    h += 0.15 * Math.sin((u + v) * Math.PI * 8)
-    return h
-  }
-  const eps = 1 / SIZE
   for (let y = 0; y < SIZE; y++) {
     for (let x = 0; x < SIZE; x++) {
       const hL = height(x - 1, y)
       const hR = height(x + 1, y)
-      const hD = height(x, y - 1)
-      const hU = height(x, y + 1)
-      // Tangent-space normal from the height gradient.
-      const scale = 2.0
-      let nx = (-(hR - hL) / (2 * eps)) * scale
-      let ny = (-(hU - hD) / (2 * eps)) * scale
+      const hU = height(x, y - 1)
+      const hD = height(x, y + 1)
+      // Tangent-space normal from the height gradient (heights in px units).
+      let nx = -(hR - hL) / 2
+      let ny = -(hD - hU) / 2
       let nz = 1
       const inv = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz)
       nx *= inv

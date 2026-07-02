@@ -2,7 +2,7 @@ import { Suspense, useCallback, useState } from 'react'
 
 import { OrbitControls } from '@react-three/drei/webgpu'
 import { Canvas, useLoader } from '@react-three/fiber/webgpu'
-import { LinearFilter, RepeatWrapping, SRGBColorSpace, TextureLoader } from 'three'
+import { LinearFilter, NoToneMapping, RepeatWrapping, SRGBColorSpace, TextureLoader } from 'three'
 
 import DropZone from '../components/DropZone'
 import InfoPanel from '../components/InfoPanel'
@@ -66,6 +66,7 @@ const IndexPage = () => {
       <Canvas
         camera={{ fov: 40, near: 0.1, far: 100, position: [0, 0.2, 3.4] }}
         className="fixed top-0 left-0 h-screen w-screen bg-neutral-800"
+        renderer={{ toneMapping: NoToneMapping }}
       >
         <ambientLight intensity={0.15} />
         <hemisphereLight args={[0xbcd1ff, 0x181a20, 0.55]} />

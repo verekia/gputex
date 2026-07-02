@@ -96,18 +96,21 @@ export type ProgressFn = (message: string) => void
 // cross-GPU float jitter passes. `null` = record only (used while baselining).
 // ---------------------------------------------------------------------------
 const PSNR_THRESHOLDS: Record<string, number | null> = {
-  // `${format}:${quality}:${image}` — measured on the FULL 512² committed test
-  // textures (2026-07, Apple/metal-3, after the bbox-clamped fast refit:
-  // 28.92/32.02, 45.99/46.60, 32.58/33.69, 30.23/33.20, alpha 34.45/32.86)
-  // minus ~0.15 dB. `null` = record only (used while baselining a change).
-  'bc1:fast:color': 28.75,
-  'bc1:high:color': 31.85,
-  'bc5:fast:normal': 45.8,
-  'bc5:high:normal': 46.45,
-  'bc7:fast:color': 32.4,
-  'bc7:high:color': 33.5,
-  'astc:fast:color': 30.05,
-  'astc:high:color': 33.05,
+  // `${format}:${quality}:${image}` — measured on the FULL 1024² committed
+  // test cards (2026-07, Apple/metal-3, 16-tile colour card + structured
+  // normal map: 28.73/29.34, 51.85/53.18, 31.18/31.93, 30.05/30.53, alpha
+  // 34.45/32.86) minus ~0.15 dB. The colour card is deliberately harder than
+  // the old 512² one (Nyquist checkers, zone plate), so floors sit lower and
+  // the fast↔high gap is narrower. `null` = record only (used while
+  // baselining a change).
+  'bc1:fast:color': 28.55,
+  'bc1:high:color': 29.2,
+  'bc5:fast:normal': 51.7,
+  'bc5:high:normal': 53.0,
+  'bc7:fast:color': 31.0,
+  'bc7:high:color': 31.8,
+  'astc:fast:color': 29.9,
+  'astc:high:color': 30.4,
   'bc7:fast:alpha': 34.3,
   'astc:fast:alpha': 32.7,
 }
@@ -116,19 +119,19 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
 // near-losslessly (SSE ≤ EASY_BLOCK_SSE), max of SSE(fast) − SSE(high). A
 // fast path must never lose badly on content that is easy to encode — the
 // 2026-07 BC1 rank-1 refit bug turned FLAT tiles (high SSE ≈ 0.001) into the
-// wrong colour entirely (fast SSE ≈ 3.0). Hard blocks (the noise-checker
-// quadrant) are excluded: there the bbox-seeded fast path legitimately
-// trails the exhaustive search by ~2+ SSE, same as the pre-rewrite encoder.
+// wrong colour entirely (fast SSE ≈ 3.0). Hard blocks (the noise tile)
+// are excluded: there the bbox-seeded fast path legitimately trails the
+// exhaustive search by ~2+ SSE, same as the pre-rewrite encoder.
 // `null` = record only.
 const EASY_BLOCK_SSE = 0.05
 const EXCESS_LIMITS: Record<string, number | null> = {
-  // `${format}:${image}` — ~3–5× the observed values (2026-07, Apple/metal-3,
-  // after the bbox-clamped fast refit: 0.020, 0.010, 0.010, 0.066–0.098,
-  // alpha 0.015/0.018), still 10×+ below catastrophic-artifact level.
-  'bc1:color': 0.06,
+  // `${format}:${image}` — ~2–3× the observed values (2026-07, Apple/metal-3,
+  // 1024² 16-tile card: 0.061, 0.015, 0.045, 0.050, alpha 0.015/0.018),
+  // still 10×+ below catastrophic-artifact level.
+  'bc1:color': 0.15,
   'bc5:normal': 0.05,
-  'bc7:color': 0.05,
-  'astc:color': 0.25,
+  'bc7:color': 0.12,
+  'astc:color': 0.15,
   'bc7:alpha': 0.05,
   'astc:alpha': 0.1,
 }
@@ -525,9 +528,10 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   }
 
   // -------------------------------------------------------------- quality
-  // Quality runs on the FULL committed test cards — every quadrant (smooth
-  // gradients, flat saturated tiles, per-channel ramps, noise + radial disc)
-  // stresses a different failure mode, and a crop would hide localized bugs.
+  // Quality runs on the FULL committed test cards — every tile (smooth
+  // gradients, hard edges, Nyquist checkers, zone plate, noise, disc-over-
+  // checker probe, natural-ish content) stresses a different failure mode,
+  // and a crop would hide localized bugs.
   const qualityCases: Array<{ format: FormatKey; image: string; img: ImageData; qualities: EncodeQuality[] }> = [
     { format: 'bc1', image: 'color', img: colorFull, qualities: ['fast', 'high'] },
     { format: 'bc5', image: 'normal', img: normalFull, qualities: ['fast', 'high'] },

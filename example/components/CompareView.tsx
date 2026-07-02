@@ -4,7 +4,15 @@ import type { EncoderConstructor, EncodeQuality } from 'gputex'
 
 import { OrbitControls } from '@react-three/drei/webgpu'
 import { Canvas, useLoader } from '@react-three/fiber/webgpu'
-import { LinearFilter, LinearSRGBColorSpace, MOUSE, NearestFilter, SRGBColorSpace, TextureLoader } from 'three'
+import {
+  LinearFilter,
+  LinearSRGBColorSpace,
+  MOUSE,
+  NearestFilter,
+  NoToneMapping,
+  SRGBColorSpace,
+  TextureLoader,
+} from 'three'
 import { float, max, sqrt, texture as textureNode, vec4 } from 'three/tsl'
 import { MeshBasicNodeMaterial } from 'three/webgpu'
 
@@ -12,8 +20,6 @@ import { useEncodedTexture } from '../hooks/useEncodedTexture'
 import TestNav from './TestNav'
 
 import type { Texture } from 'three'
-
-const GAP = 0.06 // world-space gap between the two planes
 
 // Normal-map preview material: reconstruct z = √(1 − x² − y²) from the stored
 // (R, G) = (x, y) and show the full normal as colour. Applied to BOTH planes on
@@ -38,16 +44,19 @@ const fmtBytes = (n: number): string => {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+// Both planes live at the SAME transform; only one is visible at a time, so
+// toggling original/encoded is a pixel-perfect A/B flip (no parallax, no
+// z-fighting). Both stay mounted so the flip is instant.
 const TexturedPlane = ({
   texture,
-  x,
+  visible,
   aspect,
   pixelated,
   colorSpace,
   reconstructNormal,
 }: {
   texture: Texture | null
-  x: number
+  visible: boolean
   aspect: number
   pixelated: boolean
   colorSpace: 'srgb' | 'linear'
@@ -63,7 +72,7 @@ const TexturedPlane = ({
 
   if (!texture) return null
   return (
-    <mesh position={[x, 0, 0]}>
+    <mesh visible={visible}>
       <planeGeometry args={[aspect, 1]} />
       {reconstructNormal ? <NormalMaterial map={texture} /> : <meshBasicMaterial map={texture} toneMapped={false} />}
     </mesh>
@@ -72,7 +81,7 @@ const TexturedPlane = ({
 
 const OriginalPlane = (props: {
   url: string
-  x: number
+  visible: boolean
   aspect: number
   pixelated: boolean
   colorSpace: 'srgb' | 'linear'
@@ -116,11 +125,11 @@ const CompareView = ({
 }: CompareViewProps) => {
   const [quality, setQuality] = useState<EncodeQuality>('fast')
   const [pixelated, setPixelated] = useState(false)
+  const [showOriginal, setShowOriginal] = useState(false)
 
   const { texture, info, error, loading } = useEncodedTexture(url, encoder, { colorSpace, quality })
 
   const aspect = info ? info.width / info.height : 1
-  const halfStep = aspect / 2 + GAP
 
   const savings = info && info.compressedBytes ? info.rgba8Bytes / info.compressedBytes : 0
   const formatLabel = info?.format ?? (loading ? 'encoding…' : title.toLowerCase())
@@ -128,13 +137,24 @@ const CompareView = ({
   return (
     <>
       <Canvas
-        camera={{ fov: 40, near: 0.1, far: 100, position: [0, 0, 2.4] }}
+        // z chosen so the unit-height plane fills ~91% of the viewport height:
+        // visible height = 2·z·tan(fov/2) = 2·1.5·tan(20°) ≈ 1.09.
+        camera={{ fov: 40, near: 0.1, far: 100, position: [0, 0, 1.5] }}
         className="fixed inset-0 h-screen w-screen bg-neutral-900"
+        // Linear pages (BC5 normal maps) display DATA, not colour: without
+        // this the renderer's default linear→sRGB output transform brightens
+        // every texel (0.5 → 0.73 — washed-out lavender). sRGB pages
+        // round-trip (decode on sample, encode on output), so they keep the
+        // default. NB: on the webgpu build the prop is `renderer`, not `gl`.
+        renderer={{
+          outputColorSpace: colorSpace === 'linear' ? LinearSRGBColorSpace : SRGBColorSpace,
+          toneMapping: NoToneMapping,
+        }}
       >
         <Suspense fallback={null}>
           <OriginalPlane
             url={url}
-            x={-halfStep}
+            visible={showOriginal}
             aspect={aspect}
             pixelated={pixelated}
             colorSpace={colorSpace}
@@ -143,7 +163,7 @@ const CompareView = ({
         </Suspense>
         <TexturedPlane
           texture={texture}
-          x={halfStep}
+          visible={!showOriginal}
           aspect={aspect}
           pixelated={pixelated}
           colorSpace={colorSpace}
@@ -160,14 +180,24 @@ const CompareView = ({
         />
       </Canvas>
 
-      {/* Plane legends */}
-      <div className="pointer-events-none fixed top-4 left-1/2 z-10 flex w-full -translate-x-1/2 justify-center gap-[20vw] text-center">
-        <span className="rounded-md bg-black/70 px-2 py-1 font-mono text-xs text-gray-300">
-          {reconstructNormal ? 'Original → normal' : 'Original (RGBA8)'}
-        </span>
-        <span className="rounded-md bg-black/70 px-2 py-1 font-mono text-xs text-blue-300">
-          {reconstructNormal ? `${formatLabel} → normal` : formatLabel}
-        </span>
+      {/* Encoded ↔ original A/B flip: one fixed-width button so repeated
+          clicks land on the same spot. Black = encoded, red = original. */}
+      <div className="fixed top-4 left-1/2 z-10 -translate-x-1/2">
+        <button
+          type="button"
+          onClick={() => setShowOriginal(v => !v)}
+          className={`w-64 rounded-lg border border-white/15 px-3 py-1 text-center font-mono text-xs text-white shadow-lg transition-colors ${
+            showOriginal ? 'bg-red-600' : 'bg-black'
+          }`}
+        >
+          {showOriginal
+            ? reconstructNormal
+              ? 'Original → normal'
+              : 'Original (RGBA8)'
+            : reconstructNormal
+              ? `${formatLabel} → normal`
+              : formatLabel}
+        </button>
       </div>
 
       <TestNav current={current} />
