@@ -1,4 +1,7 @@
+import { describe, expect, it, spyOn } from 'bun:test'
+
 import { ASTC4x4Encoder } from '../ASTC4x4Encoder.js'
+import { BC1Encoder } from '../BC1Encoder.js'
 import { BC5Encoder } from '../BC5Encoder.js'
 import { BC7Encoder } from '../BC7Encoder.js'
 import { selectFormat } from '../selectFormat.js'
@@ -63,6 +66,64 @@ describe('selectFormat: ASTC path', () => {
     expect(sel.format).toBe(TextureFormat.ASTC_4x4_SRGB)
     expect(sel.encoderClass).toBe(ASTC4x4Encoder)
     expect(sel.astcNormalRemap).toBe(true)
+  })
+})
+
+describe('selectFormat: preferredFormat bc1', () => {
+  it('returns BC1_SRGB + BC1Encoder for color hint on a BC adapter', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'color', { preferredFormat: 'bc1' })
+    expect(sel.format).toBe(TextureFormat.BC1_SRGB)
+    expect(sel.encoderClass).toBe(BC1Encoder)
+    expect(sel.astcNormalRemap).toBe(false)
+  })
+
+  it('returns BC1 (linear) when colorSpace=linear', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'color', {
+      colorSpace: 'linear',
+      preferredFormat: 'bc1',
+    })
+    expect(sel.format).toBe(TextureFormat.BC1)
+    expect(sel.encoderClass).toBe(BC1Encoder)
+  })
+
+  it('falls back to ASTC when the adapter lacks BC', () => {
+    // The preference is a wish, not a demand — ASTC-only (mobile) devices
+    // proceed through the normal selection.
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC]), 'color', { preferredFormat: 'bc1' })
+    expect(sel.format).toBe(TextureFormat.ASTC_4x4_SRGB)
+    expect(sel.encoderClass).toBe(ASTC4x4Encoder)
+  })
+
+  it('ignores the preference (with a warning) for colorWithAlpha', () => {
+    // BC1 has only 1-bit punch-through alpha; silently dropping the alpha
+    // channel would be a footgun, so the preference is ignored.
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'colorWithAlpha', { preferredFormat: 'bc1' })
+      expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+      expect(sel.encoderClass).toBe(BC7Encoder)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('ignores the preference (with a warning) for normal maps', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'normal', { preferredFormat: 'bc1' })
+      expect(sel.format).toBe(TextureFormat.BC5)
+      expect(sel.encoderClass).toBe(BC5Encoder)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('still returns null when no compressed format is supported', () => {
+    const sel = selectFormat(stubAdapter([]), 'color', { preferredFormat: 'bc1' })
+    expect(sel.format).toBe(null)
+    expect(sel.encoderClass).toBe(null)
   })
 })
 

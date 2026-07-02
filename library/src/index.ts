@@ -58,7 +58,13 @@ export {
 } from './webgl/index.js'
 
 // Format selection.
-export { selectFormat, type TextureHint, type SelectFormatOptions, type FormatSelection } from './selectFormat.js'
+export {
+  selectFormat,
+  type TextureHint,
+  type PreferredFormat,
+  type SelectFormatOptions,
+  type FormatSelection,
+} from './selectFormat.js'
 
 // Mip-chain helpers (exported so callers can pre-generate a chain once
 // and feed it into `Encoder.encodeToBytes` themselves if they want

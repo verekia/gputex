@@ -24,7 +24,7 @@ import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Tex
 
 import { Encoder, type EncodeQuality } from '../Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
-import { selectFormat, type TextureHint } from '../selectFormat.js'
+import { selectFormat, type PreferredFormat, type TextureHint } from '../selectFormat.js'
 import { selectWebGLFormat } from '../webgl/selectWebGLFormat.js'
 import { detectWebGLCapabilities } from '../webgl/webglCapabilities.js'
 import { getSharedWebGLContext } from '../webgl/webglContext.js'
@@ -53,6 +53,14 @@ export type CompressTextureSource =
 export interface CompressOptions {
   /** How the texture will be used. Drives format selection. Default 'color'. */
   hint?: TextureHint
+  /**
+   * Prefer a specific format over the default choice when the device
+   * supports it; falls back to the normal selection (BC7 → ASTC → RGBA8)
+   * when it doesn't. Currently only 'bc1': half the memory of BC7 for
+   * opaque colour textures, at lower quality. Only honoured with
+   * `hint: 'color'` — BC1 can't carry real alpha or normal maps.
+   */
+  preferredFormat?: PreferredFormat
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
   colorSpace?: 'srgb' | 'linear'
   /** Flip the image vertically before encoding. Default true (matches Three.js convention). */
@@ -216,6 +224,7 @@ export async function compressTexture(
 ): Promise<CompressResult> {
   const {
     hint = 'color',
+    preferredFormat,
     colorSpace = 'srgb',
     flipY = true,
     mipmaps = false,
@@ -262,7 +271,7 @@ export async function compressTexture(
     const adapter = providedAdapter ?? (await navigator.gpu.requestAdapter())
     if (!adapter) return null
 
-    const selection = selectFormat(adapter, hint, { colorSpace })
+    const selection = selectFormat(adapter, hint, { colorSpace, preferredFormat })
     if (!selection.format || !selection.encoderClass) return null
 
     // Instantiate the encoder. Reuse a caller-provided device, otherwise
@@ -356,7 +365,7 @@ export async function compressTexture(
     if (!gl) return null
 
     const caps = detectWebGLCapabilities(gl)
-    const selection = selectWebGLFormat(caps, hint, { colorSpace })
+    const selection = selectWebGLFormat(caps, hint, { colorSpace, preferredFormat })
     if (!selection.format || !selection.encoderClass) return null
 
     const encoder = selection.encoderClass.create(gl)

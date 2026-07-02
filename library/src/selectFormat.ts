@@ -9,9 +9,13 @@
 //   • `texture-compression-astc` available (any hint)          → ASTC 4×4
 //   • neither                                                  → null (fall back to RGBA8)
 //
-// BC1 is never selected automatically — it's retained as a reference /
-// legacy encoder for the demo, not a modern choice. Callers that want
-// BC1 specifically should construct `BC1Encoder` directly.
+// BC1 is never selected by default — at 0.5 B/px it trades visible
+// quality for half of BC7's footprint, a call only the application can
+// make. Callers opt in per-texture via `preferredFormat: 'bc1'`, which
+// is honoured when the adapter has BC support and the hint is 'color'
+// (BC1 carries neither real alpha nor a 2-channel normal map), and
+// falls back to the normal selection above otherwise. `BC1Encoder` also
+// remains directly constructible.
 //
 // ASTC has no 2-channel analogue of BC5. For a normal-map hint on the
 // ASTC path, the caller has to pre-swizzle (nx, ny) into (R, R, R, G)
@@ -20,6 +24,7 @@
 // instead of silently producing a desaturated-looking normal map.
 
 import { ASTC4x4Encoder } from './ASTC4x4Encoder.js'
+import { BC1Encoder } from './BC1Encoder.js'
 import { BC5Encoder } from './BC5Encoder.js'
 import { BC7Encoder } from './BC7Encoder.js'
 import { detectCapabilities, type FeatureProvider } from './capabilities.js'
@@ -35,9 +40,20 @@ import type { EncoderConstructor } from './Encoder.js'
  */
 export type TextureHint = 'color' | 'colorWithAlpha' | 'normal'
 
+/**
+ * Optional format preference — a wish, not a demand. Applied when the
+ * device supports the format and the hint is compatible; otherwise
+ * selection proceeds normally (BC7 → ASTC → null). Currently only
+ * 'bc1': half the memory of BC7 (0.5 vs 1 byte/pixel) for opaque
+ * colour, at visibly lower quality on smooth content.
+ */
+export type PreferredFormat = 'bc1'
+
 export interface SelectFormatOptions {
   /** Pick the sRGB variant when the format has one. Default 'srgb'. */
   colorSpace?: 'srgb' | 'linear'
+  /** Prefer a specific format when supported. See `PreferredFormat`. */
+  preferredFormat?: PreferredFormat
 }
 
 export interface FormatSelection {
@@ -58,9 +74,28 @@ export function selectFormat(
   hint: TextureHint,
   options: SelectFormatOptions = {},
 ): FormatSelection {
-  const { colorSpace = 'srgb' } = options
+  const { colorSpace = 'srgb', preferredFormat } = options
   const srgb = colorSpace === 'srgb'
   const caps = detectCapabilities(adapter)
+
+  // Explicit BC1 preference: honoured for opaque colour on BC-capable
+  // adapters. Non-'color' hints can't ride BC1 (no real alpha, no
+  // 2-channel mode), so the preference is ignored with a warning rather
+  // than silently degrading the texture. An adapter without BC falls
+  // through to the normal selection below.
+  if (preferredFormat === 'bc1') {
+    if (hint !== 'color') {
+      console.warn(
+        `[gputex] preferredFormat 'bc1' ignored for hint '${hint}' — BC1 has no real alpha channel and is unsuitable for normal maps.`,
+      )
+    } else if (caps.bc) {
+      return {
+        format: srgb ? TextureFormat.BC1_SRGB : TextureFormat.BC1,
+        encoderClass: BC1Encoder,
+        astcNormalRemap: false,
+      }
+    }
+  }
 
   // BC path (desktop: Windows, Linux, most discrete-GPU Macs).
   if (caps.bc) {

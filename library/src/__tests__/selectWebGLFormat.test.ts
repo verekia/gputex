@@ -1,3 +1,5 @@
+import { describe, expect, it, spyOn } from 'bun:test'
+
 import { TextureFormat } from '../TextureFormat.js'
 import { ASTC4x4WebGLEncoder } from '../webgl/ASTC4x4WebGLEncoder.js'
 import { BC1WebGLEncoder } from '../webgl/BC1WebGLEncoder.js'
@@ -100,6 +102,53 @@ describe('selectWebGLFormat: BC1 last-resort (s3tc)', () => {
     const sel = selectWebGLFormat(caps({ s3tc: true, s3tcSrgb: true }), 'colorWithAlpha')
     expect(sel.format).toBe(null)
     expect(sel.encoderClass).toBe(null)
+  })
+})
+
+describe('selectWebGLFormat: preferredFormat bc1', () => {
+  it('picks BC1 over BC7 when s3tc is present alongside bptc', () => {
+    const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true, s3tcSrgb: true }), 'color', {
+      preferredFormat: 'bc1',
+    })
+    expect(sel.format).toBe(TextureFormat.BC1_SRGB)
+    expect(sel.encoderClass).toBe(BC1WebGLEncoder)
+  })
+
+  it('picks linear BC1 when colorSpace=linear', () => {
+    const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true }), 'color', {
+      colorSpace: 'linear',
+      preferredFormat: 'bc1',
+    })
+    expect(sel.format).toBe(TextureFormat.BC1)
+    expect(sel.encoderClass).toBe(BC1WebGLEncoder)
+  })
+
+  it('falls back to BC7 when the sRGB s3tc extension is missing', () => {
+    // sRGB BC1 needs WEBGL_compressed_texture_s3tc_srgb specifically; plain
+    // s3tc isn't enough, so the preference falls through to bptc.
+    const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true }), 'color', { preferredFormat: 'bc1' })
+    expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+    expect(sel.encoderClass).toBe(BC7WebGLEncoder)
+  })
+
+  it('falls back to ASTC on astc-only contexts', () => {
+    const sel = selectWebGLFormat(caps({ astc: true }), 'color', { preferredFormat: 'bc1' })
+    expect(sel.format).toBe(TextureFormat.ASTC_4x4_SRGB)
+    expect(sel.encoderClass).toBe(ASTC4x4WebGLEncoder)
+  })
+
+  it('ignores the preference (with a warning) for colorWithAlpha', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true, s3tcSrgb: true }), 'colorWithAlpha', {
+        preferredFormat: 'bc1',
+      })
+      expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+      expect(sel.encoderClass).toBe(BC7WebGLEncoder)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
 

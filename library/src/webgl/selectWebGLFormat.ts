@@ -4,7 +4,9 @@
 // — BC7 for colour on desktop, BC5 for normals, ASTC on mobile — but keyed on
 // WebGL2 compressed-texture extensions, with one addition: BC1 (DXT1) is a
 // broadly-available last resort for opaque colour when neither BPTC nor ASTC is
-// present (most WebGL2 GPUs expose s3tc even when they lack bptc).
+// present (most WebGL2 GPUs expose s3tc even when they lack bptc). The
+// `preferredFormat: 'bc1'` opt-in is honoured here too, keyed on the s3tc
+// extension matching the requested colour space.
 //
 // Degradations vs the WebGPU path:
 //   • 'colorWithAlpha' never falls back to BC1 — DXT1 has only 1-bit alpha, so
@@ -37,13 +39,31 @@ export function selectWebGLFormat(
   hint: TextureHint,
   options: SelectFormatOptions = {},
 ): WebGLFormatSelection {
-  const { colorSpace = 'srgb' } = options
+  const { colorSpace = 'srgb', preferredFormat } = options
   const srgb = colorSpace === 'srgb'
   const astc = (astcNormalRemap: boolean): WebGLFormatSelection => ({
     format: srgb ? TextureFormat.ASTC_4x4_SRGB : TextureFormat.ASTC_4x4,
     encoderClass: ASTC4x4WebGLEncoder,
     astcNormalRemap,
   })
+
+  // Explicit BC1 preference — same contract as the WebGPU side: honoured
+  // for opaque colour when the s3tc extension matching the colour space is
+  // present, ignored (with a warning) for hints BC1 can't carry, and
+  // falling through to the normal selection below otherwise.
+  if (preferredFormat === 'bc1') {
+    if (hint !== 'color') {
+      console.warn(
+        `[gputex] preferredFormat 'bc1' ignored for hint '${hint}' — BC1 has no real alpha channel and is unsuitable for normal maps.`,
+      )
+    } else if (srgb ? caps.s3tcSrgb : caps.s3tc) {
+      return {
+        format: srgb ? TextureFormat.BC1_SRGB : TextureFormat.BC1,
+        encoderClass: BC1WebGLEncoder,
+        astcNormalRemap: false,
+      }
+    }
+  }
 
   if (hint === 'normal') {
     // BC5 is linear-only; the colorSpace option is ignored for normals.

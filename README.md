@@ -33,9 +33,16 @@ bun add gputex
 | **BC7**      | 16 (8 bpp)        | Color / RGBA on desktop (`texture-compression-bc`)        |
 | **BC5**      | 16 (8 bpp)        | Normal maps — RG only (`texture-compression-bc`)          |
 | **ASTC 4x4** | 16 (8 bpp)        | Color / RGBA on mobile / iOS (`texture-compression-astc`) |
-| **BC1**      | 8 (4 bpp)         | Legacy (never auto-selected)                              |
+| **BC1**      | 8 (4 bpp)         | Opaque color at half BC7's size (opt-in)                  |
 
 Format selection is automatic: BC7/BC5 on desktop, ASTC on mobile, uncompressed RGBA8 fallback otherwise.
+
+BC1 is never picked by default — it's half the memory of BC7 but visibly lower
+quality, a trade-off only the application can make. Opt in per-texture with
+`preferredFormat: 'bc1'`: on BC-capable devices the texture encodes as BC1;
+everywhere else (e.g. ASTC-only mobile) selection proceeds as normal. The
+preference is only honoured with `hint: 'color'`, since BC1 can't carry real
+alpha or a normal map.
 
 ## WebGL fallback
 
@@ -204,13 +211,14 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 
 ### `compressTexture` options
 
-| Option       | Type                 | Default   | Description                                             |
-| ------------ | -------------------- | --------- | ------------------------------------------------------- |
-| `hint`       | `TextureHint`        | `'color'` | `'color'`, `'colorWithAlpha'`, or `'normal'`            |
-| `colorSpace` | `'srgb' \| 'linear'` | `'srgb'`  | Use the sRGB or linear variant of the chosen format     |
-| `flipY`      | `boolean`            | `true`    | Flip vertically (matches Three.js convention)           |
-| `mipmaps`    | `boolean`            | `false`   | Generate full mip chain down to 1x1                     |
-| `device`     | `GPUDevice`          | —         | Reuse an existing WebGPU device instead of creating one |
+| Option            | Type                 | Default   | Description                                                                                      |
+| ----------------- | -------------------- | --------- | ------------------------------------------------------------------------------------------------ |
+| `hint`            | `TextureHint`        | `'color'` | `'color'`, `'colorWithAlpha'`, or `'normal'`                                                     |
+| `preferredFormat` | `'bc1'`              | —         | Prefer BC1 (half of BC7's size) when supported; normal selection otherwise. `hint: 'color'` only |
+| `colorSpace`      | `'srgb' \| 'linear'` | `'srgb'`  | Use the sRGB or linear variant of the chosen format                                              |
+| `flipY`           | `boolean`            | `true`    | Flip vertically (matches Three.js convention)                                                    |
+| `mipmaps`         | `boolean`            | `false`   | Generate full mip chain down to 1x1                                                              |
+| `device`          | `GPUDevice`          | —         | Reuse an existing WebGPU device instead of creating one                                          |
 
 ## Benchmarks
 

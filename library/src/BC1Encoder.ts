@@ -1,8 +1,8 @@
 // BC1 (DXT1) GPU encoder. The simplest format in the suite — 4 bpp,
-// RGB-only with punch-through alpha. Retained alongside BC5/BC7/ASTC as
-// a reference implementation and legacy fallback; the format-selection
-// layer never picks it automatically (BC7 is the default desktop
-// choice), but it remains available for callers that want BC1 directly.
+// RGB-only with punch-through alpha. The format-selection layer picks
+// it only when the caller opts in via `preferredFormat: 'bc1'` (BC7 is
+// the default desktop choice — see selectFormat.ts); it also remains
+// available for callers that want BC1 directly.
 //
 // Like the other block encoders it offers two quality levels: 'fast'
 // (default — bbox endpoints + one least-squares refit) and 'high'

@@ -22,11 +22,17 @@ import { compressTexture, type CompressResult } from './compressTexture.js'
 import type { Texture } from 'three'
 
 import type { EncodeQuality } from '../Encoder.js'
-import type { TextureHint } from '../selectFormat.js'
+import type { PreferredFormat, TextureHint } from '../selectFormat.js'
 
 export class GputexLoader extends Loader<Texture> {
   /** Format-selection hint. Default 'color'. */
   hint: TextureHint = 'color'
+  /**
+   * Prefer a specific format (currently only 'bc1') when the device
+   * supports it; normal selection otherwise. See
+   * `CompressOptions.preferredFormat`.
+   */
+  preferredFormat?: PreferredFormat
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
   colorSpace: 'srgb' | 'linear' = 'srgb'
   /** Flip the image vertically before encoding. Default true (matches Three.js convention). */
@@ -65,6 +71,7 @@ export class GputexLoader extends Loader<Texture> {
     this.manager.itemStart(url)
     compressTexture(url, {
       hint: this.hint,
+      preferredFormat: this.preferredFormat,
       colorSpace: this.colorSpace,
       flipY: this.flipY,
       mipmaps: this.mipmaps,
