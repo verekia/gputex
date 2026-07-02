@@ -1,6 +1,6 @@
 # GPUtex | On-the-fly GPU texture encoding
 
-Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
+Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF — or an SVG, rasterised on the fly — and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
 
 ⚠️ 100% vibe-coded. The code is completely unreviewed and under-tested. Do not use for anything important.
 
@@ -92,6 +92,32 @@ material.map = texture
   search, p-bit search); matches the CPU reference encoders block-for-block
   (byte-identical on >96% of blocks; the rest are equal-error FP tie-breaks,
   enforced by the GPU test suite).
+
+#### SVG sources
+
+SVGs work anywhere a raster image does — as a URL, a Blob/File, an inline
+markup string (detected by a leading `<`), or an `<img>` element. The vector
+is rasterised before encoding, at the SVG's intrinsic size by default
+(absolute `width`/`height` attributes, else the `viewBox` dimensions). Use
+`svgSize` to pick the raster size — the browser renders the vector directly
+at that size, so upscaling stays crisp:
+
+```ts
+// Longest side 1024, aspect ratio preserved:
+const { texture } = await compressTexture('/logo.svg', { svgSize: 1024 })
+
+// Exact size (aspect mismatches follow the SVG's preserveAspectRatio rules):
+await compressTexture('/icon.svg', { svgSize: { width: 512, height: 512 } })
+
+// Inline markup:
+await compressTexture('<svg viewBox="0 0 32 32">…</svg>', { svgSize: 256 })
+```
+
+An SVG with no `width`/`height` **and** no `viewBox` has no intrinsic size;
+`svgSize` is required for those. Rasterisation needs a DOM `Image`, so SVG
+sources are main-thread only. Non-Three.js users get the same rasteriser as
+a standalone helper: `rasterizeSvg(source, { size })` from the core `gputex`
+entry returns an `ImageBitmap` ready for `encodeToBytes()`.
 
 ### `GputexLoader` — Three.js Loader
 
@@ -211,14 +237,15 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 
 ### `compressTexture` options
 
-| Option            | Type                 | Default   | Description                                                                                      |
-| ----------------- | -------------------- | --------- | ------------------------------------------------------------------------------------------------ |
-| `hint`            | `TextureHint`        | `'color'` | `'color'`, `'colorWithAlpha'`, or `'normal'`                                                     |
-| `preferredFormat` | `'bc1'`              | —         | Prefer BC1 (half of BC7's size) when supported; normal selection otherwise. `hint: 'color'` only |
-| `colorSpace`      | `'srgb' \| 'linear'` | `'srgb'`  | Use the sRGB or linear variant of the chosen format                                              |
-| `flipY`           | `boolean`            | `true`    | Flip vertically (matches Three.js convention)                                                    |
-| `mipmaps`         | `boolean`            | `false`   | Generate full mip chain down to 1x1                                                              |
-| `device`          | `GPUDevice`          | —         | Reuse an existing WebGPU device instead of creating one                                          |
+| Option            | Type                          | Default   | Description                                                                                      |
+| ----------------- | ----------------------------- | --------- | ------------------------------------------------------------------------------------------------ |
+| `hint`            | `TextureHint`                 | `'color'` | `'color'`, `'colorWithAlpha'`, or `'normal'`                                                     |
+| `preferredFormat` | `'bc1'`                       | —         | Prefer BC1 (half of BC7's size) when supported; normal selection otherwise. `hint: 'color'` only |
+| `colorSpace`      | `'srgb' \| 'linear'`          | `'srgb'`  | Use the sRGB or linear variant of the chosen format                                              |
+| `svgSize`         | `number \| { width, height }` | intrinsic | Raster size for SVG sources: longest side (aspect preserved) or exact size                       |
+| `flipY`           | `boolean`                     | `true`    | Flip vertically (matches Three.js convention)                                                    |
+| `mipmaps`         | `boolean`                     | `false`   | Generate full mip chain down to 1x1                                                              |
+| `device`          | `GPUDevice`                   | —         | Reuse an existing WebGPU device instead of creating one                                          |
 
 ## Benchmarks
 

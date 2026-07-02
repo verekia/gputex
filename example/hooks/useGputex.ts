@@ -1,6 +1,6 @@
 import { useLayoutEffect } from 'react'
 
-import type { TextureHint } from 'gputex'
+import type { SvgRasterSize, TextureHint } from 'gputex'
 
 import { useLoader } from '@react-three/fiber'
 import { GputexLoader } from 'gputex/three'
@@ -22,6 +22,7 @@ export interface EncodeInfo {
 interface UseGputexOptions {
   hint?: TextureHint
   colorSpace?: 'srgb' | 'linear'
+  svgSize?: SvgRasterSize
   flipY?: boolean
   mipmaps?: boolean
 }
@@ -34,6 +35,7 @@ export function useGputex(
   const textures = useLoader(GputexLoader, url, loader => {
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
+    if (options?.svgSize !== undefined) loader.svgSize = options.svgSize
     if (options?.flipY !== undefined) loader.flipY = options.flipY
     if (options?.mipmaps !== undefined) loader.mipmaps = options.mipmaps
   })
@@ -51,6 +53,7 @@ useGputex.preload = (url: string | string[], options?: UseGputexOptions) => {
   useLoader.preload(GputexLoader, url, loader => {
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
+    if (options?.svgSize !== undefined) loader.svgSize = options.svgSize
     if (options?.flipY !== undefined) loader.flipY = options.flipY
     if (options?.mipmaps !== undefined) loader.mipmaps = options.mipmaps
   })

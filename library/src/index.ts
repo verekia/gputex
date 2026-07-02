@@ -70,3 +70,8 @@ export {
 // and feed it into `Encoder.encodeToBytes` themselves if they want
 // finer control over the pipeline than `compressTexture` provides).
 export { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
+
+// SVG rasterisation. Used automatically by `compressTexture()` for SVG
+// sources; exported for callers driving the core encoders directly — the
+// returned ImageBitmap is a valid `EncoderImageSource`. Main-thread only.
+export { rasterizeSvg, type RasterizeSvgOptions, type SvgRasterSize } from './svg.js'

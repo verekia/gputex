@@ -23,6 +23,7 @@ import type { Texture } from 'three'
 
 import type { EncodeQuality } from '../Encoder.js'
 import type { PreferredFormat, TextureHint } from '../selectFormat.js'
+import type { SvgRasterSize } from '../svg.js'
 
 export class GputexLoader extends Loader<Texture> {
   /** Format-selection hint. Default 'color'. */
@@ -35,6 +36,12 @@ export class GputexLoader extends Loader<Texture> {
   preferredFormat?: PreferredFormat
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
   colorSpace: 'srgb' | 'linear' = 'srgb'
+  /**
+   * Rasterisation size for SVG URLs — a number (longest side, aspect
+   * preserved) or exact `{ width, height }`. Default: the SVG's intrinsic
+   * size. See `CompressOptions.svgSize`.
+   */
+  svgSize?: SvgRasterSize
   /** Flip the image vertically before encoding. Default true (matches Three.js convention). */
   flipY: boolean = true
   /** Generate + encode a full mip chain. Default false. */
@@ -73,6 +80,7 @@ export class GputexLoader extends Loader<Texture> {
       hint: this.hint,
       preferredFormat: this.preferredFormat,
       colorSpace: this.colorSpace,
+      svgSize: this.svgSize,
       flipY: this.flipY,
       mipmaps: this.mipmaps,
       quality: this.quality,

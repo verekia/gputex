@@ -20,7 +20,9 @@ const Sphere = ({ texture }: { texture: Texture | CompressedTexture | null }) =>
 )
 
 const CompressedSphere = ({ url, onResult }: { url: string; onResult: (result: EncodeInfo) => void }) => {
-  const texture = useGputex(url, { hint: 'color', colorSpace: 'srgb' }, (_tex, result) => {
+  // svgSize only applies to dropped SVGs: rasterise at 1024 so even tiny /
+  // viewBox-only icons make a crisp sphere texture.
+  const texture = useGputex(url, { hint: 'color', colorSpace: 'srgb', svgSize: 1024 }, (_tex, result) => {
     if (result) onResult(result)
   })
   return <Sphere texture={texture as Texture | CompressedTexture} />

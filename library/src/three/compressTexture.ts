@@ -1,7 +1,8 @@
 // Public `compressTexture()` entry point.
 //
 // Ties together:
-//   • source loading (URL / Blob / ImageBitmap / HTMLImageElement / ...)
+//   • source loading (URL / Blob / ImageBitmap / HTMLImageElement / ...,
+//     with SVG sources rasterised to pixels first — see svg.ts)
 //   • capability-based format selection
 //   • single-level or full-mip-chain encoding
 //   • a three-tier path: WebGPU compute → WebGL2 fragment-shader fallback →
@@ -25,6 +26,7 @@ import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Tex
 import { Encoder, type EncodeQuality } from '../Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
 import { selectFormat, type PreferredFormat, type TextureHint } from '../selectFormat.js'
+import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from '../svg.js'
 import { selectWebGLFormat } from '../webgl/selectWebGLFormat.js'
 import { detectWebGLCapabilities } from '../webgl/webglCapabilities.js'
 import { getSharedWebGLContext } from '../webgl/webglContext.js'
@@ -39,6 +41,11 @@ import type { TextureFormat } from '../TextureFormat.js'
  * Everything `compressTexture()` can take as an image source. A superset
  * of `EncoderImageSource` (see Encoder.ts) that also accepts URL strings
  * and Blob / File objects — the common cases in a web app.
+ *
+ * SVG works through all of these: a URL to an `.svg` file, a string of
+ * inline SVG markup (detected by a leading `<`), an SVG Blob/File, or an
+ * HTMLImageElement whose src is SVG. Vector sources are rasterised to RGBA
+ * before encoding — see the `svgSize` option.
  */
 export type CompressTextureSource =
   | string
@@ -63,6 +70,14 @@ export interface CompressOptions {
   preferredFormat?: PreferredFormat
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
   colorSpace?: 'srgb' | 'linear'
+  /**
+   * Rasterisation size for SVG sources. A number scales the SVG so its
+   * longest side matches (aspect ratio preserved); `{ width, height }`
+   * rasterises at exactly that size. Default: the SVG's intrinsic size
+   * (absolute width/height attributes, else the viewBox dimensions).
+   * Ignored for non-SVG sources.
+   */
+  svgSize?: SvgRasterSize
   /** Flip the image vertically before encoding. Default true (matches Three.js convention). */
   flipY?: boolean
   /** Generate a full mip chain down to 1×1 on the CPU, encode every level. */
@@ -121,29 +136,62 @@ export interface CompressResult {
  * We pass `colorSpaceConversion: 'none'` + `premultiplyAlpha: 'none'` to
  * preserve the source bytes verbatim; the sRGB / alpha handling is done
  * downstream via the texture's `colorSpace` tag.
+ *
+ * SVG sources take a separate route (`rasterizeSvg`) because
+ * `createImageBitmap` can't decode SVG blobs in Chromium/Firefox and the
+ * vector needs an explicit raster size anyway.
  */
-async function sourceToBitmap(source: CompressTextureSource): Promise<ImageBitmap> {
+async function sourceToBitmap(source: CompressTextureSource, svgSize?: SvgRasterSize): Promise<ImageBitmap> {
   const opts: ImageBitmapOptions = {
     colorSpaceConversion: 'none',
     premultiplyAlpha: 'none',
   }
   if (typeof source === 'string') {
+    // A string starting with `<` is inline SVG markup, not a URL.
+    if (isSvgMarkup(source)) {
+      return rasterizeSvg(source, { size: svgSize })
+    }
     const resp = await fetch(source)
     if (!resp.ok) {
       throw new Error(`compressTexture: fetch ${source} failed (${resp.status})`)
     }
     const blob = await resp.blob()
+    // Trust the Content-Type, with the URL extension as a fallback for
+    // servers that mislabel `.svg` files (text/plain, octet-stream, …).
+    if (isSvgBlob(blob) || (!isImageMimeType(blob.type) && hasSvgExtension(source))) {
+      return rasterizeSvg(blob, { size: svgSize })
+    }
     return createImageBitmap(blob, opts)
   }
   if (source instanceof Blob) {
+    if (isSvgBlob(source)) {
+      return rasterizeSvg(source, { size: svgSize })
+    }
     return createImageBitmap(source, opts)
   }
   if (source instanceof ImageBitmap) {
     return source
   }
+  // An <img> holding an SVG must be re-fetched and rasterised: Firefox's
+  // `createImageBitmap` rejects SVG image elements outright.
+  if (typeof HTMLImageElement !== 'undefined' && source instanceof HTMLImageElement) {
+    const src = source.currentSrc || source.src
+    if (src && (hasSvgExtension(src) || /^data:image\/svg\+xml/i.test(src))) {
+      const resp = await fetch(src)
+      if (!resp.ok) {
+        throw new Error(`compressTexture: fetch ${src} failed (${resp.status})`)
+      }
+      return rasterizeSvg(await resp.blob(), { size: svgSize })
+    }
+  }
   // HTMLImageElement / HTMLCanvasElement / OffscreenCanvas / ImageData all
   // satisfy `createImageBitmap`'s ImageBitmapSource type.
   return createImageBitmap(source as ImageBitmapSource, opts)
+}
+
+/** True for MIME types `createImageBitmap` could plausibly decode. */
+function isImageMimeType(type: string): boolean {
+  return /^image\//i.test(type) && !/svg/i.test(type)
 }
 
 /**
@@ -226,6 +274,7 @@ export async function compressTexture(
     hint = 'color',
     preferredFormat,
     colorSpace = 'srgb',
+    svgSize,
     flipY = true,
     mipmaps = false,
     quality = 'fast',
@@ -234,7 +283,7 @@ export async function compressTexture(
   } = options
 
   const srgb = colorSpace === 'srgb'
-  const bitmap = await sourceToBitmap(source)
+  const bitmap = await sourceToBitmap(source, svgSize)
 
   // Tier 1: WebGPU compute path. Tier 2: WebGL2 fragment-shader fallback.
   // Tier 3: uncompressed RGBA8.

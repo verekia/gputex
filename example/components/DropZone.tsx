@@ -51,7 +51,7 @@ const DropZone = ({ onFileDrop, hasTexture }: DropZoneProps) => {
     >
       {!hasTexture && (
         <div className="rounded-xl border border-dashed border-white/20 bg-black/70 px-7 py-5 text-center shadow-lg backdrop-blur-md">
-          <div className="mb-1 text-sm font-semibold text-white">Drop a PNG / JPG / WebP / AVIF</div>
+          <div className="mb-1 text-sm font-semibold text-white">Drop a PNG / JPG / WebP / AVIF / SVG</div>
           <div className="text-xs text-gray-400">or click to pick one</div>
           <button
             className="pointer-events-auto mt-3 cursor-pointer rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white transition-colors hover:bg-white/10"
@@ -62,7 +62,7 @@ const DropZone = ({ onFileDrop, hasTexture }: DropZoneProps) => {
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/png,image/jpeg,image/webp,image/avif"
+            accept="image/png,image/jpeg,image/webp,image/avif,image/svg+xml"
             className="hidden"
             onChange={e => {
               const file = e.target.files?.[0]
