@@ -26,8 +26,9 @@
 //
 // QUALITY LEVELS
 //   'fast' (default): bounding-box endpoints, inset by ~half a 565 cell, then a
-//     single least-squares endpoint refit. This is the algorithm the WGSL
-//     compute shader and the WebGL2 fragment fallback both run.
+//     single least-squares endpoint refit. The WebGL2 fragment fallback runs
+//     this algorithm; the WGSL compute shaders run a faster projection-based
+//     variant of it (see bc1.wgsl / bc1_fast_f16.wgsl) with equivalent quality.
 //   'high': the endpoints are seeded from the block's principal colour axis
 //     (covariance power-iteration) instead of the bbox diagonal, then refined
 //     by several least-squares passes. Mirrors the `QUALITY_HIGH` branch of

@@ -4,13 +4,15 @@
 // buffer at `dst[block_index * 4 .. + 3]`.
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): O(N) bounding-box seed → endpoints fitted by a single
-//     least-squares pass whose sums are accumulated during a projection-based
-//     weight assignment (the 4 palette entries are colinear, so the nearest is
-//     found by projecting onto the endpoint line — no per-entry search).
-//     Profiled ~4× faster than `high` for ~0.36 dB PSNR.
+//   fast (0, default): O(N) bounding-box seed → one fused pass that projects
+//     each pixel onto the endpoint line (the 4 palette entries are colinear,
+//     so the nearest is the rounded projection — no per-entry search) while
+//     accumulating the least-squares refit sums, then a reprojection against
+//     the quantised refit endpoints with the weights packed on the fly. The
+//     endpoint ordering rule is applied before the weight pass, so no
+//     reflection is needed.
 //   high (1): O(N²) farthest-pair seed, full 4-entry nearest search, one LSQ
-//     refit — byte-for-byte identical to astc4x4_ref.ts.
+//     refit — matches astc4x4_ref.ts up to FP tie-breaks.
 // The fast branch is selected at pipeline-compile time; the driver eliminates
 // the unused (high) code.
 //
@@ -66,39 +68,36 @@ fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
 
 // ============================ FAST PATH ================================ //
 
-// Projection weight assignment over 4 levels (QUANT_4 ≈ thirds), with the LSQ
-// normal-equation sums accumulated in the same pass for a fused refit.
+// One pass over the block: project every pixel onto the e0→e1 line (4 levels,
+// QUANT_4 ≈ thirds) and accumulate the least-squares normal-equation sums;
+// solve for the refit endpoints. Weights are not produced here — the caller
+// reprojects against the quantised refit endpoints anyway.
 struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
-fn proj_assign(
-  pixels: ptr<function, array<vec4<i32>, 16>>,
-  e0: vec4<i32>, e1: vec4<i32>,
-  out_idx: ptr<function, array<u32, 16>>,
-  fit: bool,
-) -> Fit {
+fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4<i32>) -> Fit {
   var out: Fit;
-  let dir = e1 - e0;
-  let dd = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z + dir.w * dir.w;
-  if (dd == 0) {
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) { (*out_idx)[k] = 0u; }
-    out.valid = false;
-    return out;
-  }
-  let inv = 3.0 / f32(dd);
+  out.valid = false;
+  let dir = vec4<f32>(e1 - e0);
+  let dd = dot(dir, dir);
+  if (dd == 0.0) { return out; }
+  let e0f = vec4<f32>(e0);
+  let inv = 3.0 / dd;
   var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
   var sAV: vec4<f32> = vec4<f32>(0.0); var sBV: vec4<f32> = vec4<f32>(0.0);
+  var s_min = 3.0; var s_max = 0.0;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let q = (*pixels)[k] - e0;
-    let s = clamp(floor(f32(q.x * dir.x + q.y * dir.y + q.z * dir.z + q.w * dir.w) * inv + 0.5), 0.0, 3.0);
-    (*out_idx)[k] = u32(s);
-    if (fit) {
-      let v = vec4<f32>((*pixels)[k]);
-      let b = s / 3.0; let a = 1.0 - b;
-      sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b; sAV = sAV + a * v; sBV = sBV + b * v;
-    }
+    let v = vec4<f32>((*pixels)[k]);
+    let s = clamp(floor(dot(v - e0f, dir) * inv + 0.5), 0.0, 3.0);
+    s_min = min(s_min, s); s_max = max(s_max, s);
+    let b = s * (1.0 / 3.0); let a = 1.0 - b;
+    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
+    sAV = sAV + a * v; sBV = sBV + b * v;
   }
-  if (!fit) { out.valid = false; return out; }
+  // Rank-1 guard: if every pixel projects to ONE level the system is
+  // singular — det and the numerators are pure float rounding noise and the
+  // solve returns garbage endpoints. With ≥2 levels det ≥ 15·(1/3)² ≈ 1.67.
+  if (s_min == s_max) { return out; }
   let det = sAA * sBB - sAB * sAB;
-  if (abs(det) < 1e-9) { out.valid = false; return out; }
+  if (abs(det) < 1e-3) { return out; }
   out.e0 = vec4<i32>(clamp(round((sBB * sAV - sAB * sBV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
   out.e1 = vec4<i32>(clamp(round((sAA * sBV - sAB * sAV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
   out.valid = true;
@@ -183,23 +182,6 @@ fn refit_endpoints(
   return out;
 }
 
-// -------------------------- Bit-packing helper -------------------------- //
-
-fn write_bits(block: ptr<function, array<u32, 4>>, pos: u32, n_bits: u32, value: u32) {
-  let v = value & ((1u << n_bits) - 1u);
-  let word_lo = pos / 32u;
-  let bit_lo = pos % 32u;
-  let bits_in_lo = min(n_bits, 32u - bit_lo);
-  let mask_lo = ((1u << bits_in_lo) - 1u) << bit_lo;
-  (*block)[word_lo] = ((*block)[word_lo] & ~mask_lo) | ((v << bit_lo) & mask_lo);
-  if (bits_in_lo < n_bits) {
-    let bits_in_hi = n_bits - bits_in_lo;
-    let mask_hi = (1u << bits_in_hi) - 1u;
-    let val_hi = v >> bits_in_lo;
-    (*block)[word_lo + 1u] = ((*block)[word_lo + 1u] & ~mask_hi) | (val_hi & mask_hi);
-  }
-}
-
 // ------------------------------- Entry ---------------------------------- //
 
 @compute @workgroup_size(8, 8, 1)
@@ -226,14 +208,18 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     hi = max(hi, px);
   }
 
+  // Both branches produce the final endpoints (already ordered so the
+  // decoder doesn't apply blue contraction) and the packed weight word
+  // (weight k's lsb at bit 31−2k, msb at bit 30−2k).
   var e0: vec4<i32>;
   var e1: vec4<i32>;
-  var indices: array<u32, 16>;
+  var w3: u32 = 0u;
 
   if (QUALITY_HIGH != 0u) {
     let fp = farthest_pair(&pixels);
     e0 = fp.a;
     e1 = fp.b;
+    var indices: array<u32, 16>;
     var pal: array<vec4<i32>, 4>;
     build_palette(e0, e1, &pal);
     var err = assign_all(&pixels, &pal, &indices);
@@ -249,48 +235,51 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
         err = err2;
       }
     }
+    // Endpoint ordering, reflecting the assigned weights.
+    if (e0.x + e0.y + e0.z > e1.x + e1.y + e1.z) {
+      let tmp = e0; e0 = e1; e1 = tmp;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        indices[k] = 3u - indices[k];
+      }
+    }
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let w = indices[k] & 0x3u;
+      w3 = w3 | ((w & 1u) << (31u - 2u * k)) | (((w >> 1u) & 1u) << (30u - 2u * k));
+    }
   } else {
+    // Fused LSQ fit seeded from the raw bbox, quantised refit endpoints,
+    // ordering applied BEFORE the weight pass so no reflection is needed.
+    let r = proj_fit(&pixels, lo, hi);
     e0 = lo;
     e1 = hi;
-    let r = proj_assign(&pixels, e0, e1, &indices, true);
-    if (r.valid) {
-      e0 = r.e0;
-      e1 = r.e1;
-      proj_assign(&pixels, e0, e1, &indices, false);
+    if (r.valid) { e0 = r.e0; e1 = r.e1; }
+    if (e0.x + e0.y + e0.z > e1.x + e1.y + e1.z) {
+      let tmp = e0; e0 = e1; e1 = tmp;
+    }
+    let dir = vec4<f32>(e1 - e0);
+    let dd = dot(dir, dir);
+    if (dd > 0.0) {
+      let e0f = vec4<f32>(e0);
+      let inv = 3.0 / dd;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let s = u32(clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 3.0));
+        w3 = w3 | ((s & 1u) << (31u - 2u * k)) | (((s >> 1u) & 1u) << (30u - 2u * k));
+      }
     }
   }
 
-  // Endpoint ordering so the decoder doesn't apply blue contraction.
-  if (e0.x + e0.y + e0.z > e1.x + e1.y + e1.z) {
-    let tmp = e0; e0 = e1; e1 = tmp;
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      indices[k] = 3u - indices[k];
-    }
-  }
-
-  var block: array<u32, 4>;
-  block[0] = 0u; block[1] = 0u; block[2] = 0u; block[3] = 0u;
-  write_bits(&block, 0u,  11u, 0x042u);
-  write_bits(&block, 11u, 2u,  0u);
-  write_bits(&block, 13u, 4u,  12u);
-  write_bits(&block, 17u + 0u * 8u, 8u, u32(e0.x));
-  write_bits(&block, 17u + 1u * 8u, 8u, u32(e1.x));
-  write_bits(&block, 17u + 2u * 8u, 8u, u32(e0.y));
-  write_bits(&block, 17u + 3u * 8u, 8u, u32(e1.y));
-  write_bits(&block, 17u + 4u * 8u, 8u, u32(e0.z));
-  write_bits(&block, 17u + 5u * 8u, 8u, u32(e1.z));
-  write_bits(&block, 17u + 6u * 8u, 8u, u32(e0.w));
-  write_bits(&block, 17u + 7u * 8u, 8u, u32(e1.w));
-  var w3: u32 = 0u;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let w = indices[k] & 0x3u;
-    w3 = w3 | ((w & 1u) << (31u - 2u * k)) | (((w >> 1u) & 1u) << (30u - 2u * k));
-  }
-  block[3] = w3;
+  // Straight-line packing: block mode 0x042 @0, partitions−1=0 @11, CEM 12
+  // @13, endpoints R0 R1 G0 G1 B0 B1 A0 A1 (8 bits each) from bit 17,
+  // weights in the last word.
+  let E0 = vec4<u32>(e0);
+  let E1 = vec4<u32>(e1);
+  let w0 = 0x042u | (12u << 13u) | (E0.x << 17u) | (E1.x << 25u);
+  let w1 = (E1.x >> 7u) | (E0.y << 1u) | (E1.y << 9u) | (E0.z << 17u) | (E1.z << 25u);
+  let w2 = (E1.z >> 7u) | (E0.w << 1u) | (E1.w << 9u);
 
   let out = block_index * 4u;
-  dst[out + 0u] = block[0];
-  dst[out + 1u] = block[1];
-  dst[out + 2u] = block[2];
-  dst[out + 3u] = block[3];
+  dst[out + 0u] = w0;
+  dst[out + 1u] = w1;
+  dst[out + 2u] = w2;
+  dst[out + 3u] = w3;
 }

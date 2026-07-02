@@ -18,10 +18,11 @@ bun add gputex
 
 ### Entry points
 
-`gputex` ships two entry points:
+`gputex` ships three entry points:
 
 - **`gputex`** — the engine-agnostic core: the `*Encoder` classes, capability / format detection, and mip helpers. Nothing here imports `three`, so it works with Babylon.js, raw WebGPU/WebGL, workers, etc. Encoders return raw compressed block bytes via `encodeToBytes()`.
 - **`gputex/three`** — the Three.js layer. Re-exports the entire core **plus** `compressTexture()`, `GputexLoader`, and `buildCompressedTexture()` / `encodeToTexture()`. This is the only entry that imports `three`.
+- **`gputex/testing`** — the CPU reference encoders/decoders the GPU shaders are validated against. Test-suite material, not runtime API (see [Testing](#testing)).
 
 `three` is an **optional** peer dependency (`>=0.170`): install it only if you import `gputex/three`. Pure-core consumers (e.g. Babylon.js) can skip it entirely.
 
@@ -38,7 +39,7 @@ Format selection is automatic: BC7/BC5 on desktop, ASTC on mobile, uncompressed 
 
 ## WebGL fallback
 
-WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The output bytes are identical to the WebGPU encoders, so the resulting `CompressedTexture` looks the same under either renderer.
+WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The WebGPU fast paths have since been rewritten for speed (projection assignment, f16), so the two backends are no longer byte-identical, but they implement the same algorithms at the same quality level and the resulting `CompressedTexture` looks the same under either renderer.
 
 The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend` field on the result (`'webgpu' | 'webgl' | 'none'`) tells you which path ran.
 
@@ -72,14 +73,18 @@ material.map = texture
 - **`'fast'` (default)** — a bounding-box endpoint seed plus projection-based
   index assignment (each pixel is projected onto the colinear endpoint line in
   O(1) instead of searching every palette entry) with a single fused
-  least-squares refit. On GPUs that report the `shader-f16` feature the whole
-  fast path runs in f16 (≈2× on Apple) — the f32 path is the automatic
-  fallback. Net vs `'high'` on an Apple GPU: **BC7 ~50×**, **ASTC ~9×**,
-  **BC5 ~5×** faster, for a PSNR cost of **≤0.45 dB** (imperceptible). BC1 is
-  single-pass and unaffected.
+  least-squares refit (accepted per block only when it lowers the error), and
+  the block bits packed with straight-line constant shifts. On GPUs that
+  report the `shader-f16` feature the whole fast path (all four formats, BC1
+  included) runs in f16 — the f32 path is the automatic fallback. Net vs
+  `'high'` on an Apple GPU: roughly **10–30× faster** depending on format,
+  for a PSNR cost of **≤0.65 dB on smooth/flat content** (imperceptible) and
+  up to a few dB on adversarial high-frequency noise, where the bbox seed
+  trails `'high'`'s exhaustive search. See the benchmark table below.
 - **`'high'`** — exhaustive endpoint search (farthest-pair seed, full nearest
-  search, p-bit search); output is byte-for-byte identical to the CPU reference
-  encoders.
+  search, p-bit search); matches the CPU reference encoders block-for-block
+  (byte-identical on >96% of blocks; the rest are equal-error FP tie-breaks,
+  enforced by the GPU test suite).
 
 ### `GputexLoader` — Three.js Loader
 
@@ -206,6 +211,77 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 | `flipY`      | `boolean`            | `true`    | Flip vertically (matches Three.js convention)           |
 | `mipmaps`    | `boolean`            | `false`   | Generate full mip chain down to 1x1                     |
 | `device`     | `GPUDevice`          | —         | Reuse an existing WebGPU device instead of creating one |
+
+## Benchmarks
+
+Measured with the repo's GPU test suite (see below) on an Apple Silicon GPU
+(`metal-3`) in Chrome, encoding a 2048×2048 image. **GPU pass** is the compute
+shader alone (WebGPU timestamp queries, median of 20 runs); end-to-end wall
+time adds ~3–4 ms of image upload + result readback regardless of format.
+"Before" is the shader generation prior to the 2026-07 optimization pass
+(projection-based index assignment everywhere, on-the-fly bit packing, an f16
+BC1 fast shader, straight-line block assembly).
+
+| Format   | Quality        | Shader | GPU pass before | GPU pass after | Speedup   |
+| -------- | -------------- | ------ | --------------- | -------------- | --------- |
+| BC1      | fast (default) | f16    | — (had no f16)  | **0.26 ms**    | **2.8×**¹ |
+| BC1      | fast           | f32    | 0.72 ms         | 0.33 ms        | 2.2×      |
+| BC5      | fast (default) | f16    | 0.33 ms         | **0.20 ms**    | 1.7×      |
+| BC5      | fast           | f32    | 0.79 ms         | 0.39 ms        | 2.0×      |
+| BC7      | fast (default) | f16    | 1.38 ms         | **0.52 ms**    | 2.7×      |
+| BC7      | fast           | f32    | 2.65 ms         | 1.70 ms        | 1.6×      |
+| ASTC 4×4 | fast (default) | f16    | 0.33 ms         | **0.20 ms**    | 1.7×      |
+| ASTC 4×4 | fast           | f32    | 0.72 ms         | 0.66 ms        | 1.1×      |
+| BC1      | high           | f32    | 2.9 ms          | 3.0 ms         | unchanged |
+| BC5      | high           | f32    | 3.4 ms          | 3.4 ms         | unchanged |
+| BC7      | high           | f32    | 14.1 ms         | 14.1 ms        | unchanged |
+| ASTC 4×4 | high           | f32    | 2.6 ms          | 2.4 ms         | unchanged |
+
+¹ vs the old f32 fast shader, which was the only BC1 fast path before. The
+BC1 rows were measured with old and new pipelines interleaved in one session
+(the most noise-robust method); the others are cross-run suite medians.
+
+Per-quadrant PSNR on the committed 512² test card is equal to or better than
+the previous fast encoders everywhere (flat tiles bit-identical, gradients
++0.01 dB, noise −0.01 dB); the `high` paths still match the CPU reference
+encoders. Timestamps are quantised to 100 µs by Chrome, so sub-millisecond
+figures are ±0.05–0.1 ms.
+
+## Testing
+
+Unit tests (`bun test`) cover the CPU reference encoders and metadata, but the
+WGSL shaders can only be validated on a real GPU. The repo ships a browser
+test + benchmark suite at `example/pages/test.tsx` (logic in
+`example/lib/gpuTestSuite.ts`):
+
+```sh
+bun run --filter gputex build   # build the library the example consumes
+cd example && bunx next dev     # then open http://localhost:3000/test
+```
+
+The page runs three groups against the live WebGPU device and renders
+PASS/FAIL tables (machine-readable copy on `window.__GPUTEX_TESTS__`):
+
+- **Correctness** — `quality: 'high'` output is compared block-by-block
+  against the CPU reference encoders (`gputex/testing`), including a
+  non-multiple-of-4 image for the clamp-to-edge padding path. Differing blocks
+  must have equal decoded error (FP tie-break tolerance) and the aggregate
+  PSNR delta must be ≤0.05 dB. Plus determinism checks (same input twice →
+  identical bytes).
+- **Quality** — `'fast'` and `'high'` output is CPU-decoded and validated on
+  the FULL 512² test cards (every quadrant stresses a different failure mode)
+  with two gates, for both the f16 and (force-disabled-f16) f32 shaders:
+  aggregate PSNR must beat per-format thresholds pinned ~0.15 dB under the
+  measured baseline, and — because a handful of catastrophically wrong blocks
+  barely moves aggregate PSNR — the worst _easy_ block (one that `'high'`
+  encodes near-losslessly) must not exceed `'high'`'s error by more than a
+  small per-format limit.
+- **Performance** — the benchmark table above: wall + GPU-pass time per
+  format × quality × shader variant.
+
+The `gputex/testing` entry point exports the CPU reference
+encoders/decoders (`encodeBC7Mode6Block`, `decodeASTC4x4Block`, …) so any
+consumer can run the same validation.
 
 ## Requirements
 

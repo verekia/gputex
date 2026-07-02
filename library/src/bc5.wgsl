@@ -31,10 +31,13 @@
 // copied across a function return.
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): bbox endpoints + a single nearest-search assignment per
-//     channel. The LSQ refit pass below is the bulk of the kernel and buys
-//     only ~0.36 dB, so it is skipped — ~3.8× faster.
-//   high (1): runs the refit, byte-for-byte identical to bc4_ref/bc5_ref.
+//   fast (0, default): bbox endpoints + O(1) projection assignment per texel.
+//     The 8-entry palette in 6-interp mode is colinear and EVENLY spaced from
+//     r0 to r1 (levels 0..7 in palette order 0,2,3,4,5,6,7,1), so the nearest
+//     entry is the rounded projection onto the r0→r1 axis — no 8-entry
+//     search, and the 3-bit indices are packed on the fly. The LSQ refit is
+//     skipped (buys only ~0.36 dB).
+//   high (1): full nearest search + refit, matches bc4_ref/bc5_ref.
 
 // 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
 override QUALITY_HIGH: u32 = 0u;
@@ -133,6 +136,32 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
   if (r0 == r1) {
     if (r1 > 0u) { r1 = r1 - 1u; }
     else         { r0 = r0 + 1u; }
+  }
+
+  if (QUALITY_HIGH == 0u) {
+    // -------- fast: projection assignment, indices packed on the fly ----
+    // level = round(7·(v − r0)/(r1 − r0)); level → BC4 index LUT (0,2,3,4,
+    // 5,6,7,1) packed as 3-bit entries in 0x3F58D0. Pixel k's 3 bits start
+    // at bit 3k+16 of the (w0,w1) pair (bytes 0..1 are the endpoints).
+    let r0f = f32(r0) / 255.0;
+    let scale = 7.0 / (f32(r1) / 255.0 - r0f);
+    var w0 = r0 | (r1 << 8u);
+    var w1 = 0u;
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let L = u32(clamp(floor(((*values)[k] - r0f) * scale + 0.5), 0.0, 7.0));
+      let idx = (0x3F58D0u >> (L * 3u)) & 7u;
+      let bit = 3u * k + 16u;
+      if (bit <= 29u) {
+        w0 = w0 | (idx << bit);
+      } else if (bit >= 32u) {
+        w1 = w1 | (idx << (bit - 32u));
+      } else {
+        // k = 5 straddles the word boundary (bits 31..33).
+        w0 = w0 | (idx << bit);
+        w1 = w1 | (idx >> (32u - bit));
+      }
+    }
+    return vec2<u32>(w0, w1);
   }
 
   // ---------------- 2. Initial palette + indices + error --------------

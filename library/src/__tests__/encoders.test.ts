@@ -40,6 +40,20 @@ describe('BC1Encoder metadata', () => {
   })
 })
 
+describe('f16 fast shader variants', () => {
+  it('every encoder ships an f16 fast module (BC1 included)', () => {
+    for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ASTC4x4Encoder]) {
+      const view: AnyProto = Object.create(cls.prototype)
+      const src: string | null = view.wgslSourceFastF16()
+      expect(typeof src).toBe('string')
+      expect(src).toContain('enable f16')
+      expect(src).toContain('@compute')
+      // The f16 modules are standalone fast-only shaders — no QUALITY_HIGH.
+      expect(src).not.toContain('QUALITY_HIGH')
+    }
+  })
+})
+
 describe('BC5Encoder', () => {
   it('declares its metadata', () => {
     expect(BC5Encoder.requiredFeature).toBe(WebGPUFeature.BC)

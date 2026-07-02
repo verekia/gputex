@@ -14,6 +14,10 @@
     "./three": {
       "types": "./dist/three.d.ts",
       "import": "./dist/three.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
     }
   },
   "scripts": {

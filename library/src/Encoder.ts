@@ -39,14 +39,20 @@ export interface EncoderOptions {
   device: GPUDevice
   adapter?: GPUAdapter
   ownsDevice?: boolean
+  /**
+   * Force the f32 'fast' shader even when the device supports shader-f16.
+   * For tests/benchmarks that need to exercise the f32 fallback path on
+   * f16-capable hardware. Default false.
+   */
+  disableF16?: boolean
 }
 
 /**
- * Encoder quality level. 'fast' (default) uses the cheaper search paths in the
- * shaders — measured ~2–4× faster for ≤0.36 dB PSNR. 'high' runs the exhaustive
- * search, producing output byte-identical to the CPU reference encoders (BC5/
- * BC7/ASTC). BC1's 'high' adds a principal-axis endpoint seed and iterative
- * refit on top of the 'fast' bbox+refit path.
+ * Encoder quality level. 'fast' (default) uses the projection-based paths in
+ * the shaders — an order of magnitude faster for a ≤0.65 dB PSNR cost. 'high'
+ * runs the exhaustive search, matching the CPU reference encoders
+ * block-for-block (byte-identical up to FP tie-breaks with equal error).
+ * BC1's 'high' adds a principal-axis endpoint seed and iterative refit.
  */
 export type EncodeQuality = 'fast' | 'high'
 
@@ -70,6 +76,14 @@ export interface EncodeBytesResult {
   paddedHeight: number
   data: Uint8Array
   encodeMs: number
+  /**
+   * GPU-side compute-pass time in ms, measured with timestamp queries.
+   * Present only when the encode was called with `withGpuTime: true` and the
+   * device has the 'timestamp-query' feature (requested automatically by
+   * `create()` when available). Browsers quantise timestamps (Chrome: 100µs),
+   * so treat small values as approximate.
+   */
+  gpuMs?: number
 }
 
 export interface FormatVariant {
@@ -127,6 +141,11 @@ export abstract class Encoder {
     if (adapter.features.has('shader-f16')) {
       requiredFeatures.push('shader-f16')
     }
+    // Timestamp queries power the opt-in `withGpuTime` shader timing used by
+    // the GPU test/benchmark suite. Zero cost unless an encode asks for it.
+    if (adapter.features.has('timestamp-query')) {
+      requiredFeatures.push('timestamp-query')
+    }
     const device = await adapter.requestDevice({ requiredFeatures })
     return new this({ device, adapter, ownsDevice: true })
   }
@@ -134,6 +153,7 @@ export abstract class Encoder {
   readonly device: GPUDevice
   readonly adapter?: GPUAdapter
   readonly ownsDevice: boolean
+  readonly disableF16: boolean
   // `!:` because these are set in `_buildPipeline()` which the constructor
   // calls; TypeScript's flow analysis doesn't see through method calls.
   protected _module!: GPUShaderModule
@@ -146,10 +166,11 @@ export abstract class Encoder {
   protected _pipeline!: GPUComputePipeline
   protected _pipelineCache = new Map<EncodeQuality, GPUComputePipeline>()
 
-  constructor({ device, adapter, ownsDevice = false }: EncoderOptions) {
+  constructor({ device, adapter, ownsDevice = false, disableF16 = false }: EncoderOptions) {
     this.device = device
     this.adapter = adapter
     this.ownsDevice = ownsDevice
+    this.disableF16 = disableF16
     this._buildPipeline()
   }
 
@@ -188,7 +209,7 @@ export abstract class Encoder {
     if (!this.supportsQuality) return this._pipeline
     // 'fast' uses the dedicated f16 module when available — it's a standalone
     // fast-only shader (no QUALITY_HIGH override). 'high' always uses the f32
-    // module so its output stays byte-identical to the CPU reference.
+    // module so its output keeps matching the CPU reference.
     if (quality === 'fast' && this._moduleF16) {
       if (!this._pipelineF16) {
         this._pipelineF16 = this.device.createComputePipeline({
@@ -250,7 +271,7 @@ export abstract class Encoder {
   /**
    * Optional f16 WGSL for the 'fast' path. Used only when the device reports the
    * `shader-f16` feature; the format's f32 `wgslSource()` is the fallback and
-   * `'high'` always uses it. Returns null when there's no f16 variant (BC1).
+   * `'high'` always uses it. Returns null when there's no f16 variant.
    */
   wgslSourceFastF16(): string | null {
     return null
@@ -258,7 +279,7 @@ export abstract class Encoder {
 
   /** Whether the f16 fast path is both available and supported on this device. */
   protected get _useF16(): boolean {
-    return this.wgslSourceFastF16() !== null && this.device.features.has('shader-f16')
+    return !this.disableF16 && this.wgslSourceFastF16() !== null && this.device.features.has('shader-f16')
   }
 
   /** WGSL compute-shader source. */
@@ -290,7 +311,11 @@ export abstract class Encoder {
    */
   async encodeToBytes(
     source: EncoderImageSource,
-    { flipY = false, quality = 'fast' }: { flipY?: boolean; quality?: EncodeQuality } = {},
+    {
+      flipY = false,
+      quality = 'fast',
+      withGpuTime = false,
+    }: { flipY?: boolean; quality?: EncodeQuality; withGpuTime?: boolean } = {},
   ): Promise<EncodeBytesResult> {
     const device = this.device
     // ImageBitmap/VideoFrame/etc. all expose width/height numerically;
@@ -335,7 +360,11 @@ export abstract class Encoder {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     })
-    device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, paddedWidth, paddedHeight]))
+    // width/height are the SOURCE dimensions, not the padded ones: the shaders
+    // clamp texel reads to (width-1, height-1), which must be the last real
+    // texel. Clamping to the padded size would read the zero-initialized
+    // padding strip and bleed black into the edge blocks' palettes.
+    device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
 
     // 4. Pipeline + bind group. The pipeline is specialised for the requested
     //    quality level; its `layout: 'auto'` bind group layout is identical
@@ -352,15 +381,30 @@ export abstract class Encoder {
       ],
     })
 
-    // 5. Dispatch — one workgroup tile per (workgroupSize) blocks.
+    // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When asked
+    //    (and the device has 'timestamp-query'), bracket the pass with
+    //    timestamps so the caller gets shader-only GPU time.
+    const useTimestamps = withGpuTime && device.features.has('timestamp-query')
+    const querySet = useTimestamps ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null
+    const queryBuffer = useTimestamps
+      ? device.createBuffer({
+          label: `${this.label}-ts-resolve`,
+          size: 16,
+          usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+        })
+      : null
+
     const [wgX, wgY] = this.workgroupSize
     const t0 = performance.now()
     const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
-    const pass = enc.beginComputePass()
+    const pass = enc.beginComputePass(
+      querySet ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
+    )
     pass.setPipeline(pipeline)
     pass.setBindGroup(0, bindGroup)
     pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(blocksY / wgY), 1)
     pass.end()
+    if (querySet && queryBuffer) enc.resolveQuerySet(querySet, 0, 2, queryBuffer, 0)
 
     // 6. Buffer readback. We go through a MAP_READ staging buffer rather
     //    than copyBufferToTexture: the encoder owns its own adapter/device,
@@ -372,6 +416,15 @@ export abstract class Encoder {
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     })
     enc.copyBufferToBuffer(dstBuffer, 0, staging, 0, outByteLen)
+    const tsStaging =
+      querySet && queryBuffer
+        ? device.createBuffer({
+            label: `${this.label}-ts-staging`,
+            size: 16,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          })
+        : null
+    if (tsStaging && queryBuffer) enc.copyBufferToBuffer(queryBuffer, 0, tsStaging, 0, 16)
     device.queue.submit([enc.finish()])
 
     await staging.mapAsync(GPUMapMode.READ)
@@ -379,11 +432,25 @@ export abstract class Encoder {
     staging.unmap()
     const encodeMs = performance.now() - t0
 
+    let gpuMs: number | undefined
+    if (tsStaging) {
+      await tsStaging.mapAsync(GPUMapMode.READ)
+      const [begin, end] = new BigUint64Array(tsStaging.getMappedRange().slice(0))
+      tsStaging.unmap()
+      tsStaging.destroy()
+      // Timestamps are u64 nanoseconds.
+      if (end !== undefined && begin !== undefined && end > begin) {
+        gpuMs = Number(end - begin) / 1e6
+      }
+    }
+    querySet?.destroy()
+    queryBuffer?.destroy()
+
     srcTex.destroy()
     dstBuffer.destroy()
     staging.destroy()
     paramsBuffer.destroy()
 
-    return { width, height, paddedWidth, paddedHeight, data, encodeMs }
+    return { width, height, paddedWidth, paddedHeight, data, encodeMs, gpuMs }
   }
 }

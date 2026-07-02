@@ -4,18 +4,18 @@
 // buffer at `dst[block_index * 4 .. + 3]`.
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): O(N) bounding-box seed → endpoints fitted by a single
-//     least-squares pass whose normal-equation sums are accumulated *during* a
-//     projection-based index assignment. The 16 palette entries are colinear
-//     (pal[i] = lerp(e0,e1,w[i])), so the nearest index is found by projecting
-//     each pixel onto the endpoint line — O(1) per pixel, no palette build and
-//     no 16-entry search. Profiled ~20× faster than `high` for ~0.4 dB PSNR.
+//   fast (0, default): O(N) bounding-box seed → one fused pass that projects
+//     each pixel onto the endpoint line (the 16 palette entries are colinear,
+//     so the nearest index is the rounded projection — no palette build, no
+//     16-entry search) while accumulating the least-squares refit sums, then
+//     a reprojection against the quantised refit endpoints for the final
+//     indices, packed on the fly into two nibble words.
 //   high (1): farthest-pair seed, exhaustive p-bit search over all four
 //     (p0,p1) ∈ {0,1}² combos, full 16-entry nearest search, one LSQ refit —
-//     byte-for-byte identical to bc7_ref.ts.
+//     matches bc7_ref.ts up to FP tie-breaks.
 //
-// Both paths run in the i32 domain. The fast path's branch is selected at
-// pipeline-compile time, so the driver eliminates the unused (high) code.
+// The fast/high branch is selected at pipeline-compile time, so the driver
+// eliminates the unused code entirely.
 //
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
 //   bits 0..6    mode field      (0b0000001 — only bit 6 is 1)
@@ -27,6 +27,10 @@
 //
 // Effective 8-bit endpoint channel = (7_bit_value << 1) | p_bit.
 // Palette[i] = ((64 − W4[i]) × e0_8 + W4[i] × e1_8 + 32) >> 6, integer.
+//
+// The block is assembled with straight-line constant shifts (see the layout
+// summary in bc7_fast_f16.wgsl) — a generic write_bits() helper's dynamic
+// word indexing keeps the output array out of registers.
 
 // 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
 override QUALITY_HIGH: u32 = 0u;
@@ -102,41 +106,36 @@ fn pick_ep(ideal: vec4<i32>) -> Ep {
   return Ep(a.seven, a.eight, 0u);
 }
 
-// Projection index assignment. The palette is colinear, so the nearest entry is
-// found by projecting onto the endpoint line — O(1) per pixel. When `fit`, the
-// LSQ normal-equation sums are accumulated in the same pass for a fused refit
-// (uniform weight i/15 — within a fraction of a code of the exact w4 table).
+// One pass over the block: project every pixel onto the e0→e1 line and
+// accumulate the least-squares normal-equation sums; solve for the refit
+// endpoints (in 8-bit space). Indices are not produced here — the caller
+// reprojects against the quantised refit endpoints anyway.
 struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
-fn proj_assign(
-  pixels: ptr<function, array<vec4<i32>, 16>>,
-  e0: vec4<i32>, e1: vec4<i32>,
-  out_idx: ptr<function, array<u32, 16>>,
-  fit: bool,
-) -> Fit {
+fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4<i32>) -> Fit {
   var out: Fit;
-  let dir = e1 - e0;
-  let dd = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z + dir.w * dir.w;
-  if (dd == 0) {
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) { (*out_idx)[k] = 0u; }
-    out.valid = false;
-    return out;
-  }
-  let inv = 15.0 / f32(dd);
+  out.valid = false;
+  let dir = vec4<f32>(e1 - e0);
+  let dd = dot(dir, dir);
+  if (dd == 0.0) { return out; }
+  let e0f = vec4<f32>(e0);
+  let inv = 15.0 / dd;
   var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
   var sAV: vec4<f32> = vec4<f32>(0.0); var sBV: vec4<f32> = vec4<f32>(0.0);
+  var s_min = 15.0; var s_max = 0.0;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let q = (*pixels)[k] - e0;
-    let s = clamp(floor(f32(q.x * dir.x + q.y * dir.y + q.z * dir.z + q.w * dir.w) * inv + 0.5), 0.0, 15.0);
-    (*out_idx)[k] = u32(s);
-    if (fit) {
-      let v = vec4<f32>((*pixels)[k]);
-      let b = s / 15.0; let a = 1.0 - b;
-      sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b; sAV = sAV + a * v; sBV = sBV + b * v;
-    }
+    let v = vec4<f32>((*pixels)[k]);
+    let s = clamp(floor(dot(v - e0f, dir) * inv + 0.5), 0.0, 15.0);
+    s_min = min(s_min, s); s_max = max(s_max, s);
+    let b = s * (1.0 / 15.0); let a = 1.0 - b;
+    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
+    sAV = sAV + a * v; sBV = sBV + b * v;
   }
-  if (!fit) { out.valid = false; return out; }
+  // Rank-1 guard: if every pixel projects to ONE level the system is
+  // singular — det and the numerators are pure float rounding noise and the
+  // solve returns garbage endpoints. With ≥2 levels det ≥ 15/225 ≈ 0.067.
+  if (s_min == s_max) { return out; }
   let det = sAA * sBB - sAB * sAB;
-  if (abs(det) < 1e-9) { out.valid = false; return out; }
+  if (abs(det) < 1e-3) { return out; }
   out.e0 = vec4<i32>(clamp(round((sBB * sAV - sAB * sBV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
   out.e1 = vec4<i32>(clamp(round((sAA * sBV - sAB * sAV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
   out.valid = true;
@@ -258,23 +257,6 @@ fn refit_endpoints(
   return out;
 }
 
-// -------------------------- Bit-packing helper -------------------------- //
-
-fn write_bits(block: ptr<function, array<u32, 4>>, pos: u32, n_bits: u32, value: u32) {
-  let v = value & ((1u << n_bits) - 1u);
-  let word_lo = pos / 32u;
-  let bit_lo = pos % 32u;
-  let bits_in_lo = min(n_bits, 32u - bit_lo);
-  let mask_lo = ((1u << bits_in_lo) - 1u) << bit_lo;
-  (*block)[word_lo] = ((*block)[word_lo] & ~mask_lo) | ((v << bit_lo) & mask_lo);
-  if (bits_in_lo < n_bits) {
-    let bits_in_hi = n_bits - bits_in_lo;
-    let mask_hi = (1u << bits_in_hi) - 1u;
-    let val_hi = v >> bits_in_lo;
-    (*block)[word_lo + 1u] = ((*block)[word_lo + 1u] & ~mask_hi) | (val_hi & mask_hi);
-  }
-}
-
 // ------------------------------- Entry --------------------------------- //
 
 @compute @workgroup_size(8, 8, 1)
@@ -304,11 +286,14 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     hi = max(hi, px);
   }
 
+  // Both branches produce: 7-bit endpoints + p-bits, and the 16 4-bit indices
+  // packed LSB-first into two nibble words (pixel k → bits 4k..4k+3).
   var e0_7: vec4<i32>;
   var e1_7: vec4<i32>;
   var p0: u32;
   var p1: u32;
-  var indices: array<u32, 16>;
+  var ilo: u32 = 0u;
+  var ihi: u32 = 0u;
 
   if (QUALITY_HIGH != 0u) {
     let fp = farthest_pair(&pixels);
@@ -319,53 +304,57 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (refit.valid) {
       try_pbit_combos(&pixels, refit.e0, refit.e1, &best);
     }
-    e0_7 = best.e0_7; e1_7 = best.e1_7; p0 = best.p0; p1 = best.p1; indices = best.indices;
+    e0_7 = best.e0_7; e1_7 = best.e1_7; p0 = best.p0; p1 = best.p1;
+    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+      ilo = ilo | (best.indices[k] << (k * 4u));
+    }
+    for (var k: u32 = 8u; k < 16u; k = k + 1u) {
+      ihi = ihi | (best.indices[k] << ((k - 8u) * 4u));
+    }
   } else {
-    var ep0 = pick_ep(lo);
-    var ep1 = pick_ep(hi);
-    let r = proj_assign(&pixels, ep0.eight, ep1.eight, &indices, true);
-    if (r.valid) {
-      ep0 = pick_ep(r.e0);
-      ep1 = pick_ep(r.e1);
-      proj_assign(&pixels, ep0.eight, ep1.eight, &indices, false);
+    // Seed the fused LSQ fit from the raw bbox, then quantise the refit
+    // endpoints and reproject for the final indices.
+    let r = proj_fit(&pixels, lo, hi);
+    var ep0: Ep;
+    var ep1: Ep;
+    if (r.valid) { ep0 = pick_ep(r.e0); ep1 = pick_ep(r.e1); }
+    else         { ep0 = pick_ep(lo);   ep1 = pick_ep(hi);   }
+    let dir = vec4<f32>(ep1.eight - ep0.eight);
+    let dd = dot(dir, dir);
+    if (dd > 0.0) {
+      let e0f = vec4<f32>(ep0.eight);
+      let inv = 15.0 / dd;
+      for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+        let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
+        ilo = ilo | (u32(s) << (k * 4u));
+      }
+      for (var k: u32 = 8u; k < 16u; k = k + 1u) {
+        let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
+        ihi = ihi | (u32(s) << ((k - 8u) * 4u));
+      }
     }
     e0_7 = ep0.seven; e1_7 = ep1.seven; p0 = ep0.p; p1 = ep1.p;
   }
 
-  // Anchor rule — pixel 0's index MSB must be 0. If not, swap endpoints and
-  // reflect every index (new_i = 15 − old_i); decoded image is unchanged.
-  if ((indices[0] & 0x8u) != 0u) {
+  // Anchor rule — pixel 0's index MSB must be 0. Swapping endpoints reflects
+  // every index (i → 15−i), which on packed nibbles is a bitwise NOT.
+  if ((ilo & 0x8u) != 0u) {
     let t7 = e0_7; e0_7 = e1_7; e1_7 = t7;
     let tp = p0;   p0   = p1;   p1   = tp;
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      indices[k] = 15u - indices[k];
-    }
+    ilo = ~ilo; ihi = ~ihi;
   }
 
-  // Pack into 128 bits = 4 u32s.
-  var block: array<u32, 4>;
-  block[0] = 0u; block[1] = 0u; block[2] = 0u; block[3] = 0u;
-  var pos: u32 = 0u;
-  write_bits(&block, pos, 7u, 0x40u); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e0_7.x)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e1_7.x)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e0_7.y)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e1_7.y)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e0_7.z)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e1_7.z)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e0_7.w)); pos = pos + 7u;
-  write_bits(&block, pos, 7u, u32(e1_7.w)); pos = pos + 7u;
-  write_bits(&block, pos, 1u, p0); pos = pos + 1u;
-  write_bits(&block, pos, 1u, p1); pos = pos + 1u;
-  write_bits(&block, pos, 3u, indices[0] & 0x7u); pos = pos + 3u;
-  for (var k: u32 = 1u; k < 16u; k = k + 1u) {
-    write_bits(&block, pos, 4u, indices[k] & 0xFu);
-    pos = pos + 4u;
-  }
+  // Straight-line mode-6 packing (see layout at the top of the file).
+  let e0 = vec4<u32>(e0_7);
+  let e1 = vec4<u32>(e1_7);
+  let w0 = 0x40u | (e0.x << 7u) | (e1.x << 14u) | (e0.y << 21u) | (e1.y << 28u);
+  let w1 = (e1.y >> 4u) | (e0.z << 3u) | (e1.z << 10u) | (e0.w << 17u) | (e1.w << 24u) | (p0 << 31u);
+  let w2 = p1 | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
+  let w3 = ihi;
 
   let out = block_index * 4u;
-  dst[out + 0u] = block[0];
-  dst[out + 1u] = block[1];
-  dst[out + 2u] = block[2];
-  dst[out + 3u] = block[3];
+  dst[out + 0u] = w0;
+  dst[out + 1u] = w1;
+  dst[out + 2u] = w2;
+  dst[out + 3u] = w3;
 }
