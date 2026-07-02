@@ -154,9 +154,12 @@ export abstract class Encoder {
   readonly adapter?: GPUAdapter
   readonly ownsDevice: boolean
   readonly disableF16: boolean
-  // `!:` because these are set in `_buildPipeline()` which the constructor
-  // calls; TypeScript's flow analysis doesn't see through method calls.
-  protected _module!: GPUShaderModule
+  // f32 module — created lazily by `_ensureModule()`: when the f16 fast
+  // module exists it serves the default path, so parsing/validating the
+  // (larger, dual-quality) f32 source is deferred until 'high' or the
+  // forced-f32 fallback is actually requested. Halves encoder construction
+  // cost on f16 hardware.
+  protected _module: GPUShaderModule | null = null
   // f16 'fast' module — built only when the device supports shader-f16 and the
   // subclass provides an f16 source. null otherwise (falls back to _module).
   protected _moduleF16: GPUShaderModule | null = null
@@ -197,16 +200,13 @@ export abstract class Encoder {
 
   protected _buildPipeline(): void {
     const device = this.device
-    const code = this.wgslSource() // subclasses override; stubs throw here
-    this._module = device.createShaderModule({
-      label: `${this.label}-encoder`,
-      code,
-    })
     if (this._useF16) {
       this._moduleF16 = device.createShaderModule({
         label: `${this.label}-encoder-f16`,
         code: this.wgslSourceFastF16()!,
       })
+    } else {
+      this._ensureModule() // subclasses override wgslSource(); stubs throw here
     }
     if (this.supportsQuality) {
       // Eagerly build the default (fast) pipeline so shader compile errors
@@ -216,9 +216,20 @@ export abstract class Encoder {
       this._pipeline = device.createComputePipeline({
         label: `${this.label}-encoder-pipeline`,
         layout: 'auto',
-        compute: { module: this._module, entryPoint: 'encode' },
+        compute: { module: this._ensureModule(), entryPoint: 'encode' },
       })
     }
+  }
+
+  /** The f32 module, parsed on first use (see `_module`). */
+  protected _ensureModule(): GPUShaderModule {
+    if (!this._module) {
+      this._module = this.device.createShaderModule({
+        label: `${this.label}-encoder`,
+        code: this.wgslSource(),
+      })
+    }
+    return this._module
   }
 
   /**
@@ -247,7 +258,7 @@ export abstract class Encoder {
       label: `${this.label}-encoder-pipeline-${quality}`,
       layout: 'auto',
       compute: {
-        module: this._module,
+        module: this._ensureModule(),
         entryPoint: 'encode',
         constants: { QUALITY_HIGH: quality === 'high' ? 1 : 0 },
       },

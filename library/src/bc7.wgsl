@@ -5,12 +5,13 @@
 //
 // QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
 //   fast (0, default): principal-axis seed (covariance power-iteration; bbox
-//     on degenerate blocks) → one fused pass that projects each pixel onto
-//     the endpoint line (the 16 palette entries are colinear, so the nearest
-//     index is the rounded projection — no palette build, no 16-entry search)
-//     while accumulating the least-squares refit sums, then a reprojection
-//     against the quantised refit endpoints for the final indices, packed on
-//     the fly into two nibble words.
+//     on degenerate blocks) at the exact projection extents, quantised
+//     directly — no LSQ refit; with the seed on the principal axis, mode 6's
+//     16-level palette leaves the refit under 0.15 dB, unlike the 4-level
+//     BC1/ASTC fast paths which keep theirs — then one pass that projects
+//     each pixel onto the endpoint line (the 16 palette entries are
+//     colinear, so the nearest index is the rounded projection — no palette
+//     build, no 16-entry search), packed on the fly into two nibble words.
 //   high (1): farthest-pair seed, exhaustive p-bit search over all four
 //     (p0,p1) ∈ {0,1}² combos, full 16-entry nearest search, one LSQ refit —
 //     matches bc7_ref.ts up to FP tie-breaks.
@@ -107,64 +108,20 @@ fn pick_ep(ideal: vec4<i32>) -> Ep {
   return Ep(a.seven, a.eight, 0u);
 }
 
-// One pass over the block: project every pixel onto the e0→e1 line and
-// accumulate the least-squares normal-equation sums; solve for the refit
-// endpoints (in 8-bit space). Indices are not produced here — the caller
-// reprojects against the quantised refit endpoints anyway.
-struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
-fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4<i32>) -> Fit {
-  var out: Fit;
-  out.valid = false;
-  let dir = vec4<f32>(e1 - e0);
-  let dd = dot(dir, dir);
-  if (dd == 0.0) { return out; }
-  let e0f = vec4<f32>(e0);
-  let inv = 15.0 / dd;
-  var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
-  var sAV: vec4<f32> = vec4<f32>(0.0); var sBV: vec4<f32> = vec4<f32>(0.0);
-  var s_min = 15.0; var s_max = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let v = vec4<f32>((*pixels)[k]);
-    let s = clamp(floor(dot(v - e0f, dir) * inv + 0.5), 0.0, 15.0);
-    s_min = min(s_min, s); s_max = max(s_max, s);
-    let b = s * (1.0 / 15.0); let a = 1.0 - b;
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAV = sAV + a * v; sBV = sBV + b * v;
-  }
-  // Rank-1 guard: if every pixel projects to ONE level the system is
-  // singular — det and the numerators are pure float rounding noise and the
-  // solve returns garbage endpoints. With ≥2 levels det ≥ 15/225 ≈ 0.067.
-  if (s_min == s_max) { return out; }
-  let det = sAA * sBB - sAB * sAB;
-  if (abs(det) < 1e-3) { return out; }
-  out.e0 = vec4<i32>(clamp(round((sBB * sAV - sAB * sBV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
-  out.e1 = vec4<i32>(clamp(round((sAA * sBV - sAB * sAV) / det), vec4<f32>(0.0), vec4<f32>(255.0)));
-  out.valid = true;
-  return out;
-}
-
-// Principal colour axis via covariance power-iteration (RGBA, 8-bit integer
-// pixel domain), seeded with the bbox diagonal. Returns a unit axis, or
-// vec4(0) for a degenerate (constant) block. Same family as bc1.wgsl's
-// principal_axis; used by the fast path to seed the LSQ fit — the bbox
-// diagonal is sign-blind and points across anti-correlated data (normal
-// maps, hue edges) instead of along it.
+// Principal colour axis via power-iteration over precomputed, mean-corrected
+// covariance rows (the moments are accumulated for free in the pixel-load
+// loop), seeded with the bbox diagonal. Returns a unit axis, or vec4(0) for
+// a degenerate (constant) block. Same family as bc1.wgsl's principal_axis;
+// used by the fast path to seed the LSQ fit — the bbox diagonal is
+// sign-blind and points across anti-correlated data (normal maps, hue edges)
+// instead of along it.
 fn principal_axis4(
-  pixels: ptr<function, array<vec4<i32>, 16>>,
-  mean: vec4<f32>,
+  c0v: vec4<f32>,
+  c1v: vec4<f32>,
+  c2v: vec4<f32>,
+  c3v: vec4<f32>,
   seed: vec4<f32>,
 ) -> vec4<f32> {
-  var c0v = vec4<f32>(0.0);
-  var c1v = vec4<f32>(0.0);
-  var c2v = vec4<f32>(0.0);
-  var c3v = vec4<f32>(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let d = vec4<f32>((*pixels)[k]) - mean;
-    c0v = c0v + d.x * d;
-    c1v = c1v + d.y * d;
-    c2v = c2v + d.z * d;
-    c3v = c3v + d.w * d;
-  }
   var v = seed;
   var len = length(v);
   if (len < 1e-9) { return vec4<f32>(0.0); }
@@ -308,12 +265,20 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let base   = vec2<i32>(i32(bx) * 4, i32(by) * 4);
   let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  // Load 16 RGBA pixels (8-bit integer domain), the per-channel bbox and the
-  // (exact, integer-summed) mean.
+  // Load 16 RGBA pixels (8-bit integer domain) and the per-channel bbox,
+  // with the covariance moments FUSED in: d = px − pixel0 (first-pixel-
+  // relative, so the sums scale with the block's span; d is integer-valued
+  // and ≤255, exact in f32). Only the fast branch consumes the moment
+  // accumulators — the QUALITY_HIGH pipeline dead-code-eliminates them.
   var pixels: array<vec4<i32>, 16>;
   var lo = vec4<i32>(255);
   var hi = vec4<i32>(0);
-  var isum = vec4<i32>(0);
+  var p0f = vec4<f32>(0.0);
+  var sd = vec4<f32>(0.0);
+  var c0v = vec4<f32>(0.0);
+  var c1v = vec4<f32>(0.0);
+  var c2v = vec4<f32>(0.0);
+  var c3v = vec4<f32>(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
@@ -322,9 +287,15 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     pixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
-    isum = isum + px;
+    if (i == 0u) { p0f = vec4<f32>(px); }
+    let d = vec4<f32>(px) - p0f;
+    sd = sd + d;
+    c0v = c0v + d.x * d;
+    c1v = c1v + d.y * d;
+    c2v = c2v + d.z * d;
+    c3v = c3v + d.w * d;
   }
-  let mean = vec4<f32>(isum) * (1.0 / 16.0);
+  let mean = p0f + sd * (1.0 / 16.0);
 
   // Both branches produce: 7-bit endpoints + p-bits, and the 16 4-bit indices
   // packed LSB-first into two nibble words (pixel k → bits 4k..4k+3).
@@ -352,20 +323,27 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       ihi = ihi | (best.indices[k] << ((k - 8u) * 4u));
     }
   } else {
-    // Seed the fused LSQ fit from the block's principal colour axis
-    // (covariance power-iteration; bbox on degenerate blocks), then quantise
-    // the refit endpoints and reproject for the final indices.
-    // The refit is clamped to the block bbox: on multi-cluster blocks (a hard
-    // edge through two-colour noise) the unconstrained solve extrapolates far
-    // outside the block's colours and the per-channel [0,255] clamp then bends
-    // the hue — fringe pixels decode to colours that exist nowhere in the
-    // block. Constraining to the bbox also measures BETTER in plain SSE
-    // (+1.3 dB on the colour test card): the wild endpoints were losing more
-    // after quantisation + reassignment than the extrapolation ever bought.
+    // Seed endpoints from the block's principal colour axis (covariance
+    // power-iteration; bbox on degenerate blocks) at the exact projection
+    // extents, quantise, and assign indices in one projection pass. No LSQ
+    // refit: with the seed already on the principal axis, mode 6's 16-level
+    // palette leaves the refit ≤0.05 dB on the colour card and ≤0.15 dB on
+    // the normal card — not worth its two extra 16-pixel passes (the coarse
+    // 4-level BC1/ASTC fast paths DO keep theirs).
+    // Mean-correct the fused moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
+    let sd16 = sd * (1.0 / 16.0);
+    let r0v = c0v - sd.x * sd16;
+    let r1v = c1v - sd.y * sd16;
+    let r2v = c2v - sd.z * sd16;
+    let r3v = c3v - sd.w * sd16;
     var seed0 = lo;
     var seed1 = hi;
-    let axis = principal_axis4(&pixels, mean, vec4<f32>(hi - lo));
+    let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
     if (dot(axis, axis) > 0.0) {
+      // Exact projection extents along the axis. (A Rayleigh-quotient span
+      // estimate was tried in place of this pass — it saves 16 dots but
+      // costs 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ
+      // misjudges two-cluster and outlier blocks. The pass stays.)
       var t_min: f32 = 1e30;
       var t_max: f32 = -1e30;
       for (var k: u32 = 0u; k < 16u; k = k + 1u) {
@@ -376,11 +354,8 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
       seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
     }
-    let r = proj_fit(&pixels, seed0, seed1);
-    var ep0: Ep;
-    var ep1: Ep;
-    if (r.valid) { ep0 = pick_ep(clamp(r.e0, lo, hi)); ep1 = pick_ep(clamp(r.e1, lo, hi)); }
-    else         { ep0 = pick_ep(lo);                  ep1 = pick_ep(hi);                  }
+    let ep0 = pick_ep(seed0);
+    let ep1 = pick_ep(seed1);
     let dir = vec4<f32>(ep1.eight - ep0.eight);
     let dd = dot(dir, dir);
     if (dd > 0.0) {

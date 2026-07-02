@@ -70,13 +70,9 @@ fn project_pack(values: ptr<function, array<h, 16>>, r0: u32, r1: u32) -> Proj {
 }
 
 // Encode one channel (16 values in exact-integer [0,255] f16) to a BC4 half.
-fn encode_bc4(values: ptr<function, array<h, 16>>) -> vec2<u32> {
-  var vmin = h(255.0);
-  var vmax = h(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    vmin = min(vmin, (*values)[k]);
-    vmax = max(vmax, (*values)[k]);
-  }
+// vmin/vmax are the channel's min/max, computed in the caller's load loop —
+// fusing that scan there saves a 16-value pass per channel.
+fn encode_bc4(values: ptr<function, array<h, 16>>, vmin: h, vmax: h) -> vec2<u32> {
   var r0 = u32(vmax); // values are exact integers — no rounding needed
   var r1 = u32(vmin);
   if (r0 == r1) {
@@ -155,14 +151,18 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
   var rv: array<h, 16>;
   var gv: array<h, 16>;
+  var rmin = h(255.0); var rmax = h(0.0);
+  var gmin = h(255.0); var gmax = h(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
     let c = textureLoad(src_tex, p, 0);
-    rv[i] = h(c.r * 255.0);
-    gv[i] = h(c.g * 255.0);
+    let r = h(c.r * 255.0);
+    let g = h(c.g * 255.0);
+    rv[i] = r; rmin = min(rmin, r); rmax = max(rmax, r);
+    gv[i] = g; gmin = min(gmin, g); gmax = max(gmax, g);
   }
-  let rb = encode_bc4(&rv);
-  let gb = encode_bc4(&gv);
+  let rb = encode_bc4(&rv, rmin, rmax);
+  let gb = encode_bc4(&gv, gmin, gmax);
   let o = bi * 4u;
   dst[o] = rb.x; dst[o + 1u] = rb.y; dst[o + 2u] = gb.x; dst[o + 3u] = gb.y;
 }

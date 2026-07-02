@@ -81,17 +81,20 @@ material.map = texture
   covariance power-iteration — unlike a bbox diagonal it follows
   anti-correlated channels, worth **+2–4 dB on normal-map-like content**)
   plus projection-based index assignment (each pixel is projected onto the
-  colinear endpoint line in O(1) instead of searching every palette entry)
-  with a single fused least-squares refit (accepted per block only when it
-  lowers the error), and the block bits packed with straight-line constant
-  shifts. On GPUs that report the `shader-f16` feature the whole fast path
-  (all four formats, BC1 included) runs in f16 — the f32 path is the
-  automatic fallback. Net vs `'high'` on an Apple GPU: roughly **10–30×
-  faster** depending on format, for a PSNR cost of **≤0.35 dB on the test
-  cards** (BC7 within 0.05 dB of `'high'`; ASTC fast actually measures
-  slightly above it) and up to a few dB on adversarial high-frequency noise,
-  where any single-line seed trails `'high'`'s exhaustive search. See the
-  benchmark table below.
+  colinear endpoint line in O(1) instead of searching every palette entry),
+  and the block bits packed with straight-line constant shifts. The formats
+  with coarse 4-level palettes (BC1, ASTC) and BC5 add a least-squares
+  endpoint refit accepted per block only when it lowers the error; BC7's
+  16-level mode-6 palette makes the refit redundant on a principal-axis seed
+  (≤0.05 dB), so its fast path skips it and stays the cheapest per pixel. On
+  GPUs that report the `shader-f16` feature the whole fast path (all four
+  formats, BC1 included) runs in f16 — the f32 path is the automatic
+  fallback. Net vs `'high'` on an Apple GPU: roughly **10–30× faster**
+  depending on format, for a PSNR cost of **≤0.35 dB on the test cards**
+  (BC7 within 0.1 dB of `'high'`; ASTC fast actually measures slightly above
+  it) and up to a few dB on adversarial high-frequency noise, where any
+  single-line seed trails `'high'`'s exhaustive search. See the benchmark
+  table below.
 - **`'high'`** — exhaustive endpoint search (farthest-pair seed, full nearest
   search, p-bit search); matches the CPU reference encoders block-for-block
   (byte-identical on >96% of blocks; the rest are equal-error FP tie-breaks,

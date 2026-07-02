@@ -1,22 +1,25 @@
 // bc7 "fast" encoder — f16 variant (requires the shader-f16 feature).
 // Same algorithm family as the f32 fast path in bc7.wgsl (principal-axis
-// seed → projection-based index assignment with a fused least-squares
-// refit → reproject), tuned for throughput:
+// seed at the exact projection extents → quantise → one projection-based
+// index-assignment pass), tuned for throughput:
 //
-//   • All projection / refit math in f16 ([0,1] domain). ~2× ALU throughput
-//     on f16-capable GPUs. The projection direction is pre-scaled by 32:
+//   • All projection math in f16 ([0,1] domain). ~2× ALU throughput on
+//     f16-capable GPUs. The projection direction is pre-scaled by 32:
 //     a shallow block (endpoints ~1/255 apart) has dd = dot(dir,dir) ≈ 1.5e-5,
 //     where 15/dd ≈ 10⁶ overflows f16 (max 65504) to +inf and the products
-//     inside the projection dot are subnormal — the indices and the LSQ refit
-//     feeding on them turn to garbage (visible as banding on smooth
-//     gradients). Scaling dir by 32 multiplies the dots by 32 and dd by 1024;
-//     s = dot·(32·15/dd₃₂) is the same quantity with every intermediate in
-//     f16's normal range (worst case inv = 480/0.0157 ≈ 3.0e4 < 65504).
-//   • The LSQ seed pass projects against the RAW bbox endpoints — quantising
-//     the seed first (pick_ep) costs two extra quantisation searches and
-//     doesn't measurably change where the refit lands.
+//     inside the projection dot are subnormal — the indices turn to garbage
+//     (visible as banding on smooth gradients). Scaling dir by 32 multiplies
+//     the dots by 32 and dd by 1024; s = dot·(32·15/dd₃₂) is the same
+//     quantity with every intermediate in f16's normal range (worst case
+//     inv = 480/0.0157 ≈ 3.0e4 < 65504).
+//   • NO least-squares refit, unlike the BC1/BC5/ASTC fast paths: with the
+//     seed already on the principal axis at the exact projection extents,
+//     mode 6's fine 16-level palette leaves the refit ≤0.05 dB on the colour
+//     card and ≤0.15 dB on the normal card — not worth its two extra
+//     16-pixel passes. The coarse 4-level formats DO need it (dropping it
+//     there costs 0.5–1.3 dB).
 //   • Indices are packed into two u32 nibble words ON THE FLY during the
-//     final projection pass — no array<u32,16> private array. The BC7 anchor
+//     projection pass — no array<u32,16> private array. The BC7 anchor
 //     reflection (i → 15−i) is then just a bitwise NOT of both words.
 //   • The 128-bit block is assembled with straight-line constant shifts
 //     instead of a generic write_bits() helper (whose dynamic word indexing
@@ -53,53 +56,6 @@ fn pick_ep(ideal01: h4) -> Ep {
   return Ep(vec4<u32>(q0), e0 * h(1.0 / 255.0), 0u);
 }
 
-// One pass over the block: project every pixel onto the e0→e1 line and
-// accumulate the least-squares normal-equation sums; solve for the refit
-// endpoints. Indices are NOT produced here — the caller reprojects against
-// the quantised refit endpoints anyway.
-//
-// The value sums accumulate v − e0, not v: the basis is affine (a + b = 1),
-// so fitting the shifted data and adding e0 back is the same fit, but the
-// accumulators scale with the block's span instead of its absolute level —
-// on a shallow dark block, f16 rounding of absolute sums (ulp ≈ 0.12 of an
-// 8-bit level per add) drifts the refit endpoints by ±1 level.
-struct Fit { e0: h4, e1: h4, valid: bool };
-fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
-  var out: Fit;
-  out.valid = false;
-  // dir pre-scaled by 32 to keep dd and the projection dots in f16's normal
-  // range (see header). Spans below ~0.7 of an 8-bit step (dd₃₂ < 0.008,
-  // possible only for non-8-bit sources) are treated as flat — encoding them
-  // flat is under half a level of error, while running the math on them risks
-  // inv overflowing to +inf.
-  let dir = (e1 - e0) * h(32.0);
-  let dd = dot(dir, dir);
-  if (dd < h(0.008)) { return out; }
-  let inv = h(480.0) / dd; // 32·15/dd₃₂ ≡ 15/dd
-  var sAA = h(0.0); var sBB = h(0.0); var sAB = h(0.0);
-  var sAV = h4(0.0); var sBV = h4(0.0);
-  var s_min = h(15.0); var s_max = h(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let vr = (*pix)[k] - e0;
-    let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), h(15.0));
-    s_min = min(s_min, s); s_max = max(s_max, s);
-    let b = s * h(1.0 / 15.0); let a = h(1.0) - b;
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAV = sAV + a * vr; sBV = sBV + b * vr;
-  }
-  // Rank-1 guard: if every pixel projects to ONE level the system is
-  // singular — det/numerators are pure f16 rounding noise and the solve
-  // returns garbage endpoints. With ≥2 distinct levels
-  // det = Σ_i<j (b_j − b_i)² ≥ 15/225 ≈ 0.067, so 0.02 is a safe floor.
-  if (s_min == s_max) { return out; }
-  let det = sAA * sBB - sAB * sAB;
-  if (abs(det) < h(0.02)) { return out; }
-  out.e0 = clamp(e0 + (sBB * sAV - sAB * sBV) / det, h4(0.0), h4(1.0));
-  out.e1 = clamp(e0 + (sAA * sBV - sAB * sAV) / det, h4(0.0), h4(1.0));
-  out.valid = true;
-  return out;
-}
-
 @compute @workgroup_size(8, 8, 1)
 fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= params.blocks_x || gid.y >= params.blocks_y) { return; }
@@ -107,41 +63,52 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
   let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
+  // Load pass, with the covariance moments FUSED in (no separate 16-pixel
+  // pass): d = (px − pixel0)·16, relative to the block's first pixel so the
+  // accumulators scale with the block's span — raw Σv·vᵀ moments would
+  // cancel catastrophically in f16 — and pre-scaled ×16 so shallow blocks
+  // (span ~1/255 → d² ≈ 1e-3) clear the subnormal floor while full-range
+  // sums stay ≤4096. C = Σddᵀ − (Σd)(Σd)ᵀ/16 is the ×256-scaled covariance.
   var pix: array<h4, 16>;
   var lo = h4(1.0);
   var hi = h4(0.0);
-  var mean = h4(0.0);
+  var p0v = h4(0.0);
+  var sd = h4(0.0);
+  var c0v = h4(0.0);
+  var c1v = h4(0.0);
+  var c2v = h4(0.0);
+  var c3v = h4(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
     let px = h4(textureLoad(src_tex, p, 0));
     pix[i] = px; lo = min(lo, px); hi = max(hi, px);
-    mean = mean + px;
+    if (i == 0u) { p0v = px; }
+    let d = (px - p0v) * h(16.0);
+    sd = sd + d;
+    c0v = c0v + d.x * d;
+    c1v = c1v + d.y * d;
+    c2v = c2v + d.z * d;
+    c3v = c3v + d.w * d;
   }
-  mean = mean * h(1.0 / 16.0);
+  let mean = p0v + sd * h(1.0 / 256.0);
+  // Mean-correction via sd4·sd4ᵀ with sd4 = Σd/4: (Σd)(Σd)ᵀ/16 with every
+  // product ≤4096 (a direct Σd·Σdᵀ could hit 65536 and overflow f16).
+  let sd4 = sd * h(0.25);
+  c0v = c0v - sd4.x * sd4;
+  c1v = c1v - sd4.y * sd4;
+  c2v = c2v - sd4.z * sd4;
+  c3v = c3v - sd4.w * sd4;
 
   // Seed endpoints from the block's principal colour axis (covariance
   // power-iteration, seeded with the bbox diagonal — same family as the BC1
   // 'high' path). The bbox diagonal is sign-blind: on anti-correlated
   // channels (normal maps, hue edges) it points across the data instead of
   // along it, and the LSQ refit — which fits endpoints GIVEN the projection
-  // indices — can't recover from a wrong axis. Deviations are pre-scaled ×16
-  // so covariance entries for shallow blocks stay in f16's normal range
-  // (span ~1/255 → d² ≈ 1e-3) while full-range sums stay ≤4096; the
-  // iteration renormalises by the max component (a plain length() of the
-  // matvec output could overflow f16), so only the direction survives.
+  // indices — can't recover from a wrong axis. The iteration renormalises by
+  // the max component (a plain length() of the matvec output could overflow
+  // f16), so only the direction survives.
   var seed_lo = lo;
   var seed_hi = hi;
-  var c0v = h4(0.0);
-  var c1v = h4(0.0);
-  var c2v = h4(0.0);
-  var c3v = h4(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let d = (pix[k] - mean) * h(16.0);
-    c0v = c0v + d.x * d;
-    c1v = c1v + d.y * d;
-    c2v = c2v + d.z * d;
-    c3v = c3v + d.w * d;
-  }
   var axis = hi - lo;
   var axis_ok = true;
   for (var it: u32 = 0u; it < 4u; it = it + 1u) {
@@ -152,6 +119,11 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   if (axis_ok) {
     axis = axis / length(axis);
+    // Exact projection extents along the axis. (A Rayleigh-quotient span
+    // estimate was tried in place of this pass — it saves 16 dots but costs
+    // 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ misjudges
+    // two-cluster and outlier blocks and the quantised weight grid can't
+    // recover. The pass stays.)
     var t_min = h(4.0);
     var t_max = h(-4.0);
     for (var k: u32 = 0u; k < 16u; k = k + 1u) {
@@ -170,11 +142,9 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   // fringe pixels decode to colours that exist nowhere in the block.
   // Constraining to the bbox also measures better in plain SSE (+1.3 dB on
   // the colour test card).
-  let r = proj_fit(&pix, seed_lo, seed_hi);
-  var ep0: Ep;
-  var ep1: Ep;
-  if (r.valid) { ep0 = pick_ep(clamp(r.e0, lo, hi)); ep1 = pick_ep(clamp(r.e1, lo, hi)); }
-  else         { ep0 = pick_ep(lo);                  ep1 = pick_ep(hi);                  }
+  // Quantise the PCA-extents seed directly — no LSQ refit (see header).
+  var ep0 = pick_ep(seed_lo);
+  var ep1 = pick_ep(seed_hi);
 
   // Final projection against the decoded endpoints, packing the 4-bit indices
   // into two nibble words as we go (pixel k → bits 4k..4k+3 of ilo/ihi).

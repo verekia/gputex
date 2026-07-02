@@ -105,12 +105,14 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   // 34.68/33.22. The colour card is deliberately harder than the old 512²
   // one (Nyquist checkers, zone plate). `null` = record only (used while
   // baselining a change; the `:normal` colour-format entries track the
-  // cross-card matrix without gating).
+  // cross-card matrix without gating). BC7 fast re-baselined after its LSQ
+  // refit was dropped (PCA-extents seed + mode 6's 16-level palette make it
+  // redundant, ≤0.05 dB here): 31.84/31.93 fast f16/f32.
   'bc1:fast:color': 29.05,
   'bc1:high:color': 29.2,
   'bc5:fast:normal': 52.7,
   'bc5:high:normal': 53.0,
-  'bc7:fast:color': 31.75,
+  'bc7:fast:color': 31.7,
   'bc7:high:color': 31.8,
   'astc:fast:color': 30.4,
   'astc:high:color': 30.4,

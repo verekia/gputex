@@ -52,14 +52,10 @@ Assign assignAll(float values[16], float pal[8], out uint indices[16]) {
 
 // Encode 16 single-channel values into an 8-byte BC4 block (two little-endian
 // u32s). Mirrors encode_bc4() in bc5.wgsl's fast branch: bbox seed, fused
-// assignment + LSQ sums, refit accepted only if the error drops.
-uvec2 encodeBC4(float values[16]) {
-  float vmin = 1.0;
-  float vmax = 0.0;
-  for (int k = 0; k < 16; k++) {
-    vmin = min(vmin, values[k]);
-    vmax = max(vmax, values[k]);
-  }
+// assignment + LSQ sums, refit accepted only if the error drops. vmin/vmax
+// are the channel's min/max, computed in the caller's load loop — fusing
+// that scan there saves a 16-value pass per channel.
+uvec2 encodeBC4(float values[16], float vmin, float vmax) {
   uint r0 = quantize8(vmax);
   uint r1 = quantize8(vmin);
   if (r0 == r1) {
@@ -129,15 +125,19 @@ void main() {
 
   float rValues[16];
   float gValues[16];
+  float rMin = 1.0; float rMax = 0.0;
+  float gMin = 1.0; float gMax = 0.0;
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
     vec4 c = texelFetch(uSrc, ivec2(p.x, sy), 0);
     rValues[i] = c.r;
     gValues[i] = c.g;
+    rMin = min(rMin, c.r); rMax = max(rMax, c.r);
+    gMin = min(gMin, c.g); gMax = max(gMax, c.g);
   }
 
-  uvec2 rBlock = encodeBC4(rValues);
-  uvec2 gBlock = encodeBC4(gValues);
+  uvec2 rBlock = encodeBC4(rValues, rMin, rMax);
+  uvec2 gBlock = encodeBC4(gValues, gMin, gMax);
   outColor = uvec4(rBlock.x, rBlock.y, gBlock.x, gBlock.y);
 }

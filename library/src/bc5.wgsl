@@ -124,14 +124,10 @@ fn assign_all(
 
 // Encode 16 single-channel values into an 8-byte BC4 block, packed as
 // two little-endian u32s (u32[0] = bytes 0..3, u32[1] = bytes 4..7).
-fn encode_bc4(values: ptr<function, array<f32, 16>>) -> vec2<u32> {
+// vmin/vmax are the channel's min/max, computed in the caller's load loop —
+// fusing that scan there saves a 16-value pass per channel.
+fn encode_bc4(values: ptr<function, array<f32, 16>>, vmin: f32, vmax: f32) -> vec2<u32> {
   // ---------------- 1. Initial endpoints: bbox of input ----------------
-  var vmin: f32 = 1.0;
-  var vmax: f32 = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    vmin = min(vmin, (*values)[k]);
-    vmax = max(vmax, (*values)[k]);
-  }
   var r0: u32 = quantize8(vmax);
   var r1: u32 = quantize8(vmin);
   // Force 6-interp mode: red0 > red1 strictly.
@@ -322,9 +318,12 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
   // Load 4×4 RG values, splitting into per-channel arrays so each can
-  // be handed to encode_bc4 independently.
+  // be handed to encode_bc4 independently; the per-channel min/max scan is
+  // fused into the same loop.
   var r_values: array<f32, 16>;
   var g_values: array<f32, 16>;
+  var r_min: f32 = 1.0; var r_max: f32 = 0.0;
+  var g_min: f32 = 1.0; var g_max: f32 = 0.0;
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
@@ -333,10 +332,12 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c  = textureLoad(src_tex, p, 0);
     r_values[i] = c.r;
     g_values[i] = c.g;
+    r_min = min(r_min, c.r); r_max = max(r_max, c.r);
+    g_min = min(g_min, c.g); g_max = max(g_max, c.g);
   }
 
-  let r_block = encode_bc4(&r_values);
-  let g_block = encode_bc4(&g_values);
+  let r_block = encode_bc4(&r_values, r_min, r_max);
+  let g_block = encode_bc4(&g_values, g_min, g_max);
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.
   let out = block_index * 4u;

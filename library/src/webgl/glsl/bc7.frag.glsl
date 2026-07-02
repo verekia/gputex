@@ -3,11 +3,12 @@
 //
 // One fragment per 4×4 block → 16-byte block as 4 × u32 in outColor. Fast path
 // only: principal-axis seed (covariance power-iteration; bbox on degenerate
-// blocks) → endpoints fitted by a single least-squares pass whose
-// normal-equation sums are accumulated during a projection-based index
-// assignment (palette is colinear, so the nearest entry is found by projecting
-// onto the endpoint line — O(1) per pixel). Mirrors the `QUALITY_HIGH == 0`
-// branch of bc7.wgsl; see that file for the mode-6 bit layout and rationale.
+// blocks) at the exact projection extents, quantised directly (no LSQ refit —
+// mode 6's 16-level palette leaves it under 0.15 dB) → one projection-based
+// index-assignment pass (palette is colinear, so the nearest entry is found
+// by projecting onto the endpoint line — O(1) per pixel). Mirrors the
+// `QUALITY_HIGH == 0` branch of bc7.wgsl; see that file for the mode-6 bit
+// layout and rationale.
 //
 // Determinism note: the WGSL refit uses round() (half-to-even); here we use
 // floor(x + 0.5) for portability. The two differ only at exact .5 ties, a
@@ -60,22 +61,13 @@ Ep pickEp(ivec4 ideal) {
   return Ep(a.seven, a.eight, 0u);
 }
 
-// Principal colour axis of gPixels via covariance power-iteration, seeded
-// with the bbox diagonal. Returns a unit axis, or vec4(0.0) for a degenerate
-// (constant) block. The bbox diagonal alone is sign-blind and points across
-// anti-correlated data (normal maps, hue edges) instead of along it.
-vec4 principalAxis(vec4 mean, vec4 seed) {
-  vec4 c0v = vec4(0.0);
-  vec4 c1v = vec4(0.0);
-  vec4 c2v = vec4(0.0);
-  vec4 c3v = vec4(0.0);
-  for (int k = 0; k < 16; k++) {
-    vec4 d = vec4(gPixels[k]) - mean;
-    c0v += d.x * d;
-    c1v += d.y * d;
-    c2v += d.z * d;
-    c3v += d.w * d;
-  }
+// Principal colour axis via power-iteration over precomputed, mean-corrected
+// covariance rows (the moments are accumulated for free in the pixel-load
+// loop), seeded with the bbox diagonal. Returns a unit axis, or vec4(0.0)
+// for a degenerate (constant) block. The bbox diagonal alone is sign-blind
+// and points across anti-correlated data (normal maps, hue edges) instead of
+// along it.
+vec4 principalAxis(vec4 c0v, vec4 c1v, vec4 c2v, vec4 c3v, vec4 seed) {
   vec4 v = seed;
   float len = length(v);
   if (len < 1e-9) { return vec4(0.0); }
@@ -145,9 +137,16 @@ void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
   ivec2 maxXY = uSrcSize - ivec2(1);
 
+  // Load pass with the covariance moments FUSED in: d = px − pixel0
+  // (first-pixel-relative, so the sums scale with the block's span).
   ivec4 lo = ivec4(255);
   ivec4 hi = ivec4(0);
-  ivec4 isum = ivec4(0);
+  vec4 p0f = vec4(0.0);
+  vec4 sd = vec4(0.0);
+  vec4 c0v = vec4(0.0);
+  vec4 c1v = vec4(0.0);
+  vec4 c2v = vec4(0.0);
+  vec4 c3v = vec4(0.0);
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
@@ -155,14 +154,30 @@ void main() {
     gPixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
-    isum += px;
+    if (i == 0) { p0f = vec4(px); }
+    vec4 d = vec4(px) - p0f;
+    sd += d;
+    c0v += d.x * d;
+    c1v += d.y * d;
+    c2v += d.z * d;
+    c3v += d.w * d;
   }
-  vec4 mean = vec4(isum) / 16.0;
+  vec4 mean = p0f + sd / 16.0;
+  // Mean-correct the fused moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
+  vec4 sd16 = sd / 16.0;
+  c0v -= sd.x * sd16;
+  c1v -= sd.y * sd16;
+  c2v -= sd.z * sd16;
+  c3v -= sd.w * sd16;
 
   ivec4 seed0 = lo;
   ivec4 seed1 = hi;
-  vec4 axis = principalAxis(mean, vec4(hi - lo));
+  vec4 axis = principalAxis(c0v, c1v, c2v, c3v, vec4(hi - lo));
   if (dot(axis, axis) > 0.0) {
+    // Exact projection extents along the axis. (A Rayleigh-quotient span
+    // estimate was tried in place of this pass — it saves 16 dots but costs
+    // 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ misjudges
+    // two-cluster and outlier blocks. The pass stays.)
     float tMin = 1e30;
     float tMax = -1e30;
     for (int k = 0; k < 16; k++) {
@@ -174,19 +189,13 @@ void main() {
     seed1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
   }
 
+  // Quantise the PCA-extents seed directly and assign indices in one
+  // projection pass — no LSQ refit: with the seed already on the principal
+  // axis, mode 6's 16-level palette leaves the refit under 0.15 dB (the
+  // coarse 4-level BC1/ASTC fast paths DO keep theirs).
   Ep ep0 = pickEp(seed0);
   Ep ep1 = pickEp(seed1);
-  Fit r = projAssign(ep0.eight, ep1.eight, true);
-  if (r.valid) {
-    // Clamp the refit to the block bbox: on multi-cluster blocks the
-    // unconstrained LSQ solve extrapolates far outside the block's colours and
-    // the per-channel [0,255] clamp then bends the hue — fringe pixels decode
-    // to colours that exist nowhere in the block. Constraining to the bbox
-    // also measures better in plain SSE (+1.3 dB on the colour test card).
-    ep0 = pickEp(clamp(r.e0, lo, hi));
-    ep1 = pickEp(clamp(r.e1, lo, hi));
-    projAssign(ep0.eight, ep1.eight, false);
-  }
+  projAssign(ep0.eight, ep1.eight, false);
   ivec4 e0_7 = ep0.seven;
   ivec4 e1_7 = ep1.seven;
   uint p0 = ep0.p;
