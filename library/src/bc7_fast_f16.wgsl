@@ -3,8 +3,15 @@
 // projection-based index assignment with a fused least-squares refit →
 // reproject), tuned for throughput:
 //
-//   • All projection / refit math in f16 ([0,1] domain, so dot products stay
-//     well inside f16 range). ~2× ALU throughput on f16-capable GPUs.
+//   • All projection / refit math in f16 ([0,1] domain). ~2× ALU throughput
+//     on f16-capable GPUs. The projection direction is pre-scaled by 32:
+//     a shallow block (endpoints ~1/255 apart) has dd = dot(dir,dir) ≈ 1.5e-5,
+//     where 15/dd ≈ 10⁶ overflows f16 (max 65504) to +inf and the products
+//     inside the projection dot are subnormal — the indices and the LSQ refit
+//     feeding on them turn to garbage (visible as banding on smooth
+//     gradients). Scaling dir by 32 multiplies the dots by 32 and dd by 1024;
+//     s = dot·(32·15/dd₃₂) is the same quantity with every intermediate in
+//     f16's normal range (worst case inv = 480/0.0157 ≈ 3.0e4 < 65504).
 //   • The LSQ seed pass projects against the RAW bbox endpoints — quantising
 //     the seed first (pick_ep) costs two extra quantisation searches and
 //     doesn't measurably change where the refit lands.
@@ -50,24 +57,35 @@ fn pick_ep(ideal01: h4) -> Ep {
 // accumulate the least-squares normal-equation sums; solve for the refit
 // endpoints. Indices are NOT produced here — the caller reprojects against
 // the quantised refit endpoints anyway.
+//
+// The value sums accumulate v − e0, not v: the basis is affine (a + b = 1),
+// so fitting the shifted data and adding e0 back is the same fit, but the
+// accumulators scale with the block's span instead of its absolute level —
+// on a shallow dark block, f16 rounding of absolute sums (ulp ≈ 0.12 of an
+// 8-bit level per add) drifts the refit endpoints by ±1 level.
 struct Fit { e0: h4, e1: h4, valid: bool };
 fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   var out: Fit;
   out.valid = false;
-  let dir = e1 - e0;
+  // dir pre-scaled by 32 to keep dd and the projection dots in f16's normal
+  // range (see header). Spans below ~0.7 of an 8-bit step (dd₃₂ < 0.008,
+  // possible only for non-8-bit sources) are treated as flat — encoding them
+  // flat is under half a level of error, while running the math on them risks
+  // inv overflowing to +inf.
+  let dir = (e1 - e0) * h(32.0);
   let dd = dot(dir, dir);
-  if (dd == h(0.0)) { return out; }
-  let inv = h(15.0) / dd;
+  if (dd < h(0.008)) { return out; }
+  let inv = h(480.0) / dd; // 32·15/dd₃₂ ≡ 15/dd
   var sAA = h(0.0); var sBB = h(0.0); var sAB = h(0.0);
   var sAV = h4(0.0); var sBV = h4(0.0);
   var s_min = h(15.0); var s_max = h(0.0);
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let v = (*pix)[k];
-    let s = clamp(floor(dot(v - e0, dir) * inv + h(0.5)), h(0.0), h(15.0));
+    let vr = (*pix)[k] - e0;
+    let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), h(15.0));
     s_min = min(s_min, s); s_max = max(s_max, s);
     let b = s * h(1.0 / 15.0); let a = h(1.0) - b;
     sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAV = sAV + a * v; sBV = sBV + b * v;
+    sAV = sAV + a * vr; sBV = sBV + b * vr;
   }
   // Rank-1 guard: if every pixel projects to ONE level the system is
   // singular — det/numerators are pure f16 rounding noise and the solve
@@ -76,8 +94,8 @@ fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   if (s_min == s_max) { return out; }
   let det = sAA * sBB - sAB * sAB;
   if (abs(det) < h(0.02)) { return out; }
-  out.e0 = clamp((sBB * sAV - sAB * sBV) / det, h4(0.0), h4(1.0));
-  out.e1 = clamp((sAA * sBV - sAB * sAV) / det, h4(0.0), h4(1.0));
+  out.e0 = clamp(e0 + (sBB * sAV - sAB * sBV) / det, h4(0.0), h4(1.0));
+  out.e1 = clamp(e0 + (sAA * sBV - sAB * sAV) / det, h4(0.0), h4(1.0));
   out.valid = true;
   return out;
 }
@@ -109,10 +127,13 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   // into two nibble words as we go (pixel k → bits 4k..4k+3 of ilo/ihi).
   var ilo: u32 = 0u;
   var ihi: u32 = 0u;
-  let dir = ep1.eight - ep0.eight;
+  // Same ×32 pre-scale as proj_fit; distinct quantised endpoints are ≥1/255
+  // apart, i.e. dd₃₂ ≥ 0.0157, so the flat-block threshold only catches
+  // truly identical endpoints.
+  let dir = (ep1.eight - ep0.eight) * h(32.0);
   let dd = dot(dir, dir);
-  if (dd > h(0.0)) {
-    let inv = h(15.0) / dd;
+  if (dd >= h(0.008)) {
+    let inv = h(480.0) / dd;
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
       let s = clamp(floor(dot(pix[k] - ep0.eight, dir) * inv + h(0.5)), h(0.0), h(15.0));
       ilo = ilo | (u32(s) << (k * 4u));

@@ -3,7 +3,13 @@
 // projection weight assignment with a fused least-squares refit →
 // reproject), tuned for throughput:
 //
-//   • All projection / refit math in f16 ([0,1] domain).
+//   • All projection / refit math in f16 ([0,1] domain). The projection
+//     direction is pre-scaled by 32 — a shallow block (endpoints ~1/255
+//     apart) has dd ≈ 1.5e-5, where 3/dd ≈ 2e5 overflows f16 (max 65504) to
+//     +inf and the projection dots go subnormal, turning weights and the LSQ
+//     refit to garbage (banding on smooth gradients). Scaling dir by 32 puts
+//     every intermediate in f16's normal range; s = dot·(32·3/dd₃₂) is the
+//     same quantity (worst case inv = 96/0.0157 ≈ 6.1e3).
 //   • The seed pass only accumulates the LSQ sums (no weight output) — the
 //     final weights come from reprojecting against the refit endpoints.
 //   • Endpoint ordering (the blue-contraction rule: sum(e0.rgb) must not
@@ -30,20 +36,27 @@ struct Fit { e0: h4, e1: h4, valid: bool };
 fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   var out: Fit;
   out.valid = false;
-  let dir = e1 - e0;
+  // dir pre-scaled by 32 to keep dd and the projection dots in f16's normal
+  // range (see header). Spans below ~0.7 of an 8-bit step (dd₃₂ < 0.008,
+  // possible only for non-8-bit sources) are treated as flat.
+  let dir = (e1 - e0) * h(32.0);
   let dd = dot(dir, dir);
-  if (dd == h(0.0)) { return out; }
-  let inv = h(3.0) / dd;
+  if (dd < h(0.008)) { return out; }
+  let inv = h(96.0) / dd; // 32·3/dd₃₂ ≡ 3/dd
   var sAA = h(0.0); var sBB = h(0.0); var sAB = h(0.0);
   var sAV = h4(0.0); var sBV = h4(0.0);
   var s_min = h(3.0); var s_max = h(0.0);
+  // Value sums accumulate v − e0 (basis is affine, a + b = 1, so the fit
+  // commutes with the shift): accumulators scale with the block span, keeping
+  // f16 rounding a fraction of the span instead of ±1 level at high absolute
+  // values.
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let v = (*pix)[k];
-    let s = clamp(floor(dot(v - e0, dir) * inv + h(0.5)), h(0.0), h(3.0));
+    let vr = (*pix)[k] - e0;
+    let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), h(3.0));
     s_min = min(s_min, s); s_max = max(s_max, s);
     let b = s * h(1.0 / 3.0); let a = h(1.0) - b;
     sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAV = sAV + a * v; sBV = sBV + b * v;
+    sAV = sAV + a * vr; sBV = sBV + b * vr;
   }
   // Rank-1 guard: if every pixel projects to ONE level the system is
   // singular — det/numerators are pure f16 rounding noise and the solve
@@ -52,8 +65,8 @@ fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   if (s_min == s_max) { return out; }
   let det = sAA * sBB - sAB * sAB;
   if (abs(det) < h(0.5)) { return out; }
-  out.e0 = clamp((sBB * sAV - sAB * sBV) / det, h4(0.0), h4(1.0));
-  out.e1 = clamp((sAA * sBV - sAB * sAV) / det, h4(0.0), h4(1.0));
+  out.e0 = clamp(e0 + (sBB * sAV - sAB * sBV) / det, h4(0.0), h4(1.0));
+  out.e1 = clamp(e0 + (sAA * sBV - sAB * sAV) / det, h4(0.0), h4(1.0));
   out.valid = true;
   return out;
 }
@@ -96,10 +109,12 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Weight pass, packing on the fly: weight k's lsb at bit 31−2k of the last
   // word, msb at bit 30−2k.
   var w3: u32 = 0u;
-  let dir = d1 - d0;
+  // Same ×32 pre-scale as proj_fit; distinct 8-bit endpoints are ≥1/255
+  // apart (dd₃₂ ≥ 0.0157), so the threshold only catches identical ones.
+  let dir = (d1 - d0) * h(32.0);
   let dd = dot(dir, dir);
-  if (dd > h(0.0)) {
-    let inv = h(3.0) / dd;
+  if (dd >= h(0.008)) {
+    let inv = h(96.0) / dd;
     for (var k: u32 = 0u; k < 16u; k = k + 1u) {
       let s = u32(clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(3.0)));
       w3 = w3 | ((s & 1u) << (31u - 2u * k)) | (((s >> 1u) & 1u) << (30u - 2u * k));
