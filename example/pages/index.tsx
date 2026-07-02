@@ -2,7 +2,7 @@ import { Suspense, useCallback, useState } from 'react'
 
 import { OrbitControls } from '@react-three/drei/webgpu'
 import { Canvas, useLoader } from '@react-three/fiber/webgpu'
-import { LinearFilter, NoToneMapping, RepeatWrapping, SRGBColorSpace, TextureLoader } from 'three'
+import { LinearFilter, NoToneMapping, SRGBColorSpace, TextureLoader } from 'three'
 
 import DropZone from '../components/DropZone'
 import InfoPanel from '../components/InfoPanel'
@@ -31,7 +31,6 @@ const CompressedSphere = ({ url, onResult }: { url: string; onResult: (result: E
 const OriginalSphere = ({ url }: { url: string }) => {
   const texture = useLoader(TextureLoader, url)
   texture.colorSpace = SRGBColorSpace
-  texture.wrapS = texture.wrapT = RepeatWrapping
   texture.minFilter = LinearFilter
   texture.magFilter = LinearFilter
   texture.generateMipmaps = false

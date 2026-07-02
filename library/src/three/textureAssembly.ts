@@ -7,11 +7,11 @@
 // the two encoder hierarchies can't drift apart.
 
 import {
+  ClampToEdgeWrapping,
   CompressedTexture,
   LinearFilter,
   LinearMipmapLinearFilter,
   LinearSRGBColorSpace,
-  RepeatWrapping,
   SRGBColorSpace,
 } from 'three'
 
@@ -56,7 +56,12 @@ export function assembleCompressedTexture(
   texture.magFilter = LinearFilter
   texture.minFilter = levels.length > 1 ? LinearMipmapLinearFilter : LinearFilter
   texture.generateMipmaps = false
-  texture.wrapS = texture.wrapT = RepeatWrapping
+  // Clamp, not repeat (matches three.js's own default): with linear filtering,
+  // repeat wrapping blends UV-0/1 border samples with the OPPOSITE edge of the
+  // image — a 1-px halo of foreign colours around a plane — and on NPOT
+  // sources it would bleed the block-padding strip into the far borders too.
+  // Callers that tile can still set RepeatWrapping on the returned texture.
+  texture.wrapS = texture.wrapT = ClampToEdgeWrapping
   texture.needsUpdate = true
   texture.userData.logicalWidth = base.width
   texture.userData.logicalHeight = base.height

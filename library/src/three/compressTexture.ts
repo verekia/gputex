@@ -21,7 +21,7 @@
 // webgl/webglContext.ts) and runs the *fast* encoders only; the `quality`
 // option and `device`/`adapter` options apply to the WebGPU path only.
 
-import { LinearFilter, LinearSRGBColorSpace, RepeatWrapping, SRGBColorSpace, Texture } from 'three'
+import { ClampToEdgeWrapping, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace, Texture } from 'three'
 
 import { Encoder, type EncodeQuality } from '../Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
@@ -255,7 +255,9 @@ function wrapUncompressed(bitmap: ImageBitmap, srgb: boolean, flipY: boolean): T
   tex.colorSpace = srgb ? SRGBColorSpace : LinearSRGBColorSpace
   tex.magFilter = LinearFilter
   tex.minFilter = LinearFilter
-  tex.wrapS = tex.wrapT = RepeatWrapping
+  // Same wrap mode as the compressed tiers (see textureAssembly.ts) so the
+  // fallback renders identically at UV borders.
+  tex.wrapS = tex.wrapT = ClampToEdgeWrapping
   tex.generateMipmaps = false
   tex.flipY = flipY
   tex.needsUpdate = true
