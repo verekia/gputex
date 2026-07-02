@@ -6,9 +6,8 @@
 // blocks) at the exact projection extents, quantised directly (no LSQ refit —
 // mode 6's 16-level palette leaves it under 0.15 dB) → one projection-based
 // index-assignment pass (palette is colinear, so the nearest entry is found
-// by projecting onto the endpoint line — O(1) per pixel). Mirrors the
-// `QUALITY_HIGH == 0` branch of bc7.wgsl; see that file for the mode-6 bit
-// layout and rationale.
+// by projecting onto the endpoint line — O(1) per pixel). Same algorithm as
+// bc7.wgsl; see that file for the mode-6 bit layout and rationale.
 //
 // Determinism note: the WGSL refit uses round() (half-to-even); here we use
 // floor(x + 0.5) for portability. The two differ only at exact .5 ties, a

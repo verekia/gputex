@@ -21,7 +21,6 @@ import { compressTexture, type CompressResult } from './compressTexture.js'
 
 import type { Texture } from 'three'
 
-import type { EncodeQuality } from '../Encoder.js'
 import type { PreferredFormat, TextureHint } from '../selectFormat.js'
 import type { SvgRasterSize } from '../svg.js'
 
@@ -46,8 +45,6 @@ export class GputexLoader extends Loader<Texture> {
   flipY: boolean = true
   /** Generate + encode a full mip chain. Default false. */
   mipmaps: boolean = false
-  /** Encode quality / speed trade-off. Default 'fast' (~2–4× faster, ≤0.36 dB). */
-  quality: EncodeQuality = 'fast'
   /**
    * Optional pre-existing WebGPU device. Reusing the renderer's device
    * avoids spinning up a second WebGPU context for encoding.
@@ -83,7 +80,6 @@ export class GputexLoader extends Loader<Texture> {
       svgSize: this.svgSize,
       flipY: this.flipY,
       mipmaps: this.mipmaps,
-      quality: this.quality,
       device: this.device,
       adapter: this.adapter,
     }).then(

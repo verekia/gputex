@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useMemo, useState } from 'react'
 
-import type { EncoderConstructor, EncodeQuality } from 'gputex'
+import type { EncoderConstructor } from 'gputex'
 
 import { OrbitControls } from '@react-three/drei/webgpu'
 import { Canvas, useLoader } from '@react-three/fiber/webgpu'
@@ -123,11 +123,10 @@ const CompareView = ({
   colorSpace,
   reconstructNormal = false,
 }: CompareViewProps) => {
-  const [quality, setQuality] = useState<EncodeQuality>('fast')
   const [pixelated, setPixelated] = useState(false)
   const [showOriginal, setShowOriginal] = useState(false)
 
-  const { texture, info, error, loading } = useEncodedTexture(url, encoder, { colorSpace, quality })
+  const { texture, info, error, loading } = useEncodedTexture(url, encoder, { colorSpace })
 
   const aspect = info ? info.width / info.height : 1
 
@@ -215,7 +214,6 @@ const CompareView = ({
           <>
             <div className="border-t border-white/10 pt-2">
               <Row label="Format" value={info?.format ?? (loading ? 'Encoding…' : '—')} />
-              <Row label="Quality" value={quality} />
               <Row label="Resolution" value={info ? `${info.width} × ${info.height} px` : '—'} />
               <Row label="Encode time" value={info ? `${info.encodeMs.toFixed(2)} ms` : '—'} />
             </div>
@@ -228,23 +226,6 @@ const CompareView = ({
         )}
 
         <div className="mt-3 flex flex-col gap-2 border-t border-white/10 pt-3">
-          <div className="flex items-center gap-2">
-            <span className="w-16 text-xs text-gray-400">Quality</span>
-            <div className="flex overflow-hidden rounded-lg border border-white/15">
-              {(['fast', 'high'] as const).map(q => (
-                <button
-                  key={q}
-                  type="button"
-                  onClick={() => setQuality(q)}
-                  className={`px-3 py-1 font-mono text-xs transition-colors ${
-                    quality === q ? 'bg-blue-500 text-white' : 'text-gray-300 hover:bg-white/10'
-                  }`}
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          </div>
           <label className="flex cursor-pointer items-center gap-2">
             <input
               type="checkbox"

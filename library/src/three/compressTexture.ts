@@ -23,7 +23,7 @@
 
 import { ClampToEdgeWrapping, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace, Texture } from 'three'
 
-import { Encoder, type EncodeQuality } from '../Encoder.js'
+import { Encoder } from '../Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
 import { selectFormat, type PreferredFormat, type TextureHint } from '../selectFormat.js'
 import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from '../svg.js'
@@ -82,14 +82,6 @@ export interface CompressOptions {
   flipY?: boolean
   /** Generate a full mip chain down to 1×1 on the CPU, encode every level. */
   mipmaps?: boolean
-  /**
-   * Encode quality / speed trade-off. 'fast' (default) is ~2–4× faster for a
-   * ≤0.36 dB PSNR cost; 'high' runs the exhaustive search (output identical to
-   * the CPU reference encoders; for BC1, a principal-axis seed + iterative
-   * refit). No effect on the WebGL fallback (which always uses the fast
-   * encoders).
-   */
-  quality?: EncodeQuality
   /** Reuse an existing device (e.g. Three.js's renderer device) instead
    *  of creating a new one. WebGPU path only. When provided, the encoder
    *  never destroys it. */
@@ -279,7 +271,6 @@ export async function compressTexture(
     svgSize,
     flipY = true,
     mipmaps = false,
-    quality = 'fast',
     device: providedDevice,
     adapter: providedAdapter,
   } = options
@@ -343,9 +334,9 @@ export async function compressTexture(
         if (needsWriteTexture) {
           const level0 = bitmapToMipLevel(bitmap, flipY)
           const imageData = mipLevelToImageData(level0)
-          bytes = await encoder.encodeToBytes(imageData, { quality })
+          bytes = await encoder.encodeToBytes(imageData)
         } else {
-          bytes = await encoder.encodeToBytes(bitmap, { flipY, quality })
+          bytes = await encoder.encodeToBytes(bitmap, { flipY })
         }
         const tex = buildCompressedTexture([bytes], selection.format)
         return {
@@ -375,7 +366,7 @@ export async function compressTexture(
       for (const level of chain) {
         const padded = padToBlockMultiple(level)
         const imageData = mipLevelToImageData(padded)
-        const bytes = await encoder.encodeToBytes(imageData, { quality })
+        const bytes = await encoder.encodeToBytes(imageData)
         encodedLevels.push(bytes)
         totalEncodeMs += bytes.encodeMs
       }

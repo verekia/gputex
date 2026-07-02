@@ -5,9 +5,9 @@
 // slow, block-at-a-time TypeScript implementations meant for test suites and
 // benchmarks (e.g. the browser GPU test page in the example app) that need to:
 //
-//   • check `quality: 'high'` GPU output against the reference (byte-equal
-//     up to FP tie-breaks)
-//   • decode compressed blocks on the CPU to compute PSNR for the fast paths
+//   • gate GPU output against the exhaustive reference encode, per block and
+//     in aggregate PSNR (the reference is the quality yardstick)
+//   • decode compressed blocks on the CPU to compute PSNR
 //
 // Keeping them behind a dedicated entry keeps `gputex` itself lean while
 // letting any consumer verify encoder output without re-deriving the formats.

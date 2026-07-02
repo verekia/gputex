@@ -47,20 +47,9 @@ export interface EncoderOptions {
   disableF16?: boolean
 }
 
-/**
- * Encoder quality level. 'fast' (default) uses the projection-based paths in
- * the shaders — an order of magnitude faster for a ≤0.65 dB PSNR cost. 'high'
- * runs the exhaustive search, matching the CPU reference encoders
- * block-for-block (byte-identical up to FP tie-breaks with equal error).
- * BC1's 'high' adds a principal-axis endpoint seed and iterative refit.
- */
-export type EncodeQuality = 'fast' | 'high'
-
 export interface EncodeCallOptions {
   /** Tags the output color space. Forced 'linear' for encoders with supportsSrgb=false. */
   colorSpace?: 'srgb' | 'linear'
-  /** Encode quality / speed trade-off. Default 'fast'. */
-  quality?: EncodeQuality
 }
 
 /**
@@ -154,20 +143,10 @@ export abstract class Encoder {
   readonly adapter?: GPUAdapter
   readonly ownsDevice: boolean
   readonly disableF16: boolean
-  // f32 module — created lazily by `_ensureModule()`: when the f16 fast
-  // module exists it serves the default path, so parsing/validating the
-  // (larger, dual-quality) f32 source is deferred until 'high' or the
-  // forced-f32 fallback is actually requested. Halves encoder construction
-  // cost on f16 hardware.
-  protected _module: GPUShaderModule | null = null
-  // f16 'fast' module — built only when the device supports shader-f16 and the
-  // subclass provides an f16 source. null otherwise (falls back to _module).
-  protected _moduleF16: GPUShaderModule | null = null
-  protected _pipelineF16: GPUComputePipeline | null = null
-  // Default pipeline (fast). Kept as a field for back-compat; the per-quality
-  // cache below holds the specialised pipelines for encoders that support it.
+  // The single compute pipeline: built from the f16 module when the device
+  // supports shader-f16 and the subclass provides an f16 source, from the
+  // f32 module otherwise. Both implement the same algorithm.
   protected _pipeline!: GPUComputePipeline
-  protected _pipelineCache = new Map<EncodeQuality, GPUComputePipeline>()
 
   // -------------------------------------------------------------------- //
   // Per-encoder GPU resource cache. Creating the source texture, output/
@@ -178,8 +157,7 @@ export abstract class Encoder {
   // these; concurrent encodes on the same encoder see `_resourcesBusy` and
   // fall back to transient resources, keeping the API contract unchanged.
   // Buffers are grow-only, the texture is recreated on size change, and the
-  // bind group is cached per pipeline (with `layout: 'auto'` each pipeline
-  // has its own layout) until any bound resource is recreated.
+  // bind group is kept until any bound resource is recreated.
   private _cachedSrcTex: GPUTexture | null = null
   private _cachedSrcW = 0
   private _cachedSrcH = 0
@@ -187,7 +165,7 @@ export abstract class Encoder {
   private _cachedStaging: GPUBuffer | null = null
   private _cachedParams: GPUBuffer | null = null
   private _lastParams: [number, number, number, number] | null = null
-  private _bindGroupCache = new Map<GPUComputePipeline, GPUBindGroup>()
+  private _cachedBindGroup: GPUBindGroup | null = null
   private _resourcesBusy = false
 
   constructor({ device, adapter, ownsDevice = false, disableF16 = false }: EncoderOptions) {
@@ -200,71 +178,17 @@ export abstract class Encoder {
 
   protected _buildPipeline(): void {
     const device = this.device
-    if (this._useF16) {
-      this._moduleF16 = device.createShaderModule({
-        label: `${this.label}-encoder-f16`,
-        code: this.wgslSourceFastF16()!,
-      })
-    } else {
-      this._ensureModule() // subclasses override wgslSource(); stubs throw here
-    }
-    if (this.supportsQuality) {
-      // Eagerly build the default (fast) pipeline so shader compile errors
-      // still surface at construction time, as before.
-      this._pipeline = this._getPipeline('fast')
-    } else {
-      this._pipeline = device.createComputePipeline({
-        label: `${this.label}-encoder-pipeline`,
-        layout: 'auto',
-        compute: { module: this._ensureModule(), entryPoint: 'encode' },
-      })
-    }
-  }
-
-  /** The f32 module, parsed on first use (see `_module`). */
-  protected _ensureModule(): GPUShaderModule {
-    if (!this._module) {
-      this._module = this.device.createShaderModule({
-        label: `${this.label}-encoder`,
-        code: this.wgslSource(),
-      })
-    }
-    return this._module
-  }
-
-  /**
-   * Pipeline for a given quality level. Encoders that don't declare a
-   * `QUALITY_HIGH` override (`supportsQuality === false`, e.g. BC1) ignore the
-   * argument and reuse the single pipeline. Specialised pipelines are cached.
-   */
-  protected _getPipeline(quality: EncodeQuality): GPUComputePipeline {
-    if (!this.supportsQuality) return this._pipeline
-    // 'fast' uses the dedicated f16 module when available — it's a standalone
-    // fast-only shader (no QUALITY_HIGH override). 'high' always uses the f32
-    // module so its output keeps matching the CPU reference.
-    if (quality === 'fast' && this._moduleF16) {
-      if (!this._pipelineF16) {
-        this._pipelineF16 = this.device.createComputePipeline({
-          label: `${this.label}-encoder-pipeline-fast-f16`,
-          layout: 'auto',
-          compute: { module: this._moduleF16, entryPoint: 'encode' },
-        })
-      }
-      return this._pipelineF16
-    }
-    const cached = this._pipelineCache.get(quality)
-    if (cached) return cached
-    const pipeline = this.device.createComputePipeline({
-      label: `${this.label}-encoder-pipeline-${quality}`,
-      layout: 'auto',
-      compute: {
-        module: this._ensureModule(),
-        entryPoint: 'encode',
-        constants: { QUALITY_HIGH: quality === 'high' ? 1 : 0 },
-      },
+    // subclasses override the wgsl source hooks; stubs throw here
+    const useF16 = this._useF16
+    const module = device.createShaderModule({
+      label: `${this.label}-encoder${useF16 ? '-f16' : ''}`,
+      code: useF16 ? this.wgslSourceFastF16()! : this.wgslSource(),
     })
-    this._pipelineCache.set(quality, pipeline)
-    return pipeline
+    this._pipeline = device.createComputePipeline({
+      label: `${this.label}-encoder-pipeline${useF16 ? '-f16' : ''}`,
+      layout: 'auto',
+      compute: { module, entryPoint: 'encode' },
+    })
   }
 
   destroy(): void {
@@ -276,7 +200,7 @@ export abstract class Encoder {
     this._cachedDst = null
     this._cachedStaging = null
     this._cachedParams = null
-    this._bindGroupCache.clear()
+    this._cachedBindGroup = null
     if (this.ownsDevice) this.device.destroy()
   }
 
@@ -301,29 +225,20 @@ export abstract class Encoder {
   }
 
   /**
-   * Whether the shader declares a `QUALITY_HIGH` pipeline-overridable constant
-   * (i.e. has distinct fast/high search paths). Default false (e.g. a stub or a
-   * format with a single path); BC1/BC5/BC7/ASTC override it to true.
-   */
-  get supportsQuality(): boolean {
-    return false
-  }
-
-  /**
-   * Optional f16 WGSL for the 'fast' path. Used only when the device reports the
-   * `shader-f16` feature; the format's f32 `wgslSource()` is the fallback and
-   * `'high'` always uses it. Returns null when there's no f16 variant.
+   * Optional f16 WGSL variant. Used only when the device reports the
+   * `shader-f16` feature; the format's f32 `wgslSource()` is the automatic
+   * fallback. Returns null when there's no f16 variant.
    */
   wgslSourceFastF16(): string | null {
     return null
   }
 
-  /** Whether the f16 fast path is both available and supported on this device. */
+  /** Whether the f16 shader is both available and supported on this device. */
   protected get _useF16(): boolean {
     return !this.disableF16 && this.wgslSourceFastF16() !== null && this.device.features.has('shader-f16')
   }
 
-  /** WGSL compute-shader source. */
+  /** WGSL compute-shader source (f32; the fallback when f16 is unavailable). */
   abstract wgslSource(): string
 
   /** e.g. 'bc1-rgba-unorm-srgb'. */
@@ -352,11 +267,7 @@ export abstract class Encoder {
    */
   async encodeToBytes(
     source: EncoderImageSource,
-    {
-      flipY = false,
-      quality = 'fast',
-      withGpuTime = false,
-    }: { flipY?: boolean; quality?: EncodeQuality; withGpuTime?: boolean } = {},
+    { flipY = false, withGpuTime = false }: { flipY?: boolean; withGpuTime?: boolean } = {},
   ): Promise<EncodeBytesResult> {
     const device = this.device
     // ImageBitmap/VideoFrame/etc. all expose width/height numerically;
@@ -474,13 +385,10 @@ export abstract class Encoder {
         device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
       }
 
-      // 4. Pipeline + bind group. The pipeline is specialised for the
-      //    requested quality level; with `layout: 'auto'` every pipeline has
-      //    its own bind group layout, so cached bind groups are keyed by
-      //    pipeline and dropped whenever a bound resource was recreated.
-      const pipeline = this._getPipeline(quality)
-      if (useCache && (srcTexIsNew || dstIsNew)) this._bindGroupCache.clear()
-      let bindGroup = useCache ? this._bindGroupCache.get(pipeline) : undefined
+      // 4. Bind group, kept until a bound resource is recreated.
+      const pipeline = this._pipeline
+      if (useCache && (srcTexIsNew || dstIsNew)) this._cachedBindGroup = null
+      let bindGroup = useCache ? this._cachedBindGroup : null
       if (!bindGroup) {
         bindGroup = device.createBindGroup({
           label: `${this.label}-bg`,
@@ -491,7 +399,7 @@ export abstract class Encoder {
             { binding: 2, resource: { buffer: paramsBuffer } },
           ],
         })
-        if (useCache) this._bindGroupCache.set(pipeline, bindGroup)
+        if (useCache) this._cachedBindGroup = bindGroup
       }
 
       // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When

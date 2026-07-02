@@ -3,8 +3,8 @@
 //
 // One fragment per 4×4 block. Output is the 8-byte BC1 block as 2 × u32 in
 // outColor.rg (outColor.ba unused); the encoder reads back RGBA32UI and keeps
-// the low two words per block. This is the *fast* path only (the WGSL
-// `QUALITY_HIGH == 0` branch): principal-axis endpoint seed (covariance
+// the low two words per block. Same algorithm as bc1.wgsl:
+// principal-axis endpoint seed (covariance
 // power-iteration; inset bbox on degenerate blocks), RGB565 quantisation,
 // forced 4-colour mode, full 4-entry L2 index search, then up to TWO
 // least-squares endpoint refit rounds, each accepted only when it lowers the

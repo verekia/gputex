@@ -123,10 +123,10 @@ const TestPage = () => {
               <thead>
                 <tr>
                   <Th>Format</Th>
-                  <Th>Quality</Th>
                   <Th>Variant</Th>
                   <Th>Image</Th>
                   <Th>PSNR</Th>
+                  <Th>Reference</Th>
                   <Th>Threshold</Th>
                   <Th>Worst easy block</Th>
                   <Th>Limit</Th>
@@ -136,16 +136,16 @@ const TestPage = () => {
               </thead>
               <tbody>
                 {results.quality.map(q => (
-                  <tr key={`${q.format}-${q.quality}-${q.variant}-${q.image}`}>
+                  <tr key={`${q.format}-${q.variant}-${q.image}`}>
                     <Td>{q.format}</Td>
-                    <Td>{q.quality}</Td>
                     <Td>{q.variant}</Td>
                     <Td>{q.image}</Td>
                     <Td>{fmtDb(q.psnrDb)}</Td>
+                    <Td>{fmtDb(q.refPsnrDb)}</Td>
                     <Td>{q.thresholdDb ? fmtDb(q.thresholdDb) : '—'}</Td>
-                    <Td>{q.quality === 'fast' ? q.worstEasyBlockExcess.toFixed(4) : '—'}</Td>
+                    <Td>{q.worstEasyBlockExcess.toFixed(4)}</Td>
                     <Td>{q.excessLimit !== null ? q.excessLimit.toFixed(2) : '—'}</Td>
-                    <Td>{q.quality === 'fast' ? q.worstBlockExcess.toFixed(2) : '—'}</Td>
+                    <Td>{q.worstBlockExcess.toFixed(2)}</Td>
                     <Td mono={false}>
                       <Badge pass={q.pass} />
                     </Td>
@@ -161,7 +161,6 @@ const TestPage = () => {
               <thead>
                 <tr>
                   <Th>Format</Th>
-                  <Th>Quality</Th>
                   <Th>Variant</Th>
                   <Th>Wall</Th>
                   <Th>GPU pass</Th>
@@ -170,9 +169,8 @@ const TestPage = () => {
               </thead>
               <tbody>
                 {results.perf.map(p => (
-                  <tr key={`${p.format}-${p.quality}-${p.variant}`}>
+                  <tr key={`${p.format}-${p.variant}`}>
                     <Td>{p.format}</Td>
-                    <Td>{p.quality}</Td>
                     <Td>{p.variant}</Td>
                     <Td>{fmtMs(p.wallMsMedian)}</Td>
                     <Td>{fmtMs(p.gpuMsMedian)}</Td>

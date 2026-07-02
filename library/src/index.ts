@@ -22,7 +22,6 @@ export {
   type EncoderOptions,
   type EncoderConstructor,
   type EncodeCallOptions,
-  type EncodeQuality,
   type EncodeBytesResult,
   type FormatVariant,
 } from './Encoder.js'

@@ -27,9 +27,6 @@ export class BC5Encoder extends Encoder {
   override get supportsSrgb(): boolean {
     return false
   }
-  override get supportsQuality(): boolean {
-    return true
-  }
 
   override wgslSource(): string {
     return shaderSource

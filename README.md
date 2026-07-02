@@ -46,14 +46,14 @@ alpha or a normal map.
 
 ## WebGL fallback
 
-WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The two backends are not byte-identical (the WebGPU fast paths use projection assignment and f16 where available), but they implement the same algorithms at the same quality level and the resulting `CompressedTexture` looks the same under either renderer.
+WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The two backends are not byte-identical (the WebGPU shaders use f16 where available), but they implement the same algorithms at the same quality level and the resulting `CompressedTexture` looks the same under either renderer.
 
 The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend` field on the result (`'webgpu' | 'webgl' | 'none'`) tells you which path ran.
 
 Notes on the WebGL path:
 
 - It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present.
-- It always uses the **fast** encoders — the `quality: 'high'` option and the `device` / `adapter` options apply to the WebGPU path only.
+- The `device` / `adapter` options apply to the WebGPU path only.
 - All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas.
 
 ## Usage
@@ -67,38 +67,33 @@ const { texture, format } = await compressTexture('/cobblestone.avif', {
   hint: 'color', // 'color' | 'colorWithAlpha' | 'normal'
   colorSpace: 'srgb',
   mipmaps: true,
-  quality: 'fast', // 'fast' (default) | 'high'
 })
 
 material.map = texture
 ```
 
-#### Quality
+#### The encoding algorithm
 
-`quality` trades encode speed against compression accuracy:
+There is a single encode mode, built to be both fast and high quality: a
+principal-axis endpoint seed (per-block covariance power-iteration — unlike
+a bbox diagonal it follows anti-correlated channels, worth **+2–4 dB on
+normal-map-like content**) plus projection-based index assignment (each
+pixel is projected onto the colinear endpoint line in O(1) instead of
+searching every palette entry), and the block bits packed with
+straight-line constant shifts. The formats with coarse 4-level palettes
+(BC1, ASTC) add up to two least-squares endpoint refit rounds accepted per
+block only when they lower the error, and BC5 one; BC7's 16-level mode-6
+palette makes the refit redundant on a principal-axis seed (≤0.05 dB), so
+it skips it and stays the cheapest per pixel. On GPUs that report the
+`shader-f16` feature everything runs in f16 — the f32 shaders are the
+automatic fallback.
 
-- **`'fast'` (default)** — a principal-axis endpoint seed (per-block
-  covariance power-iteration — unlike a bbox diagonal it follows
-  anti-correlated channels, worth **+2–4 dB on normal-map-like content**)
-  plus projection-based index assignment (each pixel is projected onto the
-  colinear endpoint line in O(1) instead of searching every palette entry),
-  and the block bits packed with straight-line constant shifts. The formats
-  with coarse 4-level palettes (BC1, ASTC) add up to two least-squares
-  endpoint refit rounds accepted per block only when they lower the error,
-  and BC5 one; BC7's 16-level mode-6 palette makes the refit redundant on a
-  principal-axis seed (≤0.05 dB), so its fast path skips it and stays the
-  cheapest per pixel. On GPUs that report the `shader-f16` feature the whole
-  fast path (all four formats, BC1 included) runs in f16 — the f32 path is
-  the automatic fallback. Net vs `'high'` on an Apple GPU: roughly **10–30×
-  faster** depending on format, for a PSNR cost of **≤0.1 dB on the test
-  cards** (BC5 fast matches `'high'` exactly; ASTC fast measures slightly
-  above it) and up to a few dB on adversarial high-frequency noise, where
-  any single-line seed trails `'high'`'s exhaustive search. See the
-  benchmark table below.
-- **`'high'`** — exhaustive endpoint search (farthest-pair seed, full nearest
-  search, p-bit search); matches the CPU reference encoders block-for-block
-  (byte-identical on >96% of blocks; the rest are equal-error FP tie-breaks,
-  enforced by the GPU test suite).
+On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
+per-block reference encoders (BC5 matches the reference exactly; ASTC and
+BC1-on-normal-maps measure slightly above it), trailing only on adversarial
+high-frequency noise, where any single-line seed loses to an exhaustive
+search — while encoding an order of magnitude faster. See the benchmark
+table below.
 
 #### SVG sources
 
@@ -265,20 +260,16 @@ buffers, bind group) across encodes, so repeated encodes — including mip
 chains — skip per-call allocation: in an interleaved A/B this cuts BC7
 end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 
-| Format   | Quality        | Shader | GPU pass    |
-| -------- | -------------- | ------ | ----------- |
-| BC1      | fast (default) | f16    | **0.26 ms** |
-| BC1      | fast           | f32    | 0.46 ms     |
-| BC5      | fast (default) | f16    | **0.26 ms** |
-| BC5      | fast           | f32    | 0.26 ms     |
-| BC7      | fast (default) | f16    | **0.26 ms** |
-| BC7      | fast           | f32    | 0.59 ms     |
-| ASTC 4×4 | fast (default) | f16    | **0.26 ms** |
-| ASTC 4×4 | fast           | f32    | 0.56 ms     |
-| BC1      | high           | f32    | 2.7 ms      |
-| BC5      | high           | f32    | 1.0 ms      |
-| BC7      | high           | f32    | 10.4 ms     |
-| ASTC 4×4 | high           | f32    | 1.6 ms      |
+| Format   | Shader        | GPU pass    |
+| -------- | ------------- | ----------- |
+| BC1      | f16 (default) | **0.26 ms** |
+| BC1      | f32           | 0.46 ms     |
+| BC5      | f16 (default) | **0.26 ms** |
+| BC5      | f32           | 0.26 ms     |
+| BC7      | f16 (default) | **0.26 ms** |
+| BC7      | f32           | 0.59 ms     |
+| ASTC 4×4 | f16 (default) | **0.26 ms** |
+| ASTC 4×4 | f32           | 0.56 ms     |
 
 Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
 timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare
@@ -297,32 +288,31 @@ cd example && bunx next dev     # then open http://localhost:3000/test
 ```
 
 A second page, `/bench`, measures median end-to-end `encodeToBytes()` wall
-time per format across image sizes (256²–4096²) at fast quality — the
-numbers that matter for runtime streaming, where host overhead dominates
-small textures (results on `window.__GPUTEX_BENCH__`).
+time per format across image sizes (256²–4096²) — the numbers that matter
+for runtime streaming, where host overhead dominates small textures
+(results on `window.__GPUTEX_BENCH__`).
 
 The page runs three groups against the live WebGPU device and renders
 PASS/FAIL tables (machine-readable copy on `window.__GPUTEX_TESTS__`):
 
-- **Correctness** — `quality: 'high'` output is compared block-by-block
-  against the CPU reference encoders (`gputex/testing`), including a
-  non-multiple-of-4 image for the clamp-to-edge padding path. Differing blocks
-  must have equal decoded error (FP tie-break tolerance) and the aggregate
-  PSNR delta must be ≤0.05 dB. Plus determinism checks (same input twice →
-  identical bytes).
-- **Quality** — `'fast'` and `'high'` output is CPU-decoded and validated on
-  the FULL 512² test cards (every quadrant stresses a different failure mode)
-  with two gates, for both the f16 and (force-disabled-f16) f32 shaders:
-  aggregate PSNR must beat per-format thresholds pinned ~0.15 dB under the
-  measured baseline, and — because a handful of catastrophically wrong blocks
-  barely moves aggregate PSNR — the worst _easy_ block (one that `'high'`
-  encodes near-losslessly) must not exceed `'high'`'s error by more than a
-  small per-format limit.
+- **Correctness** — determinism (same input twice → identical bytes) and the
+  clamp-to-edge padding path: a non-multiple-of-4 image must land within a
+  couple of dB of the exhaustive CPU reference encode (`gputex/testing`) — a
+  padding bug craters it.
+- **Quality** — GPU output is CPU-decoded and validated on the FULL 1024²
+  test cards (every tile stresses a different failure mode) with two gates,
+  for both the f16 and (force-disabled-f16) f32 shaders: aggregate PSNR must
+  beat per-format thresholds pinned ~0.15 dB under the measured baseline,
+  and — because a handful of catastrophically wrong blocks barely moves
+  aggregate PSNR — the worst _easy_ block (one the exhaustive CPU reference
+  encodes near-losslessly) must not exceed the reference's error by more
+  than a small per-format limit.
 - **Performance** — the benchmark table above: wall + GPU-pass time per
-  format × quality × shader variant.
+  format × shader variant.
 
 The `gputex/testing` entry point exports the CPU reference
-encoders/decoders (`encodeBC7Mode6Block`, `decodeASTC4x4Block`, …) so any
+encoders/decoders (`encodeBC7Mode6Block`, `decodeASTC4x4Block`, …) — the
+exhaustive per-block yardstick the GPU shaders are gated against — so any
 consumer can run the same validation.
 
 ## Requirements

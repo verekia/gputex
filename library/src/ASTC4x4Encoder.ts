@@ -32,9 +32,6 @@ export class ASTC4x4Encoder extends Encoder {
   override get supportsSrgb(): boolean {
     return true
   }
-  override get supportsQuality(): boolean {
-    return true
-  }
 
   override wgslSource(): string {
     return shaderSource

@@ -1,23 +1,18 @@
 // BC7 (BPTC) mode 6 compute shader encoder.
 //
 // One invocation per 4×4 block. Emits 16 bytes = 4 u32s into the storage
-// buffer at `dst[block_index * 4 .. + 3]`.
+// buffer at `dst[block_index * 4 .. + 3]`. This is the f32 fallback;
+// bc7_fast_f16.wgsl is the same algorithm and is preferred when the device
+// reports shader-f16.
 //
-// QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): principal-axis seed (covariance power-iteration; bbox
-//     on degenerate blocks) at the exact projection extents, quantised
-//     directly — no LSQ refit; with the seed on the principal axis, mode 6's
-//     16-level palette leaves the refit under 0.15 dB, unlike the 4-level
-//     BC1/ASTC fast paths which keep theirs — then one pass that projects
-//     each pixel onto the endpoint line (the 16 palette entries are
-//     colinear, so the nearest index is the rounded projection — no palette
-//     build, no 16-entry search), packed on the fly into two nibble words.
-//   high (1): farthest-pair seed, exhaustive p-bit search over all four
-//     (p0,p1) ∈ {0,1}² combos, full 16-entry nearest search, one LSQ refit —
-//     matches bc7_ref.ts up to FP tie-breaks.
-//
-// The fast/high branch is selected at pipeline-compile time, so the driver
-// eliminates the unused code entirely.
+// ALGORITHM: principal-axis seed (covariance power-iteration; bbox on
+// degenerate blocks) at the exact projection extents, quantised directly —
+// no LSQ refit; with the seed on the principal axis, mode 6's 16-level
+// palette leaves the refit under 0.15 dB, unlike the 4-level BC1/ASTC
+// encoders which keep theirs — then one pass that projects each pixel onto
+// the endpoint line (the 16 palette entries are colinear, so the nearest
+// index is the rounded projection — no palette build, no 16-entry search),
+// packed on the fly into two nibble words.
 //
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
 //   bits 0..6    mode field      (0b0000001 — only bit 6 is 1)
@@ -34,9 +29,6 @@
 // summary in bc7_fast_f16.wgsl) — a generic write_bits() helper's dynamic
 // word indexing keeps the output array out of registers.
 
-// 0 = fast (default), 1 = exhaustive/high-quality. Set via pipeline constants.
-override QUALITY_HIGH: u32 = 0u;
-
 struct Params {
   blocks_x: u32,
   blocks_y: u32,
@@ -48,32 +40,6 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-// Mode 6 interpolation weights (× 1/64), fixed by the spec (`W4` in bc7_ref.ts).
-fn w4(i: u32) -> u32 {
-  switch i {
-    case 0u:  { return  0u; }
-    case 1u:  { return  4u; }
-    case 2u:  { return  9u; }
-    case 3u:  { return 13u; }
-    case 4u:  { return 17u; }
-    case 5u:  { return 21u; }
-    case 6u:  { return 26u; }
-    case 7u:  { return 30u; }
-    case 8u:  { return 34u; }
-    case 9u:  { return 38u; }
-    case 10u: { return 43u; }
-    case 11u: { return 47u; }
-    case 12u: { return 51u; }
-    case 13u: { return 55u; }
-    case 14u: { return 60u; }
-    default:  { return 64u; }   // case 15u
-  }
-}
-
-fn interp4(e0: vec4<i32>, e1: vec4<i32>, w: i32) -> vec4<i32> {
-  return ((64 - w) * e0 + w * e1 + vec4<i32>(32)) >> vec4<u32>(6u);
-}
-
 fn to8(v: vec4<f32>) -> vec4<i32> {
   return vec4<i32>(clamp(floor(v * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
 }
@@ -84,9 +50,8 @@ fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
   return e.x + e.y + e.z + e.w;
 }
 
-// Quantize an 8-bit ideal endpoint to (7-bit value, reconstructed 8-bit) under
-// a fixed p-bit, all four channels at once. q7 = round((ideal8 − p)/2); used by
-// both paths.
+// Quantize an 8-bit ideal endpoint to (7-bit value, reconstructed 8-bit)
+// under a fixed p-bit, all four channels at once. q7 = round((ideal8 − p)/2).
 struct QuantPair { seven: vec4<i32>, eight: vec4<i32> };
 fn quantize_endpoint(ideal8: vec4<i32>, p: u32) -> QuantPair {
   let q = vec4<i32>(clamp(
@@ -96,8 +61,6 @@ fn quantize_endpoint(ideal8: vec4<i32>, p: u32) -> QuantPair {
   let eff = (q << vec4<u32>(1u)) | vec4<i32>(i32(p));
   return QuantPair(q, eff);
 }
-
-// ============================ FAST PATH ================================ //
 
 // Endpoint with its chosen p-bit, picked by minimum quantisation error.
 struct Ep { seven: vec4<i32>, eight: vec4<i32>, p: u32 };
@@ -111,10 +74,9 @@ fn pick_ep(ideal: vec4<i32>) -> Ep {
 // Principal colour axis via power-iteration over precomputed, mean-corrected
 // covariance rows (the moments are accumulated for free in the pixel-load
 // loop), seeded with the bbox diagonal. Returns a unit axis, or vec4(0) for
-// a degenerate (constant) block. Same family as bc1.wgsl's principal_axis;
-// used by the fast path to seed the LSQ fit — the bbox diagonal is
-// sign-blind and points across anti-correlated data (normal maps, hue edges)
-// instead of along it.
+// a degenerate (constant) block. Same family as bc1.wgsl's principal_axis —
+// the bbox diagonal alone is sign-blind and points across anti-correlated
+// data (normal maps, hue edges) instead of along it.
 fn principal_axis4(
   c0v: vec4<f32>,
   c1v: vec4<f32>,
@@ -135,121 +97,6 @@ fn principal_axis4(
   return v;
 }
 
-// ============================ HIGH PATH ================================ //
-
-struct Pair { a: vec4<i32>, b: vec4<i32> };
-fn farthest_pair(pixels: ptr<function, array<vec4<i32>, 16>>) -> Pair {
-  var best_d: i32 = 0;
-  var pa = (*pixels)[0];
-  var pb = (*pixels)[1];
-  for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let xi = (*pixels)[i];
-    for (var j: u32 = i + 1u; j < 16u; j = j + 1u) {
-      let d = dist2(xi, (*pixels)[j]);
-      if (d > best_d) { best_d = d; pa = xi; pb = (*pixels)[j]; }
-    }
-  }
-  return Pair(pa, pb);
-}
-
-fn build_palette_6(e0: vec4<i32>, e1: vec4<i32>, pal: ptr<function, array<vec4<i32>, 16>>) {
-  for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    (*pal)[i] = interp4(e0, e1, i32(w4(i)));
-  }
-}
-
-fn assign_all(
-  pixels:  ptr<function, array<vec4<i32>, 16>>,
-  pal:     ptr<function, array<vec4<i32>, 16>>,
-  out_idx: ptr<function, array<u32, 16>>,
-) -> i32 {
-  var err: i32 = 0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let px = (*pixels)[k];
-    var best_i: u32 = 0u;
-    var best_d: i32 = 2147483647;
-    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-      let d = dist2(px, (*pal)[i]);
-      if (d < best_d) { best_d = d; best_i = i; }
-    }
-    (*out_idx)[k] = best_i;
-    err = err + best_d;
-  }
-  return err;
-}
-
-struct BestMode6 {
-  e0_7: vec4<i32>, e1_7: vec4<i32>,
-  p0: u32,         p1: u32,
-  indices: array<u32, 16>,
-  err: i32,
-};
-
-// Exhaustive p-bit search (high path); commits to `*best` only on improvement.
-fn try_pbit_combos(
-  pixels: ptr<function, array<vec4<i32>, 16>>,
-  ideal0: vec4<i32>,
-  ideal1: vec4<i32>,
-  best:   ptr<function, BestMode6>,
-) {
-  var local_best = (*best).err;
-  var pal: array<vec4<i32>, 16>;
-  var tmp: array<u32, 16>;
-  for (var p0: u32 = 0u; p0 < 2u; p0 = p0 + 1u) {
-    let q0 = quantize_endpoint(ideal0, p0);
-    for (var p1: u32 = 0u; p1 < 2u; p1 = p1 + 1u) {
-      let q1 = quantize_endpoint(ideal1, p1);
-      build_palette_6(q0.eight, q1.eight, &pal);
-      let err = assign_all(pixels, &pal, &tmp);
-      if (err < local_best) {
-        local_best = err;
-        (*best).e0_7 = q0.seven;
-        (*best).e1_7 = q1.seven;
-        (*best).p0 = p0;
-        (*best).p1 = p1;
-        (*best).indices = tmp;
-        (*best).err = err;
-      }
-    }
-  }
-}
-
-// Exact-weight LSQ refit (high path); matches bc7_ref.ts `refitEndpointsMode6`.
-struct RefitResult { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
-fn refit_endpoints(
-  pixels: ptr<function, array<vec4<i32>, 16>>,
-  indices: ptr<function, array<u32, 16>>,
-) -> RefitResult {
-  var sAA: f32 = 0.0;
-  var sBB: f32 = 0.0;
-  var sAB: f32 = 0.0;
-  var sAV: vec4<f32> = vec4<f32>(0.0);
-  var sBV: vec4<f32> = vec4<f32>(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let i = (*indices)[k];
-    let a = f32(64u - w4(i)) / 64.0;
-    let b = f32(w4(i)) / 64.0;
-    let v = vec4<f32>((*pixels)[k]);
-    sAA = sAA + a * a;
-    sBB = sBB + b * b;
-    sAB = sAB + a * b;
-    sAV = sAV + a * v;
-    sBV = sBV + b * v;
-  }
-  let det = sAA * sBB - sAB * sAB;
-  var out: RefitResult;
-  if (abs(det) < 1e-9) {
-    out.valid = false;
-    return out;
-  }
-  let e0f = (sBB * sAV - sAB * sBV) / det;
-  let e1f = (sAA * sBV - sAB * sAV) / det;
-  out.e0 = vec4<i32>(clamp(round(e0f), vec4<f32>(0.0), vec4<f32>(255.0)));
-  out.e1 = vec4<i32>(clamp(round(e1f), vec4<f32>(0.0), vec4<f32>(255.0)));
-  out.valid = true;
-  return out;
-}
-
 // ------------------------------- Entry --------------------------------- //
 
 @compute @workgroup_size(8, 8, 1)
@@ -268,8 +115,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   // Load 16 RGBA pixels (8-bit integer domain) and the per-channel bbox,
   // with the covariance moments FUSED in: d = px − pixel0 (first-pixel-
   // relative, so the sums scale with the block's span; d is integer-valued
-  // and ≤255, exact in f32). Only the fast branch consumes the moment
-  // accumulators — the QUALITY_HIGH pipeline dead-code-eliminates them.
+  // and ≤255, exact in f32).
   var pixels: array<vec4<i32>, 16>;
   var lo = vec4<i32>(255);
   var hi = vec4<i32>(0);
@@ -297,81 +143,58 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   let mean = p0f + sd * (1.0 / 16.0);
 
-  // Both branches produce: 7-bit endpoints + p-bits, and the 16 4-bit indices
-  // packed LSB-first into two nibble words (pixel k → bits 4k..4k+3).
-  var e0_7: vec4<i32>;
-  var e1_7: vec4<i32>;
-  var p0: u32;
-  var p1: u32;
+  // Seed endpoints from the block's principal colour axis at the exact
+  // projection extents (see header), quantise, and assign indices in one
+  // projection pass.
+  // Mean-correct the fused moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
+  let sd16 = sd * (1.0 / 16.0);
+  let r0v = c0v - sd.x * sd16;
+  let r1v = c1v - sd.y * sd16;
+  let r2v = c2v - sd.z * sd16;
+  let r3v = c3v - sd.w * sd16;
+  var seed0 = lo;
+  var seed1 = hi;
+  let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
+  if (dot(axis, axis) > 0.0) {
+    // Exact projection extents along the axis. (A Rayleigh-quotient span
+    // estimate was tried in place of this pass — it saves 16 dots but
+    // costs 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ
+    // misjudges two-cluster and outlier blocks. The pass stays.)
+    var t_min: f32 = 1e30;
+    var t_max: f32 = -1e30;
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let t = dot(vec4<f32>(pixels[k]) - mean, axis);
+      t_min = min(t_min, t);
+      t_max = max(t_max, t);
+    }
+    seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
+    seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
+  }
+
+  // The 16 4-bit indices, packed LSB-first into two nibble words
+  // (pixel k → bits 4k..4k+3).
   var ilo: u32 = 0u;
   var ihi: u32 = 0u;
-
-  if (QUALITY_HIGH != 0u) {
-    let fp = farthest_pair(&pixels);
-    var best: BestMode6;
-    best.err = 2147483647;
-    try_pbit_combos(&pixels, fp.a, fp.b, &best);
-    let refit = refit_endpoints(&pixels, &best.indices);
-    if (refit.valid) {
-      try_pbit_combos(&pixels, refit.e0, refit.e1, &best);
-    }
-    e0_7 = best.e0_7; e1_7 = best.e1_7; p0 = best.p0; p1 = best.p1;
+  var ep0 = pick_ep(seed0);
+  var ep1 = pick_ep(seed1);
+  let dir = vec4<f32>(ep1.eight - ep0.eight);
+  let dd = dot(dir, dir);
+  if (dd > 0.0) {
+    let e0f = vec4<f32>(ep0.eight);
+    let inv = 15.0 / dd;
     for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-      ilo = ilo | (best.indices[k] << (k * 4u));
+      let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
+      ilo = ilo | (u32(s) << (k * 4u));
     }
     for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-      ihi = ihi | (best.indices[k] << ((k - 8u) * 4u));
+      let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
+      ihi = ihi | (u32(s) << ((k - 8u) * 4u));
     }
-  } else {
-    // Seed endpoints from the block's principal colour axis (covariance
-    // power-iteration; bbox on degenerate blocks) at the exact projection
-    // extents, quantise, and assign indices in one projection pass. No LSQ
-    // refit: with the seed already on the principal axis, mode 6's 16-level
-    // palette leaves the refit ≤0.05 dB on the colour card and ≤0.15 dB on
-    // the normal card — not worth its two extra 16-pixel passes (the coarse
-    // 4-level BC1/ASTC fast paths DO keep theirs).
-    // Mean-correct the fused moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
-    let sd16 = sd * (1.0 / 16.0);
-    let r0v = c0v - sd.x * sd16;
-    let r1v = c1v - sd.y * sd16;
-    let r2v = c2v - sd.z * sd16;
-    let r3v = c3v - sd.w * sd16;
-    var seed0 = lo;
-    var seed1 = hi;
-    let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
-    if (dot(axis, axis) > 0.0) {
-      // Exact projection extents along the axis. (A Rayleigh-quotient span
-      // estimate was tried in place of this pass — it saves 16 dots but
-      // costs 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ
-      // misjudges two-cluster and outlier blocks. The pass stays.)
-      var t_min: f32 = 1e30;
-      var t_max: f32 = -1e30;
-      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-        let t = dot(vec4<f32>(pixels[k]) - mean, axis);
-        t_min = min(t_min, t);
-        t_max = max(t_max, t);
-      }
-      seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
-      seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
-    }
-    let ep0 = pick_ep(seed0);
-    let ep1 = pick_ep(seed1);
-    let dir = vec4<f32>(ep1.eight - ep0.eight);
-    let dd = dot(dir, dir);
-    if (dd > 0.0) {
-      let e0f = vec4<f32>(ep0.eight);
-      let inv = 15.0 / dd;
-      for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-        let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
-        ilo = ilo | (u32(s) << (k * 4u));
-      }
-      for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-        let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
-        ihi = ihi | (u32(s) << ((k - 8u) * 4u));
-      }
-    }
-    e0_7 = ep0.seven; e1_7 = ep1.seven; p0 = ep0.p; p1 = ep1.p;
   }
+  var e0_7 = ep0.seven;
+  var e1_7 = ep1.seven;
+  var p0 = ep0.p;
+  var p1 = ep1.p;
 
   // Anchor rule — pixel 0's index MSB must be 0. Swapping endpoints reflects
   // every index (i → 15−i), which on packed nibbles is a bitwise NOT.

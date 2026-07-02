@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-import type { EncoderConstructor, EncodeQuality } from 'gputex'
+import type { EncoderConstructor } from 'gputex'
 
 import { encodeToTexture } from 'gputex/three'
 
@@ -19,7 +19,6 @@ export interface EncodedInfo {
   label: string
   /** Concrete GPUTextureFormat string, e.g. 'bc7-rgba-unorm-srgb'. */
   format: string
-  quality: EncodeQuality
   width: number
   height: number
   paddedWidth: number
@@ -33,7 +32,6 @@ export interface EncodedInfo {
 
 interface Options {
   colorSpace?: 'srgb' | 'linear'
-  quality?: EncodeQuality
   /** Bake a vertical flip into the encoded bytes. Default true (matches the
    *  TextureLoader original, which Three flips on upload). */
   flipY?: boolean
@@ -47,7 +45,7 @@ export interface EncodedResult {
 }
 
 export function useEncodedTexture(url: string, EncoderClass: EncoderConstructor, options: Options = {}): EncodedResult {
-  const { colorSpace = 'srgb', quality = 'fast', flipY = true } = options
+  const { colorSpace = 'srgb', flipY = true } = options
   const [result, setResult] = useState<EncodedResult>({ texture: null, info: null, error: null, loading: true })
 
   useEffect(() => {
@@ -81,7 +79,7 @@ export function useEncodedTexture(url: string, EncoderClass: EncoderConstructor,
         const bitmap = await createImageBitmap(blob, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' })
 
         encoder = await EncoderClass.create()
-        const { texture: built, ...bytes } = await encodeToTexture(encoder, bitmap, { flipY, quality, colorSpace })
+        const { texture: built, ...bytes } = await encodeToTexture(encoder, bitmap, { flipY, colorSpace })
         bitmap.close()
         texture = built
 
@@ -92,7 +90,6 @@ export function useEncodedTexture(url: string, EncoderClass: EncoderConstructor,
           info: {
             label: encoder.label,
             format: encoder.gpuTextureFormat({ colorSpace: effSrgb ? 'srgb' : 'linear' }),
-            quality,
             width: bytes.width,
             height: bytes.height,
             paddedWidth: bytes.paddedWidth,
@@ -117,7 +114,7 @@ export function useEncodedTexture(url: string, EncoderClass: EncoderConstructor,
       texture?.dispose()
       encoder?.destroy()
     }
-  }, [url, EncoderClass, colorSpace, quality, flipY])
+  }, [url, EncoderClass, colorSpace, flipY])
 
   return result
 }

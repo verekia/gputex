@@ -27,15 +27,12 @@ describe('BC1Encoder metadata', () => {
     expect(view.label).toBe('bc1')
     expect(view.bytesPerBlock).toBe(8)
     expect(view.supportsSrgb).toBe(true)
-    // BC1 now has distinct fast/high paths driven by a QUALITY_HIGH constant.
-    expect(view.supportsQuality).toBe(true)
     const src: string = view.wgslSource()
     expect(typeof src).toBe('string')
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
-    // Sanity: the shader exposes the quality-related helpers by name.
-    expect(src).toContain('override QUALITY_HIGH')
-    expect(src).toContain('fn refit')
+    // Sanity: the shader exposes the BC1-specific helpers by name.
+    expect(src).toContain('fn project_stats')
     expect(src).toContain('fn principal_axis')
   })
 })
@@ -48,8 +45,6 @@ describe('f16 fast shader variants', () => {
       expect(typeof src).toBe('string')
       expect(src).toContain('enable f16')
       expect(src).toContain('@compute')
-      // The f16 modules are standalone fast-only shaders — no QUALITY_HIGH.
-      expect(src).not.toContain('QUALITY_HIGH')
     }
   })
 })
@@ -96,8 +91,8 @@ describe('BC7Encoder', () => {
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
     // Sanity: the shader exposes the BC7-specific helpers by name.
-    expect(src).toContain('farthest_pair')
-    expect(src).toContain('build_palette_6')
+    expect(src).toContain('principal_axis4')
+    expect(src).toContain('pick_ep')
     expect(src).toMatch(/Mode 6/i)
   })
 })
@@ -121,8 +116,8 @@ describe('ASTC4x4Encoder', () => {
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
     // Sanity: the shader exposes the ASTC-specific helpers by name.
-    expect(src).toContain('weight_unq')
-    expect(src).toContain('build_palette')
+    expect(src).toContain('principal_axis4')
+    expect(src).toContain('proj_fit')
     expect(src).toMatch(/CEM 12/i)
   })
 })

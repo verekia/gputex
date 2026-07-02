@@ -6,8 +6,7 @@
 // grid with 2-bit weights (QUANT_4), 8-bit endpoints (QUANT_256). Fast path:
 // principal-axis seed (covariance power-iteration; bbox on degenerate blocks)
 // → one LSQ refit fused into a projection weight assignment (4 colinear
-// levels). Mirrors the `QUALITY_HIGH == 0` branch of astc4x4.wgsl; see that file
-// for the 128-bit block layout.
+// levels). Mirrors astc4x4.wgsl; see that file for the 128-bit block layout.
 //
 // Determinism note: floor(x + 0.5) replaces WGSL round() for the refit endpoints
 // (sub-LSB difference at exact .5 ties only).

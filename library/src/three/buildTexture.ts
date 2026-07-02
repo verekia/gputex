@@ -15,7 +15,7 @@ import { assembleCompressedTexture, type EncodedLevel } from './textureAssembly.
 
 import type { CompressedPixelFormat, CompressedTexture } from 'three'
 
-import type { Encoder, EncoderImageSource, EncodeQuality } from '../Encoder.js'
+import type { Encoder, EncoderImageSource } from '../Encoder.js'
 
 /**
  * Logical format → Three.js `CompressedPixelFormat`. sRGB and linear variants
@@ -72,8 +72,6 @@ export interface EncodeResult {
 export interface EncodeToTextureOptions {
   /** Pick the sRGB or linear variant of the encoder's format. Default 'srgb'. */
   colorSpace?: 'srgb' | 'linear'
-  /** Encode quality / speed trade-off. Default 'fast'. */
-  quality?: EncodeQuality
   /** Flip the image vertically before encoding. Default false. */
   flipY?: boolean
 }
@@ -87,7 +85,7 @@ export interface EncodeToTextureOptions {
 export async function encodeToTexture(
   encoder: Encoder,
   source: EncoderImageSource,
-  { colorSpace = 'srgb', quality = 'fast', flipY = false }: EncodeToTextureOptions = {},
+  { colorSpace = 'srgb', flipY = false }: EncodeToTextureOptions = {},
 ): Promise<EncodeResult> {
   // Each concrete encoder exposes its logical formats as a static; pick the
   // sRGB or linear variant the caller asked for (BC5 has only the one).
@@ -95,7 +93,7 @@ export async function encodeToTexture(
   const wantSrgb = colorSpace === 'srgb' && encoder.supportsSrgb
   const format = formats.find(f => isSrgbFormat(f) === wantSrgb) ?? formats[0]!
 
-  const bytes = await encoder.encodeToBytes(source, { flipY, quality })
+  const bytes = await encoder.encodeToBytes(source, { flipY })
   const texture = buildCompressedTexture([bytes], format)
   return { ...bytes, texture }
 }

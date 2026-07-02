@@ -1,6 +1,6 @@
 // Per-size encode benchmark (WebGPU only). Complements /test (which times a
 // single 2048² image): measures median end-to-end encodeToBytes() wall time
-// for each format × image size at fast quality — the numbers that matter for
+// for each format × image size — the numbers that matter for
 // runtime texture streaming, where per-encode host overhead dominates small
 // and medium sizes.
 //
@@ -118,11 +118,12 @@ async function runBench(onProgress: (msg: string) => void): Promise<BenchResult[
     )
   }
 
-  // Ramp the GPU out of its idle clock state before timing anything.
+  // Ramp the GPU out of its idle clock state before timing anything. The
+  // encodes are cheap, so it takes a burst of them to move the clocks.
   onProgress('Warming up GPU clocks…')
-  const bigBitmap = bitmaps.get(2048)!
-  for (let i = 0; i < 10; i++) {
-    await encoders[2]![1].encodeToBytes(bigBitmap, { quality: 'high' })
+  const bigBitmap = bitmaps.get(4096)!
+  for (let i = 0; i < 20; i++) {
+    await encoders[2]![1].encodeToBytes(bigBitmap)
   }
 
   const results: BenchResult[] = []
@@ -131,11 +132,11 @@ async function runBench(onProgress: (msg: string) => void): Promise<BenchResult[
       onProgress(`Benchmark: ${format} fast — ${size}²`)
       const bitmap = bitmaps.get(size)!
       for (let i = 0; i < WARMUP; i++) {
-        await enc.encodeToBytes(bitmap, { quality: 'fast' })
+        await enc.encodeToBytes(bitmap)
       }
       const wall: number[] = []
       for (let i = 0; i < RUNS; i++) {
-        const r = await enc.encodeToBytes(bitmap, { quality: 'fast' })
+        const r = await enc.encodeToBytes(bitmap)
         wall.push(r.encodeMs)
       }
       const wallMsMedian = median(wall)
@@ -180,7 +181,7 @@ const BenchPage = () => {
     <div className="min-h-screen bg-neutral-900 p-6 text-sm text-gray-200">
       <h1 className="text-lg font-semibold text-white">GPUtex — per-size encode benchmark</h1>
       <p className="mb-4 text-xs text-gray-400">
-        Median end-to-end <code>encodeToBytes()</code> wall time, fast quality, {RUNS} runs per cell.
+        Median end-to-end <code>encodeToBytes()</code> wall time, {RUNS} runs per cell.
       </p>
 
       {status === 'running' && (

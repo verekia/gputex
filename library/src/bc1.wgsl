@@ -1,7 +1,9 @@
 // BC1 (DXT1) compute shader encoder.
 //
 // Each invocation encodes one 4x4 pixel block into an 8-byte BC1 block
-// written as 2 x u32 into the destination storage buffer.
+// written as 2 x u32 into the destination storage buffer. This is the f32
+// fallback; bc1_fast_f16.wgsl is the same algorithm and is preferred when
+// the device reports shader-f16.
 //
 // BC1 block layout (little-endian):
 //   u32[0]: color0 (low 16) | color1 (high 16)   both in RGB565
@@ -13,22 +15,14 @@
 //   idx 2 -> (2*color0 +   color1) / 3
 //   idx 3 -> (  color0 + 2*color1) / 3
 //
-// QUALITY LEVELS (pipeline-overridable constant `QUALITY_HIGH`)
-//   fast (0, default): principal-axis endpoint seed (the high path's
-//     covariance power-iteration; inset bbox on degenerate blocks), inset by
-//     ~half a 565 cell along the axis, then a fused pass that projects every
-//     pixel onto the decoded-endpoint line (the 4 palette entries are
-//     colinear and evenly spaced, so the nearest entry is the rounded
-//     projection — no 4-entry search) while accumulating the least-squares
-//     refit sums, followed by up to TWO refit rounds (re-quantise, reproject
-//     with indices packed on the fly, accept only on lower block error).
-//   high (1): endpoints are seeded from the block's principal colour axis
-//     (covariance power-iteration) as well as the bbox diagonal, each refined by
-//     several least-squares passes with full 4-entry searches; the lower-error
-//     family wins. Mirrors bc1_ref.ts.
-
-// 0 = fast (default), 1 = high-quality. Set via pipeline constants.
-override QUALITY_HIGH: u32 = 0u;
+// ALGORITHM: principal-axis endpoint seed (covariance power-iteration; inset
+// bbox on degenerate blocks), inset by ~half a 565 cell along the axis, then
+// a fused pass that projects every pixel onto the decoded-endpoint line (the
+// 4 palette entries are colinear and evenly spaced, so the nearest entry is
+// the rounded projection — no 4-entry search) while accumulating the
+// least-squares refit sums, followed by up to TWO refit rounds (re-quantise,
+// reproject with indices packed on the fly, accept only on lower block
+// error).
 
 struct Params {
   blocks_x: u32,
@@ -65,147 +59,13 @@ fn from565(c: u32) -> vec3<f32> {
   return vec3<f32>(vec3<u32>(r8, g8, b8)) / 255.0;
 }
 
-// 4-color-mode interpolation weights: palette[j] = wa(j)*c0 + wb(j)*c1.
-fn wa(j: u32) -> f32 {
-  switch j {
-    case 0u:  { return 1.0; }
-    case 1u:  { return 0.0; }
-    case 2u:  { return 2.0 / 3.0; }
-    default:  { return 1.0 / 3.0; }   // case 3u
-  }
-}
-fn wb(j: u32) -> f32 {
-  switch j {
-    case 0u:  { return 0.0; }
-    case 1u:  { return 1.0; }
-    case 2u:  { return 1.0 / 3.0; }
-    default:  { return 2.0 / 3.0; }   // case 3u
-  }
-}
-
-fn build_palette(c0: u32, c1: u32, pal: ptr<function, array<vec3<f32>, 4>>) {
-  let p0 = from565(c0);
-  let p1 = from565(c1);
-  for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-    (*pal)[j] = wa(j) * p0 + wb(j) * p1;
-  }
-}
-
-// Assign each of the 16 pixels its nearest palette entry (full 4-entry L2),
-// writing indices into `out_idx` and returning the total squared error.
-fn assign_indices(
-  pixels:  ptr<function, array<vec3<f32>, 16>>,
-  pal:     ptr<function, array<vec3<f32>, 4>>,
-  out_idx: ptr<function, array<u32, 16>>,
-) -> f32 {
-  var err: f32 = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let c = (*pixels)[k];
-    var best_j: u32 = 0u;
-    var best_d: f32 = 1e30;
-    for (var j: u32 = 0u; j < 4u; j = j + 1u) {
-      let d = (*pal)[j] - c;
-      let d2 = dot(d, d);
-      if (d2 < best_d) {
-        best_d = d2;
-        best_j = j;
-      }
-    }
-    (*out_idx)[k] = best_j;
-    err = err + best_d;
-  }
-  return err;
-}
-
-// One least-squares refit pass: solve the 2x2 normal equations for the endpoint
-// colours that minimise Σ‖wa·e0 + wb·e1 − c‖² under the current indices. The
-// three channels share the scalar sums, so it's one 2x2 solve with vec3 RHS.
-struct RefitResult { e0: vec3<f32>, e1: vec3<f32>, valid: bool };
-fn refit(
-  pixels:  ptr<function, array<vec3<f32>, 16>>,
-  indices: ptr<function, array<u32, 16>>,
-) -> RefitResult {
-  var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
-  var sAV: vec3<f32> = vec3<f32>(0.0);
-  var sBV: vec3<f32> = vec3<f32>(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let a = wa((*indices)[k]);
-    let b = wb((*indices)[k]);
-    let v = (*pixels)[k];
-    sAA = sAA + a * a;
-    sBB = sBB + b * b;
-    sAB = sAB + a * b;
-    sAV = sAV + a * v;
-    sBV = sBV + b * v;
-  }
-  var out: RefitResult;
-  let det = sAA * sBB - sAB * sAB;
-  if (abs(det) < 1e-9) {
-    out.valid = false;
-    return out;
-  }
-  out.e0 = clamp((sBB * sAV - sAB * sBV) / det, vec3<f32>(0.0), vec3<f32>(1.0));
-  out.e1 = clamp((sAA * sBV - sAB * sAV) / det, vec3<f32>(0.0), vec3<f32>(1.0));
-  out.valid = true;
-  return out;
-}
-
-// Candidate solution tracked across endpoint seeds / refit passes.
-struct Best { c0: u32, c1: u32, indices: array<u32, 16>, err: f32 };
-
-// Quantize (hi, lo) to 565, force 4-color mode, assign indices, then refine with
-// up to `max_refits` least-squares passes. Commits to `*best` only on strict
-// improvement.
-fn fit_from_endpoints(
-  pixels: ptr<function, array<vec3<f32>, 16>>,
-  hi: vec3<f32>,
-  lo: vec3<f32>,
-  max_refits: u32,
-  best: ptr<function, Best>,
-) {
-  var c0 = to565(hi);
-  var c1 = to565(lo);
-  // 4-color mode requires color0 > color1.
-  if (c0 == c1) {
-    if (c1 > 0u) { c1 = c1 - 1u; } else { c0 = c0 + 1u; }
-  } else if (c0 < c1) {
-    let t = c0; c0 = c1; c1 = t;
-  }
-
-  var pal: array<vec3<f32>, 4>;
-  var idx: array<u32, 16>;
-  build_palette(c0, c1, &pal);
-  var err = assign_indices(pixels, &pal, &idx);
-  if (err < (*best).err) {
-    (*best).c0 = c0; (*best).c1 = c1; (*best).indices = idx; (*best).err = err;
-  }
-
-  for (var rp: u32 = 0u; rp < max_refits; rp = rp + 1u) {
-    let r = refit(pixels, &idx);
-    if (!r.valid) { break; }
-    var nc0 = to565(r.e0);
-    var nc1 = to565(r.e1);
-    // A refit that flips/equalises the endpoints would change decode mode;
-    // keep 4-color mode, and stop once it stops moving.
-    if (nc0 < nc1) { let t = nc0; nc0 = nc1; nc1 = t; }
-    if (nc0 == nc1) { break; }
-    if (nc0 == c0 && nc1 == c1) { break; }
-    build_palette(nc0, nc1, &pal);
-    let nerr = assign_indices(pixels, &pal, &idx);
-    c0 = nc0; c1 = nc1; err = nerr;
-    if (nerr < (*best).err) {
-      (*best).c0 = nc0; (*best).c1 = nc1; (*best).indices = idx; (*best).err = nerr;
-    }
-  }
-}
-
-// One projection pass against the decoded endpoints of (c0,c1), for the fast
-// path: the packed 2-bit indices, the block's squared error, and the LSQ
-// normal-equation sums of the resulting assignment — so an accepted refit
-// can seed the next round. Levels s run 0..3 along p0→p1 (palette = p0,
-// p0+⅓d, p0+⅔d, p1 — colinear, evenly spaced, so rounding the projection IS
-// the nearest-entry search). Level → BC1 index: 0→0 (c0), 1→2 (⅔c0+⅓c1),
-// 2→3, 3→1 (c1); as a packed LUT: (0x78 >> 2L) & 3.
+// One projection pass against the decoded endpoints of (c0,c1): the packed
+// 2-bit indices, the block's squared error, and the LSQ normal-equation sums
+// of the resulting assignment — so an accepted refit can seed the next
+// round. Levels s run 0..3 along p0→p1 (palette = p0, p0+⅓d, p0+⅔d, p1 —
+// colinear, evenly spaced, so rounding the projection IS the nearest-entry
+// search). Level → BC1 index: 0→0 (c0), 1→2 (⅔c0+⅓c1), 2→3, 3→1 (c1); as a
+// packed LUT: (0x78 >> 2L) & 3.
 struct ProjStats {
   indices: u32,
   err: f32,
@@ -250,7 +110,9 @@ fn project_stats(pix: ptr<function, array<vec3<f32>, 16>>, c0: u32, c1: u32) -> 
 }
 
 // Principal colour axis via covariance power-iteration, seeded with the bbox
-// diagonal. Returns a unit axis, or vec3(0) for a degenerate (constant) block.
+// diagonal. Returns a unit axis, or vec3(0) for a degenerate (constant)
+// block. The bbox diagonal alone is sign-blind and points across
+// anti-correlated data (normal maps, hue edges) instead of along it.
 fn principal_axis(
   pixels: ptr<function, array<vec3<f32>, 16>>,
   mean: vec3<f32>,
@@ -310,98 +172,11 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   mean = mean * (1.0 / 16.0);
 
-  // Inset the bounding box by ~half an RGB565 cell (1/16) so the quantized
-  // 4-color palette covers the real data range more tightly (stb_dxt heuristic).
-  let inset = (bb_max - bb_min) / 16.0;
-  let bbox_hi = clamp(bb_max - inset, vec3<f32>(0.0), vec3<f32>(1.0));
-  let bbox_lo = clamp(bb_min + inset, vec3<f32>(0.0), vec3<f32>(1.0));
-
-  if (QUALITY_HIGH == 0u) {
-    // -------- fast: PCA seed + projection + fused LSQ refit + reprojection
-    // Seed endpoints from the block's principal colour axis (same
-    // power-iteration as the high path). The bbox diagonal is sign-blind: on
-    // anti-correlated channels (normal maps, hue edges) it points across the
-    // data instead of along it, and the LSQ refit — which fits endpoints
-    // GIVEN the projection indices — can't recover from a wrong axis.
-    // Degenerate (near-flat) blocks keep the inset-bbox seed.
-    var seed_hi = bbox_hi;
-    var seed_lo = bbox_lo;
-    let axis = principal_axis(&pixels, mean, bb_max - bb_min);
-    if (dot(axis, axis) > 0.0) {
-      var t_min: f32 = 1e30;
-      var t_max: f32 = -1e30;
-      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-        let t = dot(pixels[k] - mean, axis);
-        t_min = min(t_min, t);
-        t_max = max(t_max, t);
-      }
-      // Inset along the axis by ~half a 565 cell (stb_dxt heuristic,
-      // matching the bbox inset).
-      let pad = (t_max - t_min) / 16.0;
-      seed_hi = clamp(mean + (t_max - pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
-      seed_lo = clamp(mean + (t_min + pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
-    }
-    var c0 = to565(seed_hi);
-    var c1 = to565(seed_lo);
-    if (c0 == c1) {
-      if (c1 > 0u) { c1 = c1 - 1u; } else { c0 = c0 + 1u; }
-    } else if (c0 < c1) {
-      let t = c0; c0 = c1; c1 = t;
-    }
-
-    // Fused seed pass, then up to TWO least-squares refit rounds (mirroring
-    // the high path's iterated refits, at projection cost), each accepted
-    // only if the block's squared error actually decreases — the refit
-    // minimises a continuous objective and can lose after 565 quantisation.
-    // Every pass re-accumulates the normal-equation sums, so an accepted
-    // round seeds the next.
-    var cur = project_stats(&pixels, c0, c1);
-    for (var it: u32 = 0u; it < 2u; it = it + 1u) {
-      // Refit only on a well-conditioned system: when every pixel lands on
-      // ONE level (flat blocks — the 4-colour nudge forces c0 ≠ c1 even
-      // then) the system is rank-1 and det/numerators are pure float noise;
-      // the solve would return garbage endpoints. With ≥2 levels
-      // det = Σ_i<j (b_j − b_i)² ≥ ~1.67, so 1e-3 is a safe guard.
-      if (cur.s_min >= cur.s_max) { break; }
-      let det = cur.sAA * cur.sBB - cur.sAB * cur.sAB;
-      if (abs(det) <= 1e-3) { break; }
-      // Clamp the refit to the block bbox (not [0,1]): on multi-cluster
-      // blocks the unconstrained solve extrapolates far outside the block's
-      // colours and the per-channel clamp then bends the hue — fringe pixels
-      // decode to colours that exist nowhere in the block. Constraining to
-      // the bbox also measures better in plain SSE (+1.6 dB on the colour
-      // test card), so the accept-if-better guard below keeps more refits.
-      let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, bb_min, bb_max);
-      let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, bb_min, bb_max);
-      var nc0 = to565(e0);
-      var nc1 = to565(e1);
-      if (nc0 == nc1) {
-        if (nc1 > 0u) { nc1 = nc1 - 1u; } else { nc0 = nc0 + 1u; }
-      } else if (nc0 < nc1) {
-        let t = nc0; nc0 = nc1; nc1 = t;
-      }
-      if (nc0 == c0 && nc1 == c1) { break; }
-      let nxt = project_stats(&pixels, nc0, nc1);
-      if (nxt.err >= cur.err) { break; }
-      c0 = nc0;
-      c1 = nc1;
-      cur = nxt;
-    }
-    let idx_bits = cur.indices;
-
-    let out = block_index * 2u;
-    dst[out]      = c0 | (c1 << 16u);
-    dst[out + 1u] = idx_bits;
-    return;
-  }
-
-  // ------------------------------ high --------------------------------- //
-  var best: Best;
-  best.err = 1e30;
-
-  // Seed from the principal colour axis: project all texels onto it, take the
-  // extreme projections as endpoints, inset along the axis. Then also try the
-  // bbox seed and keep whichever family yields the lower error.
+  // Seed endpoints from the block's principal colour axis at the exact
+  // projection extents, inset by ~half a 565 cell along the axis (stb_dxt
+  // heuristic). Degenerate (near-flat) blocks keep the inset-bbox seed.
+  var seed_hi: vec3<f32>;
+  var seed_lo: vec3<f32>;
   let axis = principal_axis(&pixels, mean, bb_max - bb_min);
   if (dot(axis, axis) > 0.0) {
     var t_min: f32 = 1e30;
@@ -412,18 +187,60 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       t_max = max(t_max, t);
     }
     let pad = (t_max - t_min) / 16.0;
-    let pca_hi = clamp(mean + (t_max - pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
-    let pca_lo = clamp(mean + (t_min + pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
-    fit_from_endpoints(&pixels, pca_hi, pca_lo, 3u, &best);
+    seed_hi = clamp(mean + (t_max - pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
+    seed_lo = clamp(mean + (t_min + pad) * axis, vec3<f32>(0.0), vec3<f32>(1.0));
+  } else {
+    let inset = (bb_max - bb_min) / 16.0;
+    seed_hi = clamp(bb_max - inset, vec3<f32>(0.0), vec3<f32>(1.0));
+    seed_lo = clamp(bb_min + inset, vec3<f32>(0.0), vec3<f32>(1.0));
   }
-  fit_from_endpoints(&pixels, bbox_hi, bbox_lo, 3u, &best);
+  var c0 = to565(seed_hi);
+  var c1 = to565(seed_lo);
+  if (c0 == c1) {
+    if (c1 > 0u) { c1 = c1 - 1u; } else { c0 = c0 + 1u; }
+  } else if (c0 < c1) {
+    let t = c0; c0 = c1; c1 = t;
+  }
 
-  var indices: u32 = 0u;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    indices = indices | ((best.indices[k] & 3u) << (k * 2u));
+  // Fused seed pass, then up to TWO least-squares refit rounds, each
+  // accepted only if the block's squared error actually decreases — the
+  // refit minimises a continuous objective and can lose after 565
+  // quantisation. Every pass re-accumulates the normal-equation sums, so an
+  // accepted round seeds the next.
+  var cur = project_stats(&pixels, c0, c1);
+  for (var it: u32 = 0u; it < 2u; it = it + 1u) {
+    // Refit only on a well-conditioned system: when every pixel lands on
+    // ONE level (flat blocks — the 4-colour nudge forces c0 ≠ c1 even
+    // then) the system is rank-1 and det/numerators are pure float noise;
+    // the solve would return garbage endpoints. With ≥2 levels
+    // det = Σ_i<j (b_j − b_i)² ≥ ~1.67, so 1e-3 is a safe guard.
+    if (cur.s_min >= cur.s_max) { break; }
+    let det = cur.sAA * cur.sBB - cur.sAB * cur.sAB;
+    if (abs(det) <= 1e-3) { break; }
+    // Clamp the refit to the block bbox (not [0,1]): on multi-cluster
+    // blocks the unconstrained solve extrapolates far outside the block's
+    // colours and the per-channel clamp then bends the hue — fringe pixels
+    // decode to colours that exist nowhere in the block. Constraining to
+    // the bbox also measures better in plain SSE (+1.6 dB on the colour
+    // test card), so the accept-if-better guard below keeps more refits.
+    let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, bb_min, bb_max);
+    let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, bb_min, bb_max);
+    var nc0 = to565(e0);
+    var nc1 = to565(e1);
+    if (nc0 == nc1) {
+      if (nc1 > 0u) { nc1 = nc1 - 1u; } else { nc0 = nc0 + 1u; }
+    } else if (nc0 < nc1) {
+      let t = nc0; nc0 = nc1; nc1 = t;
+    }
+    if (nc0 == c0 && nc1 == c1) { break; }
+    let nxt = project_stats(&pixels, nc0, nc1);
+    if (nxt.err >= cur.err) { break; }
+    c0 = nc0;
+    c1 = nc1;
+    cur = nxt;
   }
 
   let out = block_index * 2u;
-  dst[out]      = best.c0 | (best.c1 << 16u);
-  dst[out + 1u] = indices;
+  dst[out]      = c0 | (c1 << 16u);
+  dst[out + 1u] = cur.indices;
 }

@@ -32,11 +32,6 @@ export class BC1Encoder extends Encoder {
   override get supportsSrgb(): boolean {
     return true
   }
-  override get supportsQuality(): boolean {
-    // The shader declares a `QUALITY_HIGH` pipeline-overridable constant: 'fast'
-    // (bbox + one refit) vs 'high' (principal-axis seed + iterative refit).
-    return true
-  }
 
   override wgslSource(): string {
     return shaderSource
