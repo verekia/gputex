@@ -46,7 +46,7 @@ alpha or a normal map.
 
 ## WebGL fallback
 
-WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The WebGPU fast paths have since been rewritten for speed (projection assignment, f16), so the two backends are no longer byte-identical, but they implement the same algorithms at the same quality level and the resulting `CompressedTexture` looks the same under either renderer.
+WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The two backends are not byte-identical (the WebGPU fast paths use projection assignment and f16 where available), but they implement the same algorithms at the same quality level and the resulting `CompressedTexture` looks the same under either renderer.
 
 The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend` field on the result (`'webgpu' | 'webgl' | 'none'`) tells you which path ran.
 
@@ -253,34 +253,24 @@ Measured with the repo's GPU test suite (see below) on an Apple Silicon GPU
 (`metal-3`) in Chrome, encoding a 2048×2048 image. **GPU pass** is the compute
 shader alone (WebGPU timestamp queries, median of 20 runs); end-to-end wall
 time adds ~3–4 ms of image upload + result readback regardless of format.
-"Before" is the shader generation prior to the 2026-07 optimization pass
-(projection-based index assignment everywhere, on-the-fly bit packing, an f16
-BC1 fast shader, straight-line block assembly).
 
-| Format   | Quality        | Shader | GPU pass before | GPU pass after | Speedup   |
-| -------- | -------------- | ------ | --------------- | -------------- | --------- |
-| BC1      | fast (default) | f16    | — (had no f16)  | **0.26 ms**    | **2.8×**¹ |
-| BC1      | fast           | f32    | 0.72 ms         | 0.33 ms        | 2.2×      |
-| BC5      | fast (default) | f16    | 0.33 ms         | **0.20 ms**    | 1.7×      |
-| BC5      | fast           | f32    | 0.79 ms         | 0.39 ms        | 2.0×      |
-| BC7      | fast (default) | f16    | 1.38 ms         | **0.52 ms**    | 2.7×      |
-| BC7      | fast           | f32    | 2.65 ms         | 1.70 ms        | 1.6×      |
-| ASTC 4×4 | fast (default) | f16    | 0.33 ms         | **0.20 ms**    | 1.7×      |
-| ASTC 4×4 | fast           | f32    | 0.72 ms         | 0.66 ms        | 1.1×      |
-| BC1      | high           | f32    | 2.9 ms          | 3.0 ms         | unchanged |
-| BC5      | high           | f32    | 3.4 ms          | 3.4 ms         | unchanged |
-| BC7      | high           | f32    | 14.1 ms         | 14.1 ms        | unchanged |
-| ASTC 4×4 | high           | f32    | 2.6 ms          | 2.4 ms         | unchanged |
+| Format   | Quality        | Shader | GPU pass    |
+| -------- | -------------- | ------ | ----------- |
+| BC1      | fast (default) | f16    | **0.26 ms** |
+| BC1      | fast           | f32    | 0.33 ms     |
+| BC5      | fast (default) | f16    | **0.20 ms** |
+| BC5      | fast           | f32    | 0.39 ms     |
+| BC7      | fast (default) | f16    | **0.52 ms** |
+| BC7      | fast           | f32    | 1.70 ms     |
+| ASTC 4×4 | fast (default) | f16    | **0.20 ms** |
+| ASTC 4×4 | fast           | f32    | 0.66 ms     |
+| BC1      | high           | f32    | 3.0 ms      |
+| BC5      | high           | f32    | 3.4 ms      |
+| BC7      | high           | f32    | 14.1 ms     |
+| ASTC 4×4 | high           | f32    | 2.4 ms      |
 
-¹ vs the old f32 fast shader, which was the only BC1 fast path before. The
-BC1 rows were measured with old and new pipelines interleaved in one session
-(the most noise-robust method); the others are cross-run suite medians.
-
-Per-quadrant PSNR on the committed 512² test card is equal to or better than
-the previous fast encoders everywhere (flat tiles bit-identical, gradients
-+0.01 dB, noise −0.01 dB); the `high` paths still match the CPU reference
-encoders. Timestamps are quantised to 100 µs by Chrome, so sub-millisecond
-figures are ±0.05–0.1 ms.
+Timestamps are quantised to 100 µs by Chrome, so sub-millisecond figures are
+±0.05–0.1 ms.
 
 ## Testing
 
