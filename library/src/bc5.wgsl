@@ -184,10 +184,14 @@ fn encode_bc4(values: ptr<function, array<f32, 16>>, vmin: f32, vmax: f32) -> ve
     if (s_min < s_max) {
       let det = sAA * sBB - sAB * sAB;
       if (abs(det) > 1e-3) {
-        // Clamp the refit to the block's value range (a strict-SSE win vs
-        // clamping to [0,1], same as the other formats' fast paths).
-        let e0 = clamp(r0f + (sBB * sAV - sAB * sBV) / det, vmin, vmax);
-        let e1 = clamp(r0f + (sAA * sBV - sAB * sAV) / det, vmin, vmax);
+        // Clamp to [0,1], NOT the block's value range: for a scalar channel,
+        // endpoints beyond the data range are often genuinely optimal (they
+        // centre the palette levels on the data) and there is no colour axis
+        // to bend — the bbox clamp the colour formats need costs ~0.3 dB
+        // here. The accept-if-better guard still protects against a refit
+        // that loses after quantisation. Matches the high path's clamp.
+        let e0 = clamp(r0f + (sBB * sAV - sAB * sBV) / det, 0.0, 1.0);
+        let e1 = clamp(r0f + (sAA * sBV - sAB * sAV) / det, 0.0, 1.0);
         let n0 = quantize8(e0);
         let n1 = quantize8(e1);
         // Keep 6-interp mode (r0 > r1 strictly); skip the no-op refit.

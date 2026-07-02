@@ -125,10 +125,14 @@ fn encode_bc4(values: ptr<function, array<h, 16>>, vmin: h, vmax: h) -> vec2<u32
   if (s_min < s_max) {
     let det = sAA * sBB - sAB * sAB;
     if (abs(det) > h(0.1)) {
-      // ×16 undoes the accumulator scale; clamp to the block's value range
-      // (a strict-SSE win vs clamping to [0,255], same as the other formats).
-      let e0 = clamp(r0f + (sBB * sAV - sAB * sBV) * h(16.0) / det, vmin, vmax);
-      let e1 = clamp(r0f + (sAA * sBV - sAB * sAV) * h(16.0) / det, vmin, vmax);
+      // ×16 undoes the accumulator scale. Clamp to [0,255], NOT the block's
+      // value range: for a scalar channel, endpoints beyond the data range
+      // are often genuinely optimal (they centre the palette levels on the
+      // data) and there is no colour axis to bend — the bbox clamp the
+      // colour formats need costs ~0.3 dB here. The accept-if-better guard
+      // still protects against a refit that loses after quantisation.
+      let e0 = clamp(r0f + (sBB * sAV - sAB * sBV) * h(16.0) / det, h(0.0), h(255.0));
+      let e1 = clamp(r0f + (sAA * sBV - sAB * sAV) * h(16.0) / det, h(0.0), h(255.0));
       let n0 = u32(floor(e0 + h(0.5)));
       let n1 = u32(floor(e1 + h(0.5)));
       // Keep 6-interp mode (r0 > r1 strictly); skip the no-op refit.

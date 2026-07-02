@@ -107,10 +107,13 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   // baselining a change; the `:normal` colour-format entries track the
   // cross-card matrix without gating). BC7 fast re-baselined after its LSQ
   // refit was dropped (PCA-extents seed + mode 6's 16-level palette make it
-  // redundant, ≤0.05 dB here): 31.84/31.93 fast f16/f32.
+  // redundant, ≤0.05 dB here): 31.84/31.93 fast f16/f32. BC5 fast
+  // re-baselined after its refit clamp widened from the block bbox to [0,1]
+  // (scalar channels have no hue axis to protect): 53.18, now equal to
+  // 'high'.
   'bc1:fast:color': 29.05,
   'bc1:high:color': 29.2,
-  'bc5:fast:normal': 52.7,
+  'bc5:fast:normal': 53.0,
   'bc5:high:normal': 53.0,
   'bc7:fast:color': 31.7,
   'bc7:high:color': 31.8,

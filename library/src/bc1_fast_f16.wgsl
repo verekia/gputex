@@ -11,11 +11,13 @@
 //   3. ONE fused pass: project every pixel onto the decoded-endpoint line
 //      (the 4 palette entries are colinear and evenly spaced, so the nearest
 //      entry is the rounded projection — no 4-entry search) while
-//      accumulating the least-squares refit sums, the seed solution's packed
-//      indices and its squared error
-//   4. re-quantise the refit endpoints, reproject (indices packed on the
-//      fly), and accept the refit only if the block error decreases —
-//      flat/single-level blocks skip this pass entirely
+//      accumulating the least-squares refit sums, the packed indices and the
+//      squared error
+//   4. up to TWO refit rounds (mirroring the high path's iterated refits):
+//      re-quantise the refit endpoints, reproject (indices packed on the
+//      fly, sums re-accumulated to seed the next round), and accept each
+//      round only if the block error decreases — flat/single-level blocks
+//      skip these passes entirely
 //
 // vs the pre-projection fast branch (build palette + full 4-entry search × 3
 // passes + refit sums pass) this does roughly half the ALU per block. The
@@ -61,6 +63,56 @@ fn order565(a: u32, b: u32) -> vec2<u32> {
     let t = c0; c0 = c1; c1 = t;
   }
   return vec2<u32>(c0, c1);
+}
+
+// One projection pass against the decoded endpoints of (c0,c1): the packed
+// 2-bit indices, the block's squared error, and the LSQ normal-equation sums
+// of the resulting assignment — so an accepted refit can seed the next
+// round. Levels s run 0..3 along p0→p1 (palette = p0, p0+⅓d, p0+⅔d, p1 —
+// colinear, evenly spaced, so rounding the projection IS the nearest-entry
+// search). Level → BC1 index: 0→0 (c0), 1→2 (⅔c0+⅓c1), 2→3, 3→1 (c1); as a
+// packed LUT: (0x78 >> 2L) & 3.
+struct Proj {
+  indices: u32,
+  err: h,
+  sAA: h, sBB: h, sAB: h,
+  sAV: h3, sBV: h3,
+  s_min: h, s_max: h,
+};
+fn project_stats(pix: ptr<function, array<h3, 16>>, c0: u32, c1: u32) -> Proj {
+  var out: Proj;
+  out.indices = 0u;
+  out.err = h(0.0);
+  out.sAA = h(0.0); out.sBB = h(0.0); out.sAB = h(0.0);
+  out.sAV = h3(0.0); out.sBV = h3(0.0);
+  out.s_min = h(3.0); out.s_max = h(0.0);
+  let p0 = from565(c0);
+  let p1 = from565(c1);
+  let dir = p1 - p0;
+  let dd = dot(dir, dir);
+  if (dd == h(0.0)) {
+    // Unreachable for distinct 565 codes (the decode is injective); kept so
+    // a degenerate call still returns a consistent error.
+    out.s_min = h(0.0);
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+      let e = (*pix)[k] - p0;
+      out.err = out.err + dot(e, e);
+    }
+    return out;
+  }
+  let inv = h(3.0) / dd;
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let v = (*pix)[k];
+    let s = clamp(floor(dot(v - p0, dir) * inv + h(0.5)), h(0.0), h(3.0));
+    out.s_min = min(out.s_min, s); out.s_max = max(out.s_max, s);
+    let b = s * h(1.0 / 3.0); let a = h(1.0) - b;
+    out.sAA = out.sAA + a * a; out.sBB = out.sBB + b * b; out.sAB = out.sAB + a * b;
+    out.sAV = out.sAV + a * v; out.sBV = out.sBV + b * v;
+    let e = v - (p0 + b * dir);
+    out.err = out.err + dot(e, e);
+    out.indices = out.indices | (((0x78u >> (u32(s) * 2u)) & 3u) << (k * 2u));
+  }
+  return out;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -135,35 +187,15 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let seed = order565(to565(seed_hi), to565(seed_lo));
   var c0 = seed.x;
   var c1 = seed.y;
-  let p0 = from565(c0);
-  let p1 = from565(c1);
 
-  // Fused pass: projection assignment + LSQ normal-equation sums + the seed
-  // solution's packed indices and squared error. Levels s run 0..3 along
-  // p0→p1 (palette = p0, p0+⅓d, p0+⅔d, p1 — colinear, evenly spaced, so
-  // rounding the projection IS the nearest-entry search). Level → BC1 index:
-  // 0→0 (c0), 1→2 (⅔c0+⅓c1), 2→3, 3→1 (c1); as a packed LUT: (0x78 >> 2L) & 3.
-  var indices: u32 = 0u;
-  let dir = p1 - p0;
-  let dd = dot(dir, dir);
-  if (dd > h(0.0)) {
-    let inv = h(3.0) / dd;
-    var sAA = h(0.0); var sBB = h(0.0); var sAB = h(0.0);
-    var sAV = h3(0.0); var sBV = h3(0.0);
-    var s_min = h(3.0); var s_max = h(0.0);
-    var seed_err = h(0.0);
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      let v = pix[k];
-      let s = clamp(floor(dot(v - p0, dir) * inv + h(0.5)), h(0.0), h(3.0));
-      s_min = min(s_min, s); s_max = max(s_max, s);
-      let b = s * h(1.0 / 3.0); let a = h(1.0) - b;
-      sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-      sAV = sAV + a * v; sBV = sBV + b * v;
-      let e = v - (p0 + b * dir);
-      seed_err = seed_err + dot(e, e);
-      indices = indices | (((0x78u >> (u32(s) * 2u)) & 3u) << (k * 2u));
-    }
-    let det = sAA * sBB - sAB * sAB;
+  // Fused seed pass, then up to TWO least-squares refit rounds (mirroring
+  // the high path's iterated refits, at projection cost), each accepted only
+  // if the block's squared error actually decreases — the refit minimises a
+  // continuous objective and can lose after 565 quantisation. Every pass
+  // re-accumulates the normal-equation sums, so an accepted round seeds the
+  // next.
+  var cur = project_stats(&pix, c0, c1);
+  for (var it: u32 = 0u; it < 2u; it = it + 1u) {
     // Refit only on a well-conditioned system. When every pixel lands on ONE
     // level (flat / near-flat blocks — note the 4-colour-mode nudge forces
     // c0 ≠ c1 even for perfectly flat blocks) the system is rank-1: det is 0
@@ -171,43 +203,27 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // noise, so the solve returns garbage endpoints. With ≥2 distinct levels
     // det = Σ_i<j (b_j − b_i)² ≥ 15·(1/3)² ≈ 1.67, far above the ~0.05 f16
     // noise floor — 0.5 separates the two regimes cleanly.
-    if (s_min < s_max && abs(det) > h(0.5)) {
-      // Clamp the refit to the block bbox (not [0,1]): on multi-cluster
-      // blocks the unconstrained solve extrapolates far outside the block's
-      // colours and the per-channel clamp then bends the hue — fringe pixels
-      // decode to colours that exist nowhere in the block. Constraining to
-      // the bbox also measures better in plain SSE (+1.6 dB on the colour
-      // test card), so the accept-if-better guard below keeps more refits.
-      let e0 = clamp((sBB * sAV - sAB * sBV) / det, mn, mxv);
-      let e1 = clamp((sAA * sBV - sAB * sAV) / det, mn, mxv);
-      let refit = order565(to565(e0), to565(e1));
-      let np0 = from565(refit.x);
-      let np1 = from565(refit.y);
-      let ndir = np1 - np0;
-      let ndd = dot(ndir, ndir);
-      if (ndd > h(0.0) && !(refit.x == c0 && refit.y == c1)) {
-        // Reproject against the refit endpoints and accept them only if the
-        // block's squared error actually decreases (the refit minimises a
-        // continuous objective; after 565 quantisation it can lose).
-        let ninv = h(3.0) / ndd;
-        var refit_err = h(0.0);
-        var nindices: u32 = 0u;
-        for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-          let v = pix[k];
-          let s = clamp(floor(dot(v - np0, ndir) * ninv + h(0.5)), h(0.0), h(3.0));
-          let e = v - (np0 + s * h(1.0 / 3.0) * ndir);
-          refit_err = refit_err + dot(e, e);
-          nindices = nindices | (((0x78u >> (u32(s) * 2u)) & 3u) << (k * 2u));
-        }
-        if (refit_err < seed_err) {
-          c0 = refit.x; c1 = refit.y;
-          indices = nindices;
-        }
-      }
-    }
+    if (cur.s_min >= cur.s_max) { break; }
+    let det = cur.sAA * cur.sBB - cur.sAB * cur.sAB;
+    if (abs(det) <= h(0.5)) { break; }
+    // Clamp the refit to the block bbox (not [0,1]): on multi-cluster blocks
+    // the unconstrained solve extrapolates far outside the block's colours
+    // and the per-channel clamp then bends the hue — fringe pixels decode to
+    // colours that exist nowhere in the block. Constraining to the bbox also
+    // measures better in plain SSE (+1.6 dB on the colour test card), so the
+    // accept-if-better guard below keeps more refits.
+    let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, mn, mxv);
+    let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, mn, mxv);
+    let rq = order565(to565(e0), to565(e1));
+    if (rq.x == c0 && rq.y == c1) { break; }
+    let nxt = project_stats(&pix, rq.x, rq.y);
+    if (nxt.err >= cur.err) { break; }
+    c0 = rq.x;
+    c1 = rq.y;
+    cur = nxt;
   }
 
   let o = bi * 2u;
   dst[o] = c0 | (c1 << 16u);
-  dst[o + 1u] = indices;
+  dst[o + 1u] = cur.indices;
 }

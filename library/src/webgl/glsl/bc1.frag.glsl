@@ -6,9 +6,9 @@
 // the low two words per block. This is the *fast* path only (the WGSL
 // `QUALITY_HIGH == 0` branch): principal-axis endpoint seed (covariance
 // power-iteration; inset bbox on degenerate blocks), RGB565 quantisation,
-// forced 4-colour mode, full 4-entry L2 index search, then a single
-// least-squares endpoint refit accepted only when it lowers the block's error.
-// See bc1.wgsl for the full derivation.
+// forced 4-colour mode, full 4-entry L2 index search, then up to TWO
+// least-squares endpoint refit rounds, each accepted only when it lowers the
+// block's error. See bc1.wgsl for the full derivation.
 
 precision highp float;
 precision highp int;
@@ -42,11 +42,44 @@ vec3 from565(uint c) {
   return vec3(r8, g8, b8) / 255.0;
 }
 
+// Per-invocation scratch (mirrors the WGSL function-scope arrays passed by
+// ptr; GLSL would copy array parameters by value).
+vec3 gPixels[16];
+uint gIdx[16];
+
+// Nearest-palette assignment of gPixels for the decoded palette of (c0,c1),
+// with the block's squared error and the LSQ normal-equation sums of the
+// resulting assignment accumulated in the same pass — so an accepted refit
+// can seed the next round.
+struct Assign { float err; float sAA; float sBB; float sAB; vec3 sAV; vec3 sBV; };
+Assign assignStats(uint c0, uint c1, out uint indices[16]) {
+  vec3 p0 = from565(c0);
+  vec3 p1 = from565(c1);
+  vec3 pal[4];
+  for (int j = 0; j < 4; j++) pal[j] = WA[j] * p0 + WB[j] * p1;
+  Assign r = Assign(0.0, 0.0, 0.0, 0.0, vec3(0.0), vec3(0.0));
+  for (int k = 0; k < 16; k++) {
+    vec3 c = gPixels[k];
+    uint bestJ = 0u;
+    float bestD = 1e30;
+    for (int j = 0; j < 4; j++) {
+      vec3 d = pal[j] - c;
+      float d2 = dot(d, d);
+      if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
+    }
+    indices[k] = bestJ;
+    r.err += bestD;
+    float a = WA[int(bestJ)];
+    float b = WB[int(bestJ)];
+    r.sAA += a * a; r.sBB += b * b; r.sAB += a * b; r.sAV += a * c; r.sBV += b * c;
+  }
+  return r;
+}
+
 void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
   ivec2 maxXY = uSrcSize - ivec2(1);
 
-  vec3 pixels[16];
   vec3 bbMin = vec3(1.0);
   vec3 bbMax = vec3(0.0);
   vec3 mean = vec3(0.0);
@@ -54,7 +87,7 @@ void main() {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
     vec3 c = texelFetch(uSrc, ivec2(p.x, sy), 0).rgb;
-    pixels[i] = c;
+    gPixels[i] = c;
     bbMin = min(bbMin, c);
     bbMax = max(bbMax, c);
     mean += c;
@@ -72,7 +105,7 @@ void main() {
   vec3 c1v = vec3(0.0);
   vec3 c2v = vec3(0.0);
   for (int k = 0; k < 16; k++) {
-    vec3 d = pixels[k] - mean;
+    vec3 d = gPixels[k] - mean;
     c0v += d.x * d;
     c1v += d.y * d;
     c2v += d.z * d;
@@ -95,7 +128,7 @@ void main() {
     float tMin = 1e30;
     float tMax = -1e30;
     for (int k = 0; k < 16; k++) {
-      float t = dot(pixels[k] - mean, axis);
+      float t = dot(gPixels[k] - mean, axis);
       tMin = min(tMin, t);
       tMax = max(tMax, t);
     }
@@ -117,78 +150,37 @@ void main() {
     uint tmp = c0; c0 = c1; c1 = tmp;
   }
 
-  // Build the palette in decoded space, assign each pixel its nearest entry.
-  vec3 pal[4];
-  vec3 p0 = from565(c0);
-  vec3 p1 = from565(c1);
-  for (int j = 0; j < 4; j++) pal[j] = WA[j] * p0 + WB[j] * p1;
-
-  uint idx[16];
-  float err = 0.0;
-  for (int k = 0; k < 16; k++) {
-    vec3 c = pixels[k];
-    uint bestJ = 0u;
-    float bestD = 1e30;
-    for (int j = 0; j < 4; j++) {
-      vec3 d = pal[j] - c;
-      float d2 = dot(d, d);
-      if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
-    }
-    idx[k] = bestJ;
-    err += bestD;
-  }
-
-  // One least-squares refit: re-solve the endpoints for the current indices,
-  // re-quantise, re-assign; keep it only if the squared error drops.
-  float sAA = 0.0, sBB = 0.0, sAB = 0.0;
-  vec3 sAV = vec3(0.0), sBV = vec3(0.0);
-  for (int k = 0; k < 16; k++) {
-    float a = WA[int(idx[k])];
-    float b = WB[int(idx[k])];
-    vec3 v = pixels[k];
-    sAA += a * a; sBB += b * b; sAB += a * b; sAV += a * v; sBV += b * v;
-  }
-  float det = sAA * sBB - sAB * sAB;
-  if (abs(det) > 1e-9) {
+  // Seed assignment, then up to TWO least-squares refit rounds (mirroring
+  // bc1.wgsl's fast path), each accepted only if the block's squared error
+  // drops — the refit minimises a continuous objective and can lose after
+  // 565 quantisation. Every assignment pass re-accumulates the sums, so an
+  // accepted round seeds the next.
+  Assign cur = assignStats(c0, c1, gIdx);
+  for (int it = 0; it < 2; it++) {
+    float det = cur.sAA * cur.sBB - cur.sAB * cur.sAB;
+    if (abs(det) <= 1e-9) { break; }
     // Clamp the refit to the block bbox (not [0,1]): on multi-cluster blocks
-    // the unconstrained LSQ solve extrapolates far outside the block's colours
-    // and the per-channel clamp then bends the hue — fringe pixels decode to
-    // colours that exist nowhere in the block. Constraining to the bbox also
-    // measures better in plain SSE (+1.6 dB on the colour test card), so the
-    // accept-if-better guard below keeps more refits.
-    vec3 e0 = clamp((sBB * sAV - sAB * sBV) / det, bbMin, bbMax);
-    vec3 e1 = clamp((sAA * sBV - sAB * sAV) / det, bbMin, bbMax);
+    // the unconstrained LSQ solve extrapolates far outside the block's
+    // colours and the per-channel clamp then bends the hue — fringe pixels
+    // decode to colours that exist nowhere in the block. Constraining to the
+    // bbox also measures better in plain SSE (+1.6 dB on the colour test
+    // card), so the accept-if-better guard below keeps more refits.
+    vec3 e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, bbMin, bbMax);
+    vec3 e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, bbMin, bbMax);
     uint nc0 = to565(e0);
     uint nc1 = to565(e1);
     if (nc0 < nc1) { uint t = nc0; nc0 = nc1; nc1 = t; }
-    if (nc0 != nc1 && !(nc0 == c0 && nc1 == c1)) {
-      vec3 q0 = from565(nc0);
-      vec3 q1 = from565(nc1);
-      vec3 pal2[4];
-      for (int j = 0; j < 4; j++) pal2[j] = WA[j] * q0 + WB[j] * q1;
-      uint idx2[16];
-      float nerr = 0.0;
-      for (int k = 0; k < 16; k++) {
-        vec3 c = pixels[k];
-        uint bestJ = 0u;
-        float bestD = 1e30;
-        for (int j = 0; j < 4; j++) {
-          vec3 d = pal2[j] - c;
-          float d2 = dot(d, d);
-          if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
-        }
-        idx2[k] = bestJ;
-        nerr += bestD;
-      }
-      if (nerr < err) {
-        c0 = nc0; c1 = nc1;
-        for (int k = 0; k < 16; k++) idx[k] = idx2[k];
-      }
-    }
+    if (nc0 == nc1 || (nc0 == c0 && nc1 == c1)) { break; }
+    uint idx2[16];
+    Assign nxt = assignStats(nc0, nc1, idx2);
+    if (nxt.err >= cur.err) { break; }
+    c0 = nc0; c1 = nc1;
+    cur = nxt;
+    for (int k = 0; k < 16; k++) gIdx[k] = idx2[k];
   }
 
   uint indices = 0u;
-  for (int k = 0; k < 16; k++) indices |= (idx[k] & 3u) << (uint(k) * 2u);
+  for (int k = 0; k < 16; k++) indices |= (gIdx[k] & 3u) << (uint(k) * 2u);
 
   outColor = uvec4(c0 | (c1 << 16), indices, 0u, 0u);
 }

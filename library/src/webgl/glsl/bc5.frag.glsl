@@ -73,13 +73,14 @@ uvec2 encodeBC4(float values[16], float vmin, float vmax) {
   Assign seed = assignAll(values, pal, indices);
 
   // One least-squares refit, accepted only if the requantised endpoints lower
-  // the block error. Clamp to the block's value range (a strict-SSE win vs
-  // clamping to [0,1], same as the other formats' fast paths); keep 6-interp
-  // mode (r0 > r1 strictly).
+  // the block error. Clamp to [0,1], NOT the block's value range: for a
+  // scalar channel, endpoints beyond the data range are often genuinely
+  // optimal and there is no colour axis to bend — the bbox clamp the colour
+  // formats need costs ~0.3 dB here. Keep 6-interp mode (r0 > r1 strictly).
   float det = seed.sAA * seed.sBB - seed.sAB * seed.sAB;
   if (abs(det) > 1e-9) {
-    float e0 = clamp((seed.sBB * seed.sAV - seed.sAB * seed.sBV) / det, vmin, vmax);
-    float e1 = clamp((seed.sAA * seed.sBV - seed.sAB * seed.sAV) / det, vmin, vmax);
+    float e0 = clamp((seed.sBB * seed.sAV - seed.sAB * seed.sBV) / det, 0.0, 1.0);
+    float e1 = clamp((seed.sAA * seed.sBV - seed.sAB * seed.sAV) / det, 0.0, 1.0);
     uint n0 = quantize8(e0);
     uint n1 = quantize8(e1);
     if (n0 > n1 && !(n0 == r0 && n1 == r1)) {
