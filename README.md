@@ -261,7 +261,23 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 | `svgSize`         | `number \| { width, height }` | intrinsic | Raster size for SVG sources: longest side (aspect preserved) or exact size                       |
 | `flipY`           | `boolean`                     | `true`    | Flip vertically (matches Three.js convention)                                                    |
 | `mipmaps`         | `boolean`                     | `false`   | Generate full mip chain down to 1x1                                                              |
+| `cache`           | `boolean`                     | `false`   | Session-scoped in-memory cache; repeat calls skip decode + encode (see below)                    |
+| `cacheKey`        | `string`                      | derived   | Explicit cache identity (skips content hashing; makes pixel sources cacheable)                   |
 | `device`          | `GPUDevice`                   | —         | Reuse an existing WebGPU device instead of creating one                                          |
+
+#### In-memory transcode cache
+
+With `cache: true`, the compressed bytes are kept in a session-scoped
+in-memory LRU keyed by source identity (URL, or a content hash for
+Blobs/Files/data URLs) plus the selected format and encode options. Loading
+the same texture again later in the session — say, two worlds sharing an
+atlas — skips **both** the image decode and the encode, the two dominant
+costs: a 4K PNG that takes ~220 ms to decode + encode comes back in ~30 ms
+(content-hashed) or ~2 ms (URL-keyed). Nothing touches persistent storage;
+the cache dies with the page. Total compressed payload is capped at 256 MiB
+with LRU eviction — `setTranscodeCacheLimit(bytes)` tunes it (0 disables),
+`clearTranscodeCache()` empties it (e.g. on world unload). Pixel sources
+(ImageBitmap, canvas, ImageData) are only cached when you pass a `cacheKey`.
 
 When neither `device` nor `adapter` is passed, `compressTexture()` shares one
 WebGPU device and one encoder per format across calls: the first call pays the

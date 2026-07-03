@@ -33,7 +33,7 @@ import {
   encodeBC5Block,
   encodeBC7Mode6Block,
 } from 'gputex/testing'
-import { compressTexture, releaseSharedGpuResources } from 'gputex/three'
+import { clearTranscodeCache, compressTexture, releaseSharedGpuResources, setTranscodeCacheLimit } from 'gputex/three'
 
 type Status = 'running' | 'done' | 'error'
 
@@ -72,6 +72,8 @@ if (typeof window !== 'undefined') {
     encodeASTC4x4Block,
     compressTexture,
     releaseSharedGpuResources,
+    clearTranscodeCache,
+    setTranscodeCacheLimit,
     generateMipChain,
     padToBlockMultiple,
   }

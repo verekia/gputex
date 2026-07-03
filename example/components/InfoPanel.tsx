@@ -79,7 +79,11 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
         <Row label="Backend" value={result ? backendLabel(result.backend) : '—'} />
         <Row label="VRAM" value={compVram ? fmtBytes(compVram) : '—'} />
         <Row label="Encode time" value={result ? `${result.encodeMs.toFixed(1)} ms` : '—'} />
-        <Row label="Total (decode + encode)" value={result ? `${result.totalMs.toFixed(1)} ms` : '—'} />
+        <Row
+          label="Total (decode + encode)"
+          value={result ? `${result.totalMs.toFixed(1)} ms${result.cacheHit ? ' (cache hit)' : ''}` : '—'}
+          highlight={result?.cacheHit}
+        />
       </div>
 
       <div className="border-t border-white/10 pt-2">

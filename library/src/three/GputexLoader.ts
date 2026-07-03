@@ -45,6 +45,10 @@ export class GputexLoader extends Loader<Texture> {
   flipY: boolean = true
   /** Generate + encode a full mip chain. Default false. */
   mipmaps: boolean = false
+  /** Reuse compressed bytes from the session's in-memory transcode cache,
+   *  skipping decode + encode on repeat loads. See `CompressOptions.cache`.
+   *  Default false. */
+  cache: boolean = false
   /**
    * Optional pre-existing WebGPU device. Reusing the renderer's device
    * avoids spinning up a second WebGPU context for encoding.
@@ -80,6 +84,7 @@ export class GputexLoader extends Loader<Texture> {
       svgSize: this.svgSize,
       flipY: this.flipY,
       mipmaps: this.mipmaps,
+      cache: this.cache,
       device: this.device,
       adapter: this.adapter,
     }).then(
@@ -97,6 +102,7 @@ export class GputexLoader extends Loader<Texture> {
           encodeMs: result.encodeMs,
           decodeMs: result.decodeMs,
           totalMs: result.totalMs,
+          cacheHit: result.cacheHit,
           compressedBytes: result.fallbackUncompressed
             ? result.width * result.height * 4
             : (mip0?.data.byteLength ?? 0),

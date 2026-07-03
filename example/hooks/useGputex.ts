@@ -18,6 +18,7 @@ export interface EncodeInfo {
   encodeMs: number
   decodeMs: number
   totalMs: number
+  cacheHit: boolean
   compressedBytes: number
 }
 
@@ -27,6 +28,7 @@ interface UseGputexOptions {
   svgSize?: SvgRasterSize
   flipY?: boolean
   mipmaps?: boolean
+  cache?: boolean
 }
 
 export function useGputex(
@@ -40,6 +42,7 @@ export function useGputex(
     if (options?.svgSize !== undefined) loader.svgSize = options.svgSize
     if (options?.flipY !== undefined) loader.flipY = options.flipY
     if (options?.mipmaps !== undefined) loader.mipmaps = options.mipmaps
+    if (options?.cache !== undefined) loader.cache = options.cache
   })
 
   useLayoutEffect(() => {
@@ -58,6 +61,7 @@ useGputex.preload = (url: string | string[], options?: UseGputexOptions) => {
     if (options?.svgSize !== undefined) loader.svgSize = options.svgSize
     if (options?.flipY !== undefined) loader.flipY = options.flipY
     if (options?.mipmaps !== undefined) loader.mipmaps = options.mipmaps
+    if (options?.cache !== undefined) loader.cache = options.cache
   })
 }
 

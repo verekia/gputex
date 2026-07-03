@@ -19,6 +19,7 @@ export {
   type CompressOptions,
   type CompressResult,
 } from './compressTexture.js'
+export { clearTranscodeCache, setTranscodeCacheLimit } from './transcodeCache.js'
 export { GputexLoader } from './GputexLoader.js'
 export {
   buildCompressedTexture,

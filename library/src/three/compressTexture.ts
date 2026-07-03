@@ -27,13 +27,14 @@ import { ClampToEdgeWrapping, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace
 
 import { Encoder, type EncoderConstructor } from '../Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
-import { selectFormat, type PreferredFormat, type TextureHint } from '../selectFormat.js'
+import { selectFormat, type FormatSelection, type PreferredFormat, type TextureHint } from '../selectFormat.js'
 import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from '../svg.js'
-import { selectWebGLFormat } from '../webgl/selectWebGLFormat.js'
+import { selectWebGLFormat, type WebGLFormatSelection } from '../webgl/selectWebGLFormat.js'
 import { detectWebGLCapabilities } from '../webgl/webglCapabilities.js'
 import { getSharedWebGLContext } from '../webgl/webglContext.js'
 import { needsWriteTextureWorkaround } from '../workarounds.js'
 import { buildCompressedTexture } from './buildTexture.js'
+import { buildTranscodeKey, readTranscodeCache, writeTranscodeCache } from './transcodeCache.js'
 
 import type { CompressedTexture } from 'three'
 
@@ -89,6 +90,26 @@ export interface CompressOptions {
    *  never destroys it. */
   device?: GPUDevice
   adapter?: GPUAdapter
+  /**
+   * Keep the compressed bytes in a session-scoped in-memory LRU and reuse
+   * them on repeat calls, skipping BOTH the image decode and the encode —
+   * the dominant costs. Re-loading a texture later in the session (e.g.
+   * two worlds sharing an atlas) becomes a few ms. Keyed by source
+   * identity + selected format + encode options; capped at 256 MiB of
+   * compressed bytes by default (`setTranscodeCacheLimit()` to tune) and
+   * never touches persistent storage. Default false.
+   *
+   * URL and Blob/File sources get an identity automatically (URL string or
+   * content hash). Pixel sources (ImageBitmap, canvas, ImageData) are only
+   * cached when `cacheKey` is provided.
+   */
+  cache?: boolean
+  /**
+   * Explicit cache identity for the source, overriding the derived one.
+   * Use when you already know a stable name (e.g. an asset path) and want
+   * to skip content hashing, or to make pixel sources cacheable.
+   */
+  cacheKey?: string
 }
 
 export interface CompressResult {
@@ -124,6 +145,9 @@ export interface CompressResult {
   /** Wall-clock time of the whole `compressTexture()` call: decode + CPU
    *  mip generation + encode + texture assembly. */
   totalMs: number
+  /** True when the result came from the in-memory transcode cache (the
+   *  `cache` option) — no decode or encode ran; decodeMs/encodeMs are 0. */
+  cacheHit: boolean
   /** Dispose the texture and release GPU resources owned by this call.
    *  On the default path (no `device`/`adapter` option) the encoder and
    *  device are shared across `compressTexture()` calls and survive this —
@@ -149,6 +173,22 @@ interface SharedGpu {
   adapter: GPUAdapter
   device: GPUDevice
   encoders: Map<EncoderConstructor, Encoder>
+}
+
+/** A resolved WebGPU tier: adapter + a selection guaranteed usable. */
+interface GpuTier {
+  adapter: GPUAdapter
+  shared: SharedGpu | null
+  selection: FormatSelection & { format: TextureFormat; encoderClass: EncoderConstructor }
+}
+
+/** A resolved WebGL2 tier: context + a selection guaranteed usable. */
+interface GlTier {
+  gl: WebGL2RenderingContext
+  selection: WebGLFormatSelection & {
+    format: TextureFormat
+    encoderClass: NonNullable<WebGLFormatSelection['encoderClass']>
+  }
 }
 
 let sharedGpuPromise: Promise<SharedGpu | null> | null = null
@@ -409,20 +449,66 @@ export async function compressTexture(
     svgSize,
     flipY = true,
     mipmaps = false,
+    cache = false,
+    cacheKey,
     device: providedDevice,
     adapter: providedAdapter,
   } = options
 
   const srgb = colorSpace === 'srgb'
   const t0 = performance.now()
+
+  // Resolve backend + format BEFORE touching pixels: format selection only
+  // needs capabilities, and knowing it first lets a transcode-cache hit
+  // skip the image decode and the encode entirely.
+  const gpu = await resolveWebGPU()
+  const gl = gpu ? null : resolveWebGL()
+
+  // Transcode cache lookup (opt-in). The key includes the selected format,
+  // so entries never cross device classes (BC vs ASTC).
+  const activeFormat = gpu?.selection.format ?? gl?.selection.format ?? null
+  let transcodeKey: string | null = null
+  if (cache && activeFormat) {
+    transcodeKey = await buildTranscodeKey(source, cacheKey, {
+      format: activeFormat,
+      colorSpace,
+      flipY,
+      mipmaps,
+      svgSize,
+    })
+    if (transcodeKey) {
+      const hit = readTranscodeCache(transcodeKey)
+      if (hit) {
+        const tex = buildCompressedTexture(hit.levels, hit.format)
+        return {
+          texture: tex,
+          format: hit.format,
+          fallbackUncompressed: false,
+          backend: gpu ? 'webgpu' : 'webgl',
+          astcNormalRemap: (gpu ?? gl)!.selection.astcNormalRemap,
+          width: hit.width,
+          height: hit.height,
+          mipLevels: hit.levels.length,
+          encodeMs: 0,
+          decodeMs: 0,
+          totalMs: performance.now() - t0,
+          cacheHit: true,
+          destroy: () => {
+            tex.dispose()
+          },
+        }
+      }
+    }
+  }
+
+  const tDecode = performance.now()
   const bitmap = await sourceToBitmap(source, svgSize)
-  const decodeMs = performance.now() - t0
+  const decodeMs = performance.now() - tDecode
 
   // Tier 1: WebGPU compute path. Tier 2: WebGL2 fragment-shader fallback.
   // Tier 3: uncompressed RGBA8.
-  const viaWebGPU = await encodeViaWebGPU()
-  if (viaWebGPU) return viaWebGPU
-  const viaWebGL = encodeViaWebGL()
+  if (gpu) return encodeViaWebGPU(gpu)
+  const viaWebGL = gl ? encodeViaWebGL(gl) : null
   if (viaWebGL) return viaWebGL
 
   console.warn(
@@ -442,6 +528,7 @@ export async function compressTexture(
     encodeMs: 0,
     decodeMs,
     totalMs: performance.now() - t0,
+    cacheHit: false,
     destroy: () => {
       tex.dispose()
     },
@@ -449,8 +536,9 @@ export async function compressTexture(
 
   // ----------------------------- WebGPU ------------------------------ //
 
-  /** Returns a compressed result, or null if WebGPU can't produce one. */
-  async function encodeViaWebGPU(): Promise<CompressResult | null> {
+  /** Resolve the WebGPU tier: adapter + a usable format selection, or null
+   *  when this device can't take the compute path. */
+  async function resolveWebGPU(): Promise<GpuTier | null> {
     if (!('gpu' in navigator)) return null
 
     // Resolve the adapter: caller-provided, else the shared one. A provided
@@ -469,7 +557,16 @@ export async function compressTexture(
 
     const selection = selectFormat(adapter, hint, { colorSpace, preferredFormat })
     if (!selection.format || !selection.encoderClass) return null
+    return {
+      adapter,
+      shared,
+      selection: { ...selection, format: selection.format, encoderClass: selection.encoderClass },
+    }
+  }
 
+  /** Encode on the WebGPU tier. The selection is already validated, so any
+   *  failure from here throws rather than falling back. */
+  async function encodeViaWebGPU({ adapter, shared, selection }: GpuTier): Promise<CompressResult> {
     // Instantiate the encoder. Reuse a caller-provided device; on the shared
     // path reuse (or create and cache) the per-format shared encoder;
     // otherwise (adapter-only callers) have the encoder's `create()` request
@@ -507,6 +604,14 @@ export async function compressTexture(
           bytes = await encoder.encodeToBytes(bitmap, { flipY })
         }
         const tex = buildCompressedTexture([bytes], selection.format)
+        if (transcodeKey) {
+          writeTranscodeCache(transcodeKey, {
+            format: selection.format,
+            width: bytes.width,
+            height: bytes.height,
+            levels: [bytes],
+          })
+        }
         return {
           texture: tex,
           format: selection.format,
@@ -519,6 +624,7 @@ export async function compressTexture(
           encodeMs: bytes.encodeMs,
           decodeMs,
           totalMs: performance.now() - t0,
+          cacheHit: false,
           destroy: () => {
             tex.dispose()
             destroyEncoder()
@@ -534,6 +640,14 @@ export async function compressTexture(
       const { levels, encodeMs } = await encoder.encodeMipChainToBytes(chain)
 
       const tex = buildCompressedTexture(levels, selection.format)
+      if (transcodeKey) {
+        writeTranscodeCache(transcodeKey, {
+          format: selection.format,
+          width: level0.width,
+          height: level0.height,
+          levels,
+        })
+      }
       return {
         texture: tex,
         format: selection.format,
@@ -546,6 +660,7 @@ export async function compressTexture(
         encodeMs,
         decodeMs,
         totalMs: performance.now() - t0,
+        cacheHit: false,
         destroy: () => {
           tex.dispose()
           destroyEncoder()
@@ -562,24 +677,37 @@ export async function compressTexture(
 
   // ------------------------------ WebGL ------------------------------ //
 
-  /**
-   * Returns a compressed result, or null if WebGL2 can't produce one. Any
-   * encode failure degrades to null (→ uncompressed) rather than throwing —
-   * the fallback's job is to keep producing a working texture.
-   */
-  function encodeViaWebGL(): CompressResult | null {
+  /** Resolve the WebGL2 tier: shared context + a usable format selection,
+   *  or null when the fallback can't produce a compressed texture. */
+  function resolveWebGL(): GlTier | null {
     const gl = getSharedWebGLContext()
     if (!gl) return null
 
     const caps = detectWebGLCapabilities(gl)
     const selection = selectWebGLFormat(caps, hint, { colorSpace, preferredFormat })
     if (!selection.format || !selection.encoderClass) return null
+    return { gl, selection: { ...selection, format: selection.format, encoderClass: selection.encoderClass } }
+  }
 
+  /**
+   * Encode on the WebGL2 tier. Any encode failure degrades to null
+   * (→ uncompressed) rather than throwing — the fallback's job is to keep
+   * producing a working texture.
+   */
+  function encodeViaWebGL({ gl, selection }: GlTier): CompressResult | null {
     const encoder = selection.encoderClass.create(gl)
     try {
       if (!mipmaps) {
         const bytes = encoder.encodeToBytes(bitmap, { flipY })
         const tex = buildCompressedTexture([bytes], selection.format)
+        if (transcodeKey) {
+          writeTranscodeCache(transcodeKey, {
+            format: selection.format,
+            width: bytes.width,
+            height: bytes.height,
+            levels: [bytes],
+          })
+        }
         return {
           texture: tex,
           format: selection.format,
@@ -592,6 +720,7 @@ export async function compressTexture(
           encodeMs: bytes.encodeMs,
           decodeMs,
           totalMs: performance.now() - t0,
+          cacheHit: false,
           destroy: () => {
             tex.dispose()
             encoder.destroy()
@@ -614,6 +743,14 @@ export async function compressTexture(
       }
 
       const tex = buildCompressedTexture(encodedLevels, selection.format)
+      if (transcodeKey) {
+        writeTranscodeCache(transcodeKey, {
+          format: selection.format,
+          width: level0.width,
+          height: level0.height,
+          levels: encodedLevels,
+        })
+      }
       return {
         texture: tex,
         format: selection.format,
@@ -626,6 +763,7 @@ export async function compressTexture(
         encodeMs: totalEncodeMs,
         decodeMs,
         totalMs: performance.now() - t0,
+        cacheHit: false,
         destroy: () => {
           tex.dispose()
           encoder.destroy()

@@ -6,7 +6,7 @@ import { LinearFilter, NoToneMapping, SRGBColorSpace, TextureLoader } from 'thre
 
 import DropZone from '../components/DropZone'
 import InfoPanel from '../components/InfoPanel'
-import { useGputex } from '../hooks/useGputex'
+import { useCompressedFile } from '../hooks/useCompressedFile'
 
 import type { Texture, CompressedTexture } from 'three'
 
@@ -19,13 +19,14 @@ const Sphere = ({ texture }: { texture: Texture | CompressedTexture | null }) =>
   </mesh>
 )
 
-const CompressedSphere = ({ url, onResult }: { url: string; onResult: (result: EncodeInfo) => void }) => {
-  // svgSize only applies to dropped SVGs: rasterise at 1024 so even tiny /
-  // viewBox-only icons make a crisp sphere texture.
-  const texture = useGputex(url, { hint: 'color', colorSpace: 'srgb', svgSize: 1024 }, (_tex, result) => {
-    if (result) onResult(result)
-  })
-  return <Sphere texture={texture as Texture | CompressedTexture} />
+// The dropped File goes straight to compressTexture() (no URL hop) with the
+// persistent transcode cache on — re-dropping a file skips decode + encode.
+// Keyed by texture so the material remounts with its map already set: the
+// WebGPU node material doesn't rebuild on a null→map swap by itself (the old
+// Suspense path never hit that transition).
+const CompressedSphere = ({ file, onResult }: { file: File; onResult: (result: EncodeInfo) => void }) => {
+  const texture = useCompressedFile(file, onResult)
+  return <Sphere key={texture ? texture.uuid : 'pending'} texture={texture} />
 }
 
 const OriginalSphere = ({ url }: { url: string }) => {
@@ -48,8 +49,8 @@ const IndexPage = () => {
     setFile(droppedFile)
     setResult(null)
     setEncoding(true)
-    // A blob: URL, NOT a FileReader data: URL — fetching a multi-MB base64
-    // data URL costs >1 s in Chrome, ~6× a blob URL fetch of the same file.
+    // Only the "original" sphere needs a URL (TextureLoader takes strings);
+    // the compressed path consumes the File directly.
     setBlobUrl(URL.createObjectURL(droppedFile))
   }, [])
 
@@ -70,10 +71,10 @@ const IndexPage = () => {
         <directionalLight position={[3, 3, 4]} intensity={1.4} />
         <directionalLight position={[-3, -1, -2]} intensity={0.6} color={0xa6c8ff} />
         <OrbitControls enableDamping dampingFactor={0.08} enablePan={false} minDistance={1.6} maxDistance={6} />
-        {blobUrl ? (
+        {file && blobUrl ? (
           <Suspense fallback={<Sphere texture={null} />}>
             {useCompressed ? (
-              <CompressedSphere url={blobUrl} onResult={handleResult} />
+              <CompressedSphere file={file} onResult={handleResult} />
             ) : (
               <OriginalSphere url={blobUrl} />
             )}
