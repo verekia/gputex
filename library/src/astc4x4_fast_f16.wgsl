@@ -18,6 +18,14 @@
 //   • Weights are packed into the reversed-bit-order field on the fly, and
 //     the 128-bit block is assembled with straight-line constant shifts
 //     instead of a generic write_bits() helper.
+//   • The covariance moments stay in their OWN pass, deliberately: fusing
+//     them into the load loop bc7-style (pixel-0 residuals, with or without
+//     hoisting pixel 0 out of the loop) measured +5% GPU time on 4096²
+//     (/ab A/B, 2026-07, M3) — the separate loop overlaps the 16 texture
+//     loads' latency better than a longer in-loop dependency chain does.
+//     Per-pass cost on the same rig, for future tuning: covariance+power-
+//     iteration ≈ 18%, LSQ fit pass ≈ 24%, extents pass ≈ 6% of the kernel;
+//     @workgroup_size 16×8 measured exactly at par with 8×8.
 //
 // RESTRICTED SUBSET + BLOCK LAYOUT: see astc4x4.wgsl (single partition,
 // CEM 12, 8-bit endpoints, 2-bit weights).
