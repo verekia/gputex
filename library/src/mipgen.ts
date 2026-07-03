@@ -69,26 +69,33 @@ function downsample2x(src: MipLevel): MipLevel {
   const dstW = Math.max(1, src.width >> 1)
   const dstH = Math.max(1, src.height >> 1)
   const dst = new Uint8ClampedArray(dstW * dstH * 4)
-  const sW = src.width
-  const sMaxX = src.width - 1
+  // Hot loop: `s` hoisted (one property load instead of two per texel read)
+  // and all indices carried as running byte offsets — no per-texel
+  // `(y * W + x) * 4` multiplies.
+  const s = src.data
+  const rowBytes = src.width * 4
+  const lastColByte = (src.width - 1) * 4
   const sMaxY = src.height - 1
+  let o = 0
   for (let y = 0; y < dstH; y++) {
-    const sy0 = y * 2
-    const sy1 = Math.min(sy0 + 1, sMaxY)
+    const sy0 = y << 1
+    const sy1 = sy0 < sMaxY ? sy0 + 1 : sMaxY
+    const r0 = sy0 * rowBytes
+    const r1 = sy1 * rowBytes
     for (let x = 0; x < dstW; x++) {
-      const sx0 = x * 2
-      const sx1 = Math.min(sx0 + 1, sMaxX)
-      const i00 = (sy0 * sW + sx0) * 4
-      const i10 = (sy0 * sW + sx1) * 4
-      const i01 = (sy1 * sW + sx0) * 4
-      const i11 = (sy1 * sW + sx1) * 4
-      const o = (y * dstW + x) * 4
+      const sx0 = x << 3 // byte offset of source texel 2x
+      const sx1 = sx0 + 4 <= lastColByte ? sx0 + 4 : lastColByte
+      const i00 = r0 + sx0
+      const i10 = r0 + sx1
+      const i01 = r1 + sx0
+      const i11 = r1 + sx1
       // Unrolled per channel — predictable, and typed-array indexing
       // is the hot path here.
-      dst[o] = (src.data[i00]! + src.data[i10]! + src.data[i01]! + src.data[i11]! + 2) >> 2
-      dst[o + 1] = (src.data[i00 + 1]! + src.data[i10 + 1]! + src.data[i01 + 1]! + src.data[i11 + 1]! + 2) >> 2
-      dst[o + 2] = (src.data[i00 + 2]! + src.data[i10 + 2]! + src.data[i01 + 2]! + src.data[i11 + 2]! + 2) >> 2
-      dst[o + 3] = (src.data[i00 + 3]! + src.data[i10 + 3]! + src.data[i01 + 3]! + src.data[i11 + 3]! + 2) >> 2
+      dst[o] = (s[i00]! + s[i10]! + s[i01]! + s[i11]! + 2) >> 2
+      dst[o + 1] = (s[i00 + 1]! + s[i10 + 1]! + s[i01 + 1]! + s[i11 + 1]! + 2) >> 2
+      dst[o + 2] = (s[i00 + 2]! + s[i10 + 2]! + s[i01 + 2]! + s[i11 + 2]! + 2) >> 2
+      dst[o + 3] = (s[i00 + 3]! + s[i10 + 3]! + s[i01 + 3]! + s[i11 + 3]! + 2) >> 2
+      o += 4
     }
   }
   return { data: dst, width: dstW, height: dstH }

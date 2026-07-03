@@ -20,6 +20,7 @@
 //
 import { uploadSourceTexture } from './workarounds.js'
 
+import type { MipLevel } from './mipgen.js'
 import type { TextureFormat } from './TextureFormat.js'
 
 /**
@@ -53,17 +54,22 @@ export interface EncodeCallOptions {
 }
 
 /**
- * Result of a raw bytes-only encode. This is the encoder's native output: the
- * compressed block bytes plus dimensions, with no Three.js (or any engine)
- * involvement. Feed `data` into whatever renderer's compressed-texture upload
- * you like, or use `buildCompressedTexture()` from `gputex/three`.
+ * One level of encoded output: the compressed block bytes plus logical and
+ * block-aligned dimensions. This is the encoder's native output shape, with
+ * no Three.js (or any engine) involvement — feed `data` into whatever
+ * renderer's compressed-texture upload you like, or use
+ * `buildCompressedTexture()` from `gputex/three`.
  */
-export interface EncodeBytesResult {
+export interface EncodedLevelBytes {
   width: number
   height: number
   paddedWidth: number
   paddedHeight: number
   data: Uint8Array
+}
+
+/** Result of a raw bytes-only single-image encode. */
+export interface EncodeBytesResult extends EncodedLevelBytes {
   encodeMs: number
   /**
    * GPU-side compute-pass time in ms, measured with timestamp queries.
@@ -73,6 +79,24 @@ export interface EncodeBytesResult {
    * so treat small values as approximate.
    */
   gpuMs?: number
+}
+
+/** Result of a whole-chain encode — see `Encoder.encodeMipChainToBytes()`. */
+export interface EncodeMipChainResult {
+  /** Encoded levels in the order given; `levels[0]` is the base level. */
+  levels: EncodedLevelBytes[]
+  /** Wall-clock time for the whole chain: uploads → dispatches → readback. */
+  encodeMs: number
+  /** GPU compute time for the whole chain's single compute pass (see
+   *  `EncodeBytesResult.gpuMs` for caveats). */
+  gpuMs?: number
+}
+
+/** GPU-timing plumbing for one submission (timestamp-query based). */
+interface GpuTiming {
+  querySet: GPUQuerySet
+  resolve: GPUBuffer
+  staging: GPUBuffer
 }
 
 export interface FormatVariant {
@@ -145,8 +169,11 @@ export abstract class Encoder {
   readonly disableF16: boolean
   // The single compute pipeline: built from the f16 module when the device
   // supports shader-f16 and the subclass provides an f16 source, from the
-  // f32 module otherwise. Both implement the same algorithm.
-  protected _pipeline!: GPUComputePipeline
+  // f32 module otherwise. Both implement the same algorithm. Created with
+  // `createComputePipelineAsync` so shader compilation overlaps whatever
+  // follows construction (image decode, first upload) instead of stalling
+  // the first dispatch; encodes await readiness.
+  protected _pipelineReady!: Promise<GPUComputePipeline>
 
   // -------------------------------------------------------------------- //
   // Per-encoder GPU resource cache. Creating the source texture, output/
@@ -180,6 +207,20 @@ export abstract class Encoder {
   private _usesSampler = false
   private _sampler: GPUSampler | null = null
 
+  // Mip-chain cache — the `encodeMipChainToBytes()` counterpart of the
+  // single-shot cache above: per-level source textures + bind groups keyed
+  // on the exact level-size signature, one params buffer holding every
+  // level's uniforms at 256-byte offsets, grow-only output/staging buffers.
+  // Pays off when consecutive chains share dimensions (bulk-loading
+  // same-sized textures through `compressTexture()`).
+  private _chainSig: string | null = null
+  private _chainTextures: GPUTexture[] = []
+  private _chainParams: GPUBuffer | null = null
+  private _chainBindGroups: GPUBindGroup[] = []
+  private _chainDst: GPUBuffer | null = null
+  private _chainStaging: GPUBuffer | null = null
+  private _chainBusy = false
+
   constructor({ device, adapter, ownsDevice = false, disableF16 = false }: EncoderOptions) {
     this.device = device
     this.adapter = adapter
@@ -199,11 +240,16 @@ export abstract class Encoder {
       code,
     })
     const constants = this.pipelineConstants()
-    this._pipeline = device.createComputePipeline({
+    this._pipelineReady = device.createComputePipelineAsync({
       label: `${this.label}-encoder-pipeline${useF16 ? '-f16' : ''}`,
       layout: 'auto',
       compute: { module, entryPoint: 'encode', ...(constants ? { constants } : {}) },
     })
+    // An encoder may be constructed and never used, or rebuilt before first
+    // use (BC7's adaptiveMode4 constructor path) — don't let an orphaned
+    // promise surface as an unhandled rejection. Encodes await the live
+    // promise and still observe compile errors.
+    this._pipelineReady.catch(() => {})
   }
 
   destroy(): void {
@@ -217,6 +263,16 @@ export abstract class Encoder {
     this._cachedStaging = null
     this._cachedParams = null
     this._cachedBindGroup = null
+    for (const tex of this._chainTextures) tex.destroy()
+    this._chainTextures = []
+    this._chainParams?.destroy()
+    this._chainDst?.destroy()
+    this._chainStaging?.destroy()
+    this._chainParams = null
+    this._chainDst = null
+    this._chainStaging = null
+    this._chainBindGroups = []
+    this._chainSig = null
     if (this.ownsDevice) this.device.destroy()
   }
 
@@ -314,6 +370,10 @@ export abstract class Encoder {
     const blockCount = blocksX * blocksY
     const outByteLen = blockCount * this.bytesPerBlock
 
+    // Resolves instantly after the first encode; only the first one can
+    // actually wait on shader compilation.
+    const pipeline = await this._pipelineReady
+
     // Acquire GPU resources — from the per-encoder cache when it's free (the
     // common sequential case), transiently when another encode on this
     // encoder is still in flight.
@@ -354,7 +414,7 @@ export abstract class Encoder {
         this._cachedSrcSource === source &&
         this._cachedSrcFlipY === flipY
       if (!uploadSkippable) {
-        uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
+        uploadSourceTexture(device, srcTex, source, width, height, flipY)
       }
       if (useCache) {
         this._cachedSrcSource = source instanceof ImageBitmap ? source : null
@@ -423,7 +483,6 @@ export abstract class Encoder {
       }
 
       // 4. Bind group, kept until a bound resource is recreated.
-      const pipeline = this._pipeline
       if (useCache && (srcTexIsNew || dstIsNew)) this._cachedBindGroup = null
       let bindGroup = useCache ? this._cachedBindGroup : null
       if (!bindGroup) {
@@ -451,42 +510,36 @@ export abstract class Encoder {
       // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When
       //    asked (and the device has 'timestamp-query'), bracket the pass
       //    with timestamps so the caller gets shader-only GPU time.
-      const useTimestamps = withGpuTime && device.features.has('timestamp-query')
-      const querySet = useTimestamps ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null
-      const queryBuffer = useTimestamps
-        ? device.createBuffer({
-            label: `${this.label}-ts-resolve`,
-            size: 16,
-            usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-          })
-        : null
+      const timing = withGpuTime ? this._createTiming() : null
 
       const [wgX, wgY] = this.workgroupSize
       const t0 = performance.now()
       const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
       const pass = enc.beginComputePass(
-        querySet ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
+        timing
+          ? {
+              timestampWrites: {
+                querySet: timing.querySet,
+                beginningOfPassWriteIndex: 0,
+                endOfPassWriteIndex: 1,
+              },
+            }
+          : undefined,
       )
       pass.setPipeline(pipeline)
       pass.setBindGroup(0, bindGroup)
       pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(blocksY / wgY), 1)
       pass.end()
-      if (querySet && queryBuffer) enc.resolveQuerySet(querySet, 0, 2, queryBuffer, 0)
 
       // 6. Buffer readback. We go through a MAP_READ staging buffer rather
       //    than copyBufferToTexture: the encoder owns its own adapter/device,
       //    separate from the Three.js renderer's, so the compressed bytes
       //    have to transit CPU anyway before the renderer uploads them.
       enc.copyBufferToBuffer(dstBuffer, 0, staging, 0, outByteLen)
-      const tsStaging =
-        querySet && queryBuffer
-          ? device.createBuffer({
-              label: `${this.label}-ts-staging`,
-              size: 16,
-              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-            })
-          : null
-      if (tsStaging && queryBuffer) enc.copyBufferToBuffer(queryBuffer, 0, tsStaging, 0, 16)
+      if (timing) {
+        enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
+        enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
+      }
       device.queue.submit([enc.finish()])
 
       // Map only the bytes this encode produced — the cached staging buffer
@@ -496,19 +549,7 @@ export abstract class Encoder {
       staging.unmap()
       const encodeMs = performance.now() - t0
 
-      let gpuMs: number | undefined
-      if (tsStaging) {
-        await tsStaging.mapAsync(GPUMapMode.READ)
-        const [begin, end] = new BigUint64Array(tsStaging.getMappedRange().slice(0))
-        tsStaging.unmap()
-        tsStaging.destroy()
-        // Timestamps are u64 nanoseconds.
-        if (end !== undefined && begin !== undefined && end > begin) {
-          gpuMs = Number(end - begin) / 1e6
-        }
-      }
-      querySet?.destroy()
-      queryBuffer?.destroy()
+      const gpuMs = timing ? await this._readTimingMs(timing) : undefined
 
       return { width, height, paddedWidth, paddedHeight, data, encodeMs, gpuMs }
     } finally {
@@ -521,5 +562,286 @@ export abstract class Encoder {
         paramsBuffer?.destroy()
       }
     }
+  }
+
+  // ------------------------------------------------------------------ //
+  // Whole-chain encode — every level in one submission.                //
+  // ------------------------------------------------------------------ //
+
+  /**
+   * Encode a whole mip chain in ONE GPU submission. A per-level
+   * `encodeToBytes()` loop costs a full CPU↔GPU round trip per level (a
+   * 1024² chain is 11 levels → 11 `mapAsync` waits with the GPU idle in
+   * between); this path uploads every level, records one dispatch per level
+   * into a single compute pass, copies all outputs into one staging buffer
+   * and maps it once.
+   *
+   * `levels` are raw RGBA8 pixels in base-to-tail order; sizes don't have to
+   * halve level-to-level (each level is padded and clamped independently,
+   * exactly like `encodeToBytes`). Uploads use `writeTexture` — the direct
+   * raw-bytes path, which also sidesteps the broken
+   * `copyExternalImageToTexture` devices (see workarounds.ts). There is no
+   * flip option: bake any vertical flip into level 0 before generating the
+   * chain, as `compressTexture()` does.
+   */
+  async encodeMipChainToBytes(
+    levels: readonly MipLevel[],
+    { withGpuTime = false }: { withGpuTime?: boolean } = {},
+  ): Promise<EncodeMipChainResult> {
+    const device = this.device
+    if (levels.length === 0) {
+      throw new Error(`${this.label}Encoder: encodeMipChainToBytes needs at least one level`)
+    }
+    const pipeline = await this._pipelineReady
+    const t0 = performance.now()
+
+    // Per-level geometry, plus each level's slice of the shared output
+    // buffer. Slices start at 256-byte offsets: bind-group buffer offsets
+    // must honour min*BufferOffsetAlignment, and 256 is the spec ceiling for
+    // both the storage and uniform limits.
+    const ALIGN = 256
+    let dstCursor = 0
+    const geoms = levels.map((level, i) => {
+      const { width, height, data } = level
+      if (!width || !height) {
+        throw new Error(`${this.label}Encoder: mip level ${i} has no dimensions`)
+      }
+      if (data.length < width * height * 4) {
+        throw new Error(`${this.label}Encoder: mip level ${i} has ${data.length} bytes, expected ${width * height * 4}`)
+      }
+      const paddedWidth = (width + 3) & ~3
+      const paddedHeight = (height + 3) & ~3
+      const blocksX = paddedWidth >> 2
+      const blocksY = paddedHeight >> 2
+      const byteLen = blocksX * blocksY * this.bytesPerBlock
+      const dstOffset = dstCursor
+      dstCursor = Math.ceil((dstCursor + byteLen) / ALIGN) * ALIGN
+      return { width, height, paddedWidth, paddedHeight, blocksX, blocksY, byteLen, dstOffset }
+    })
+    const lastGeom = geoms[geoms.length - 1]!
+    // Also the copy size: a multiple of 4 as required (byteLen is a multiple
+    // of bytesPerBlock ≥ 8, offsets are ALIGN-ed).
+    const byteSpan = lastGeom.dstOffset + lastGeom.byteLen
+    const sig = geoms.map(g => `${g.width}x${g.height}`).join()
+
+    const useCache = !this._chainBusy
+    if (useCache) this._chainBusy = true
+
+    let textures: GPUTexture[] | undefined
+    let params: GPUBuffer | undefined
+    let bindGroups: GPUBindGroup[] | undefined
+    let dst: GPUBuffer | undefined
+    let staging: GPUBuffer | undefined
+    // Set when this call built the level-set resources without caching them
+    // (another chain encode was in flight) — destroy them on the way out.
+    let transientLevelSet = false
+
+    try {
+      // Output buffer, grow-only. Recreating it invalidates the cached bind
+      // groups (they bind slices of the old buffer).
+      let dstIsNew = true
+      if (useCache && this._chainDst && this._chainDst.size >= byteSpan) {
+        dst = this._chainDst
+        dstIsNew = false
+      } else {
+        dst = device.createBuffer({
+          label: `${this.label}-chain-dst`,
+          size: byteSpan,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        })
+        if (useCache) {
+          this._chainDst?.destroy()
+          this._chainDst = dst
+        }
+      }
+
+      // Level-set resources: source textures, the packed params buffer and
+      // the bind groups. Valid together only for an exact level-size
+      // signature bound to the current dst buffer — reuse needs both.
+      if (useCache && !dstIsNew && this._chainSig === sig && this._chainParams) {
+        textures = this._chainTextures
+        params = this._chainParams
+        bindGroups = this._chainBindGroups
+      } else {
+        const texs = geoms.map((g, i) =>
+          device.createTexture({
+            label: `${this.label}-chain-src-${i}`,
+            size: [g.paddedWidth, g.paddedHeight, 1],
+            format: 'rgba8unorm',
+            // No RENDER_ATTACHMENT: writeTexture is a plain copy, not the
+            // copyExternalImageToTexture blit.
+            usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+          }),
+        )
+        textures = texs
+
+        // One uniform buffer, one write: every level's { blocksX, blocksY,
+        // width, height } header at its ALIGN-ed offset.
+        params = device.createBuffer({
+          label: `${this.label}-chain-params`,
+          size: geoms.length * ALIGN,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+        const paramsData = new Uint32Array((geoms.length * ALIGN) / 4)
+        geoms.forEach((g, i) => {
+          paramsData.set([g.blocksX, g.blocksY, g.width, g.height], (i * ALIGN) / 4)
+        })
+        device.queue.writeBuffer(params, 0, paramsData)
+
+        if (this._usesSampler) {
+          this._sampler ??= device.createSampler({
+            label: `${this.label}-clamp-sampler`,
+            addressModeU: 'clamp-to-edge',
+            addressModeV: 'clamp-to-edge',
+          })
+        }
+        const dstBuf = dst
+        const paramsBuf = params
+        bindGroups = geoms.map((g, i) => {
+          const entries: GPUBindGroupEntry[] = [
+            { binding: 0, resource: texs[i]!.createView() },
+            { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
+            { binding: 2, resource: { buffer: paramsBuf, offset: i * ALIGN, size: 16 } },
+          ]
+          if (this._usesSampler) entries.push({ binding: 3, resource: this._sampler! })
+          return device.createBindGroup({
+            label: `${this.label}-chain-bg-${i}`,
+            layout: pipeline.getBindGroupLayout(0),
+            entries,
+          })
+        })
+
+        if (useCache) {
+          for (const tex of this._chainTextures) tex.destroy()
+          this._chainParams?.destroy()
+          this._chainTextures = textures
+          this._chainParams = params
+          this._chainBindGroups = bindGroups
+          this._chainSig = sig
+        } else {
+          transientLevelSet = true
+        }
+      }
+
+      // Staging buffer, grow-only (not part of any bind group).
+      if (useCache && this._chainStaging && this._chainStaging.size >= byteSpan) {
+        staging = this._chainStaging
+      } else {
+        staging = device.createBuffer({
+          label: `${this.label}-chain-staging`,
+          size: byteSpan,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        })
+        if (useCache) {
+          this._chainStaging?.destroy()
+          this._chainStaging = staging
+        }
+      }
+
+      // Upload every level's pixels.
+      for (let i = 0; i < levels.length; i++) {
+        const level = levels[i]!
+        device.queue.writeTexture({ texture: textures[i]! }, level.data, { bytesPerRow: level.width * 4 }, [
+          level.width,
+          level.height,
+          1,
+        ])
+      }
+
+      // One compute pass, one dispatch per level, one submit.
+      const timing = withGpuTime ? this._createTiming() : null
+      const [wgX, wgY] = this.workgroupSize
+      const enc = device.createCommandEncoder({ label: `${this.label}-encode-chain` })
+      const pass = enc.beginComputePass(
+        timing
+          ? {
+              timestampWrites: {
+                querySet: timing.querySet,
+                beginningOfPassWriteIndex: 0,
+                endOfPassWriteIndex: 1,
+              },
+            }
+          : undefined,
+      )
+      pass.setPipeline(pipeline)
+      for (let i = 0; i < geoms.length; i++) {
+        const g = geoms[i]!
+        pass.setBindGroup(0, bindGroups[i]!)
+        pass.dispatchWorkgroups(Math.ceil(g.blocksX / wgX), Math.ceil(g.blocksY / wgY), 1)
+      }
+      pass.end()
+      enc.copyBufferToBuffer(dst, 0, staging, 0, byteSpan)
+      if (timing) {
+        enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
+        enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
+      }
+      device.queue.submit([enc.finish()])
+
+      // Single readback for the whole chain.
+      await staging.mapAsync(GPUMapMode.READ, 0, byteSpan)
+      const mapped = staging.getMappedRange(0, byteSpan)
+      const out: EncodedLevelBytes[] = geoms.map(g => ({
+        width: g.width,
+        height: g.height,
+        paddedWidth: g.paddedWidth,
+        paddedHeight: g.paddedHeight,
+        data: new Uint8Array(mapped.slice(g.dstOffset, g.dstOffset + g.byteLen)),
+      }))
+      staging.unmap()
+      const encodeMs = performance.now() - t0
+      const gpuMs = timing ? await this._readTimingMs(timing) : undefined
+
+      return { levels: out, encodeMs, gpuMs }
+    } finally {
+      if (useCache) {
+        this._chainBusy = false
+      } else {
+        dst?.destroy()
+        staging?.destroy()
+      }
+      if (transientLevelSet) {
+        if (textures) for (const tex of textures) tex.destroy()
+        params?.destroy()
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ //
+  // GPU timing plumbing (timestamp queries)                            //
+  // ------------------------------------------------------------------ //
+
+  /** Create the query set + resolve/staging buffers for one timed
+   *  submission, or null when the device lacks 'timestamp-query'. */
+  private _createTiming(): GpuTiming | null {
+    const device = this.device
+    if (!device.features.has('timestamp-query')) return null
+    return {
+      querySet: device.createQuerySet({ type: 'timestamp', count: 2 }),
+      resolve: device.createBuffer({
+        label: `${this.label}-ts-resolve`,
+        size: 16,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      }),
+      staging: device.createBuffer({
+        label: `${this.label}-ts-staging`,
+        size: 16,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      }),
+    }
+  }
+
+  /** Read back a timed submission's pass duration (ms) and destroy the
+   *  timing objects. Timestamps are u64 nanoseconds. */
+  private async _readTimingMs(timing: GpuTiming): Promise<number | undefined> {
+    await timing.staging.mapAsync(GPUMapMode.READ)
+    const [begin, end] = new BigUint64Array(timing.staging.getMappedRange().slice(0))
+    timing.staging.unmap()
+    timing.staging.destroy()
+    timing.resolve.destroy()
+    timing.querySet.destroy()
+    if (end !== undefined && begin !== undefined && end > begin) {
+      return Number(end - begin) / 1e6
+    }
+    return undefined
   }
 }

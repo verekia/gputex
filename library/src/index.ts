@@ -23,6 +23,8 @@ export {
   type EncoderConstructor,
   type EncodeCallOptions,
   type EncodeBytesResult,
+  type EncodedLevelBytes,
+  type EncodeMipChainResult,
   type FormatVariant,
 } from './Encoder.js'
 
@@ -66,8 +68,8 @@ export {
 } from './selectFormat.js'
 
 // Mip-chain helpers (exported so callers can pre-generate a chain once
-// and feed it into `Encoder.encodeToBytes` themselves if they want
-// finer control over the pipeline than `compressTexture` provides).
+// and feed it into `Encoder.encodeMipChainToBytes` / `encodeToBytes`
+// themselves if they want finer control than `compressTexture` provides).
 export { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
 
 // SVG rasterisation. Used automatically by `compressTexture()` for SVG

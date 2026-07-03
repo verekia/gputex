@@ -17,9 +17,14 @@ export function needsWriteTextureWorkaround(adapter: GPUAdapter): boolean {
 }
 
 /**
- * Upload an image source to a GPU texture. Uses `writeTexture` with raw
- * pixel bytes when `useWriteTexture` is true (Mali workaround), otherwise
- * falls back to the standard `copyExternalImageToTexture`.
+ * Upload an image source to a GPU texture.
+ *
+ * `ImageData` goes through `writeTexture`: for CPU-resident raw bytes it's
+ * the direct path (no colour-space blit) and it sidesteps the broken
+ * `copyExternalImageToTexture` devices above. `writeTexture` can't flip, so
+ * `ImageData` + `flipY` falls back to the blit path — callers that need the
+ * Pixel 10 workaround (see `compressTexture`) bake the flip into the pixels
+ * before reaching here.
  */
 export function uploadSourceTexture(
   device: GPUDevice,
@@ -28,9 +33,8 @@ export function uploadSourceTexture(
   width: number,
   height: number,
   flipY: boolean,
-  useWriteTexture: boolean,
 ): void {
-  if (useWriteTexture && source instanceof ImageData) {
+  if (source instanceof ImageData && !flipY) {
     device.queue.writeTexture({ texture: srcTex }, source.data, { bytesPerRow: width * 4 }, [width, height, 1])
   } else {
     device.queue.copyExternalImageToTexture({ source: source as ImageBitmap, flipY }, { texture: srcTex }, [

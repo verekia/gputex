@@ -14,8 +14,10 @@
 //   material.map = texture
 //
 // Device ownership (WebGPU): if the caller passes `device`, we reuse it and
-// never destroy it. Otherwise we request our own adapter + device, tag the
-// encoder as owning it, and expose a `destroy()` on the result for cleanup.
+// never destroy it. Otherwise consecutive calls share one module-level
+// adapter + device + per-format encoder (see the shared-GPU section below);
+// `releaseSharedGpuResources()` tears that down. The result's `destroy()`
+// only releases resources owned by that call.
 //
 // The WebGL fallback shares one process-wide WebGL2 context (see
 // webgl/webglContext.ts) and runs the *fast* encoders only; the `quality`
@@ -23,7 +25,7 @@
 
 import { ClampToEdgeWrapping, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace, Texture } from 'three'
 
-import { Encoder } from '../Encoder.js'
+import { Encoder, type EncoderConstructor } from '../Encoder.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
 import { selectFormat, type PreferredFormat, type TextureHint } from '../selectFormat.js'
 import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from '../svg.js'
@@ -112,9 +114,96 @@ export interface CompressResult {
   mipLevels: number
   /** Wall-clock time of GPU encoding, summed across mip levels. */
   encodeMs: number
-  /** Release the encoder's internal GPU resources. No-op if `device` was
-   *  passed in by the caller. */
+  /** Dispose the texture and release GPU resources owned by this call.
+   *  On the default path (no `device`/`adapter` option) the encoder and
+   *  device are shared across `compressTexture()` calls and survive this —
+   *  release those with `releaseSharedGpuResources()`. */
   destroy(): void
+}
+
+// ---------------------------------------------------------------------------
+// Shared WebGPU device + encoder cache
+// ---------------------------------------------------------------------------
+//
+// When the caller passes neither `device` nor `adapter`, consecutive
+// `compressTexture()` calls share one adapter/device and one encoder per
+// format. Requesting an adapter + device costs tens of ms and a fresh
+// encoder recompiles its shader; paying that once per texture dominated the
+// encode for small/medium images. Sharing also lets the encoders' internal
+// GPU-resource caches (see Encoder.ts) carry across textures.
+//
+// The WebGL tier has always worked this way (`getSharedWebGLContext()`);
+// this is the WebGPU counterpart.
+
+interface SharedGpu {
+  adapter: GPUAdapter
+  device: GPUDevice
+  encoders: Map<EncoderConstructor, Encoder>
+}
+
+let sharedGpuPromise: Promise<SharedGpu | null> | null = null
+
+/** Features worth having on the shared device when the adapter offers them.
+ *  Superset of what any one encoder's `create()` would request, since the
+ *  device is shared across formats. */
+const SHARED_DEVICE_FEATURES: readonly GPUFeatureName[] = [
+  'texture-compression-bc',
+  'texture-compression-astc',
+  'shader-f16',
+  'timestamp-query',
+]
+
+async function createSharedGpu(): Promise<SharedGpu | null> {
+  const adapter = await navigator.gpu.requestAdapter()
+  if (!adapter) return null
+  const requiredFeatures = SHARED_DEVICE_FEATURES.filter(f => adapter.features.has(f))
+  const device = await adapter.requestDevice({ requiredFeatures })
+  return { adapter, device, encoders: new Map() }
+}
+
+/** The shared adapter/device/encoders, created on first use. Null when the
+ *  platform has no usable adapter. */
+function getSharedGpu(): Promise<SharedGpu | null> {
+  if (!sharedGpuPromise) {
+    const p = createSharedGpu()
+    sharedGpuPromise = p
+    p.then(shared => {
+      if (!shared) return
+      // A lost device (GPU reset, `releaseSharedGpuResources()`, browser
+      // reclaim) can't encode; drop this generation so the next call
+      // recreates, unless a newer generation already replaced it.
+      void shared.device.lost.then(() => {
+        shared.encoders.forEach(encoder => encoder.destroy())
+        shared.encoders.clear()
+        if (sharedGpuPromise === p) sharedGpuPromise = null
+      })
+    }).catch(() => {
+      // Device request failed; allow the next call to retry. The failure
+      // itself still propagates to whoever awaited this generation.
+      if (sharedGpuPromise === p) sharedGpuPromise = null
+    })
+  }
+  return sharedGpuPromise
+}
+
+/**
+ * Destroy the WebGPU device and encoders that `compressTexture()` shares
+ * across calls (created lazily when neither the `device` nor the `adapter`
+ * option is passed). Safe to call at any time — in-flight encodes on the
+ * shared device will fail, and the next `compressTexture()` call recreates
+ * everything. No-op when nothing is cached.
+ */
+export function releaseSharedGpuResources(): void {
+  const p = sharedGpuPromise
+  sharedGpuPromise = null
+  void p
+    ?.then(shared => {
+      if (!shared) return
+      shared.encoders.forEach(encoder => encoder.destroy())
+      shared.encoders.clear()
+      shared.device.destroy()
+    })
+    .catch(() => {})
 }
 
 // ---------------------------------------------------------------------------
@@ -310,21 +399,47 @@ export async function compressTexture(
   /** Returns a compressed result, or null if WebGPU can't produce one. */
   async function encodeViaWebGPU(): Promise<CompressResult | null> {
     if (!('gpu' in navigator)) return null
-    const adapter = providedAdapter ?? (await navigator.gpu.requestAdapter())
+
+    // Resolve the adapter: caller-provided, else the shared one. A provided
+    // device without an adapter still needs one for capability detection.
+    let shared: SharedGpu | null = null
+    let adapter: GPUAdapter | null
+    if (providedAdapter) {
+      adapter = providedAdapter
+    } else if (providedDevice) {
+      adapter = await navigator.gpu.requestAdapter()
+    } else {
+      shared = await getSharedGpu()
+      adapter = shared?.adapter ?? null
+    }
     if (!adapter) return null
 
     const selection = selectFormat(adapter, hint, { colorSpace, preferredFormat })
     if (!selection.format || !selection.encoderClass) return null
 
-    // Instantiate the encoder. Reuse a caller-provided device, otherwise
-    // have the encoder's `create()` request its own (with the needed feature).
+    // Instantiate the encoder. Reuse a caller-provided device; on the shared
+    // path reuse (or create and cache) the per-format shared encoder;
+    // otherwise (adapter-only callers) have the encoder's `create()` request
+    // its own device.
+    const EncoderCtor = selection.encoderClass
     let encoder: Encoder
+    let sharedEncoder = false
     if (providedDevice) {
-      const EncoderCtor = selection.encoderClass
       encoder = new EncoderCtor({ device: providedDevice, adapter, ownsDevice: false })
+    } else if (shared) {
+      sharedEncoder = true
+      let cached = shared.encoders.get(EncoderCtor)
+      if (!cached) {
+        cached = new EncoderCtor({ device: shared.device, adapter: shared.adapter, ownsDevice: false })
+        shared.encoders.set(EncoderCtor, cached)
+      }
+      encoder = cached
     } else {
-      encoder = await selection.encoderClass.create()
+      encoder = await EncoderCtor.create()
     }
+    // Shared encoders outlive this call; their GPU resources are released
+    // via releaseSharedGpuResources(), not per-result destroy().
+    const destroyEncoder = sharedEncoder ? () => {} : () => encoder.destroy()
 
     try {
       const needsWriteTexture = needsWriteTextureWorkaround(adapter)
@@ -351,27 +466,19 @@ export async function compressTexture(
           encodeMs: bytes.encodeMs,
           destroy: () => {
             tex.dispose()
-            encoder.destroy()
+            destroyEncoder()
           },
         }
       }
 
-      // Mipped path. Rasterise once, box-filter the chain on CPU, encode
-      // each level as a separate compute dispatch.
+      // Mipped path. Rasterise once, box-filter the chain on CPU, then
+      // encode every level in a single GPU submission — one compute pass and
+      // one readback for the whole chain instead of a round trip per level.
       const level0 = bitmapToMipLevel(bitmap, flipY)
-      const chain = generateMipChain(level0)
+      const chain = generateMipChain(level0).map(padToBlockMultiple)
+      const { levels, encodeMs } = await encoder.encodeMipChainToBytes(chain)
 
-      const encodedLevels = []
-      let totalEncodeMs = 0
-      for (const level of chain) {
-        const padded = padToBlockMultiple(level)
-        const imageData = mipLevelToImageData(padded)
-        const bytes = await encoder.encodeToBytes(imageData)
-        encodedLevels.push(bytes)
-        totalEncodeMs += bytes.encodeMs
-      }
-
-      const tex = buildCompressedTexture(encodedLevels, selection.format)
+      const tex = buildCompressedTexture(levels, selection.format)
       return {
         texture: tex,
         format: selection.format,
@@ -380,17 +487,18 @@ export async function compressTexture(
         astcNormalRemap: selection.astcNormalRemap,
         width: level0.width,
         height: level0.height,
-        mipLevels: encodedLevels.length,
-        encodeMs: totalEncodeMs,
+        mipLevels: levels.length,
+        encodeMs,
         destroy: () => {
           tex.dispose()
-          encoder.destroy()
+          destroyEncoder()
         },
       }
     } catch (e) {
       // Encoder owns a device when we created it; clean up on the error path
-      // so we don't leak adapters across retries.
-      encoder.destroy()
+      // so we don't leak adapters across retries. (Shared encoders stay —
+      // a lost shared device resets itself via its `lost` handler.)
+      destroyEncoder()
       throw e
     }
   }

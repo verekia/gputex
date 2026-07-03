@@ -14,6 +14,7 @@ export * from '../index.js'
 
 export {
   compressTexture,
+  releaseSharedGpuResources,
   type CompressTextureSource,
   type CompressOptions,
   type CompressResult,

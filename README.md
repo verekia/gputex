@@ -219,6 +219,20 @@ const { data, width, height, paddedWidth, paddedHeight } = await encoder.encodeT
 encoder.destroy()
 ```
 
+For mip chains, `encodeMipChainToBytes()` encodes every level in a **single
+GPU submission** — one compute pass and one readback instead of a full
+CPU↔GPU round trip per level (an 11-level 1024² chain is one `mapAsync`
+wait instead of eleven):
+
+```ts
+import { BC7Encoder, generateMipChain } from 'gputex'
+
+const encoder = await BC7Encoder.create()
+// level0 = { data: Uint8ClampedArray (RGBA8), width, height }
+const { levels, encodeMs } = await encoder.encodeMipChainToBytes(generateMipChain(level0))
+// levels[i] = { data, width, height, paddedWidth, paddedHeight }
+```
+
 To turn an encoder's output into a Three.js `CompressedTexture` directly, use the helpers in `gputex/three`:
 
 ```ts
@@ -248,6 +262,16 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 | `flipY`           | `boolean`                     | `true`    | Flip vertically (matches Three.js convention)                                                    |
 | `mipmaps`         | `boolean`                     | `false`   | Generate full mip chain down to 1x1                                                              |
 | `device`          | `GPUDevice`                   | —         | Reuse an existing WebGPU device instead of creating one                                          |
+
+When neither `device` nor `adapter` is passed, `compressTexture()` shares one
+WebGPU device and one encoder per format across calls: the first call pays the
+adapter/device request and pipeline compile, subsequent calls skip straight to
+the encode and reuse the encoder's cached GPU resources. The result's
+`destroy()` only disposes that call's texture; call `releaseSharedGpuResources()`
+(also exported from `gputex/three`) to tear down the shared device — the next
+`compressTexture()` call transparently recreates it. With `mipmaps: true` the
+whole chain is encoded in a single GPU submission (one compute pass, one
+readback) rather than a round trip per level.
 
 ## Benchmarks
 

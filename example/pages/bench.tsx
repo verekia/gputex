@@ -18,6 +18,8 @@ import {
   BC5WebGLEncoder,
   BC7Encoder,
   BC7WebGLEncoder,
+  generateMipChain,
+  padToBlockMultiple,
 } from 'gputex'
 import type { Encoder } from 'gputex'
 
@@ -31,6 +33,7 @@ import {
   encodeBC5Block,
   encodeBC7Mode6Block,
 } from 'gputex/testing'
+import { compressTexture, releaseSharedGpuResources } from 'gputex/three'
 
 type Status = 'running' | 'done' | 'error'
 
@@ -67,6 +70,10 @@ if (typeof window !== 'undefined') {
     encodeBC5Block,
     encodeBC7Mode6Block,
     encodeASTC4x4Block,
+    compressTexture,
+    releaseSharedGpuResources,
+    generateMipChain,
+    padToBlockMultiple,
   }
 }
 
