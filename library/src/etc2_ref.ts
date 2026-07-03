@@ -28,8 +28,9 @@
 //     selection run on D = luma(p) − luma(base) alone (exact modulo decode
 //     clamping): O(1) flip preselect from quadrant variance, subblock-average
 //     bases (differential when the delta fits, else individual), a
-//     two-candidate table search around max|D|, one estimate-accepted refit
-//     round gated on busy blocks, and a closed-form planar contest.
+//     two-candidate table search around max|D|, one cheap refit round
+//     (skew-predicted base shift, accepted without a rescore) gated on
+//     busy blocks, and a closed-form planar contest.
 //   'high': exhaustive — both flips, BOTH differential (delta clamped into
 //     range) and individual bases, full 8-table × 4-modifier search with
 //     decode-exact clamped errors, up to 4 exact-accepted refit rounds, a
@@ -633,28 +634,33 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
   const avg0 = s0.sum.map(v => v / 8)
   const avg1 = s1.sum.map(v => v / 8)
   let codes = cur.codes
-  let fit0 = fastIndices(Dof(texels0, cur.lb0), cur.t0)
-  let fit1 = fastIndices(Dof(texels1, cur.lb1), cur.t1)
+  let lb0 = cur.lb0
+  let lb1 = cur.lb1
 
-  // One refit round (base ← mean − mean chosen modifier), estimate-accepted,
-  // gated to busy blocks.
+  // One CHEAP refit round: the modifier sum predicts the selection-skew
+  // bias (relative to the unquantised mean ΣD = 0), and the requantised
+  // base is accepted without a re-search or rescore — tables kept, index
+  // packing deferred to the final base. Mirrors etc2.wgsl: the
+  // exact-accept version cost +15% GPU for ≤0.03 dB.
   if (cur.est > FAST_GATE) {
-    const nAvg0 = avg0.map(v => v - fit0.modSum / 8)
-    const nAvg1 = avg1.map(v => v - fit1.modSum / 8)
+    const mod0 = fastIndices(Dof(texels0, lb0), cur.t0).modSum
+    const mod1 = fastIndices(Dof(texels1, lb1), cur.t1).modSum
+    const nAvg0 = avg0.map(v => v - mod0 / 8)
+    const nAvg1 = avg1.map(v => v - mod1 / 8)
     const nCodes = quantiseBases(nAvg0, nAvg1, diff, true)
     if (
       nCodes &&
       !(nCodes.codes0.every((v, c) => v === codes.codes0[c]) && nCodes.codes1.every((v, c) => v === codes.codes1[c]))
     ) {
-      const next = evalCodes(flip, s0, s1, diff, nCodes)
-      if (next.est < cur.est) {
-        codes = nCodes
-        cur = next
-        fit0 = fastIndices(Dof(texels0, cur.lb0), cur.t0)
-        fit1 = fastIndices(Dof(texels1, cur.lb1), cur.t1)
-      }
+      codes = nCodes
+      const b0 = decodeBases(nCodes.codes0, diff)
+      const b1 = decodeBases(nCodes.codes1, diff)
+      lb0 = b0[0]! + b0[1]! + b0[2]!
+      lb1 = b1[0]! + b1[1]! + b1[2]!
     }
   }
+  const fit0 = fastIndices(Dof(texels0, lb0), cur.t0)
+  const fit1 = fastIndices(Dof(texels1, lb1), cur.t1)
 
   // Planar contest, closed-form: the residual of the plane the hardware
   // will ACTUALLY decode — quantised, clamped corners — via the
