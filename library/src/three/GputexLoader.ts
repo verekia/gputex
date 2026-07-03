@@ -95,6 +95,8 @@ export class GputexLoader extends Loader<Texture> {
           height: result.height,
           mipLevels: result.mipLevels,
           encodeMs: result.encodeMs,
+          decodeMs: result.decodeMs,
+          totalMs: result.totalMs,
           compressedBytes: result.fallbackUncompressed
             ? result.width * result.height * 4
             : (mip0?.data.byteLength ?? 0),

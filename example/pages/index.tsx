@@ -39,7 +39,6 @@ const OriginalSphere = ({ url }: { url: string }) => {
 
 const IndexPage = () => {
   const [file, setFile] = useState<File | null>(null)
-  const [dataUrl, setDataUrl] = useState<string | null>(null)
   const [blobUrl, setBlobUrl] = useState<string | null>(null)
   const [result, setResult] = useState<EncodeInfo | null>(null)
   const [useCompressed, setUseCompressed] = useState(true)
@@ -49,10 +48,9 @@ const IndexPage = () => {
     setFile(droppedFile)
     setResult(null)
     setEncoding(true)
+    // A blob: URL, NOT a FileReader data: URL — fetching a multi-MB base64
+    // data URL costs >1 s in Chrome, ~6× a blob URL fetch of the same file.
     setBlobUrl(URL.createObjectURL(droppedFile))
-    const reader = new FileReader()
-    reader.onload = () => setDataUrl(reader.result as string)
-    reader.readAsDataURL(droppedFile)
   }, [])
 
   const handleResult = useCallback((r: EncodeInfo) => {
@@ -72,12 +70,12 @@ const IndexPage = () => {
         <directionalLight position={[3, 3, 4]} intensity={1.4} />
         <directionalLight position={[-3, -1, -2]} intensity={0.6} color={0xa6c8ff} />
         <OrbitControls enableDamping dampingFactor={0.08} enablePan={false} minDistance={1.6} maxDistance={6} />
-        {dataUrl ? (
+        {blobUrl ? (
           <Suspense fallback={<Sphere texture={null} />}>
             {useCompressed ? (
-              <CompressedSphere url={dataUrl} onResult={handleResult} />
+              <CompressedSphere url={blobUrl} onResult={handleResult} />
             ) : (
-              <OriginalSphere url={blobUrl!} />
+              <OriginalSphere url={blobUrl} />
             )}
           </Suspense>
         ) : (

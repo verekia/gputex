@@ -16,6 +16,8 @@ export interface EncodeInfo {
   height: number
   mipLevels: number
   encodeMs: number
+  decodeMs: number
+  totalMs: number
   compressedBytes: number
 }
 

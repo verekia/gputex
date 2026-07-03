@@ -70,6 +70,7 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
         <div className="mb-1 text-[10.5px] tracking-wider text-gray-500 uppercase">Original (decoded image)</div>
         <Row label="Download size" value={file ? fmtBytes(file.size) : '—'} />
         <Row label="VRAM (RGBA8)" value={origVram ? fmtBytes(origVram) : '—'} />
+        <Row label="Decode time" value={result ? `${result.decodeMs.toFixed(1)} ms` : '—'} />
       </div>
 
       <div className="border-t border-white/10 pt-2">
@@ -78,6 +79,7 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
         <Row label="Backend" value={result ? backendLabel(result.backend) : '—'} />
         <Row label="VRAM" value={compVram ? fmtBytes(compVram) : '—'} />
         <Row label="Encode time" value={result ? `${result.encodeMs.toFixed(1)} ms` : '—'} />
+        <Row label="Total (decode + encode)" value={result ? `${result.totalMs.toFixed(1)} ms` : '—'} />
       </div>
 
       <div className="border-t border-white/10 pt-2">

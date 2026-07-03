@@ -114,6 +114,16 @@ export interface CompressResult {
   mipLevels: number
   /** Wall-clock time of GPU encoding, summed across mip levels. */
   encodeMs: number
+  /**
+   * Wall-clock time to turn the source into decoded RGBA pixels: fetch /
+   * base64 decode, image decode, SVG rasterisation. Usually the dominant
+   * cost for large images — when a load feels slower than `encodeMs`
+   * suggests, this is where the time went.
+   */
+  decodeMs: number
+  /** Wall-clock time of the whole `compressTexture()` call: decode + CPU
+   *  mip generation + encode + texture assembly. */
+  totalMs: number
   /** Dispose the texture and release GPU resources owned by this call.
    *  On the default path (no `device`/`adapter` option) the encoder and
    *  device are shared across `compressTexture()` calls and survive this —
@@ -232,6 +242,17 @@ async function sourceToBitmap(source: CompressTextureSource, svgSize?: SvgRaster
     if (isSvgMarkup(source)) {
       return rasterizeSvg(source, { size: svgSize })
     }
+    // data: URLs are decoded by hand, NOT fetched — Chrome's fetch() of a
+    // multi-MB data URL is pathologically slow (>1 s for a base64'd 4K PNG
+    // vs ~60 ms decoding it ourselves). Common source in drag-drop / paste
+    // flows via FileReader.readAsDataURL and canvas.toDataURL.
+    if (/^data:/i.test(source)) {
+      const blob = dataUrlToBlob(source)
+      if (isSvgBlob(blob)) {
+        return rasterizeSvg(blob, { size: svgSize })
+      }
+      return createImageBitmap(blob, opts)
+    }
     const resp = await fetch(source)
     if (!resp.ok) {
       throw new Error(`compressTexture: fetch ${source} failed (${resp.status})`)
@@ -273,6 +294,34 @@ async function sourceToBitmap(source: CompressTextureSource, svgSize?: SvgRaster
 /** True for MIME types `createImageBitmap` could plausibly decode. */
 function isImageMimeType(type: string): boolean {
   return /^image\//i.test(type) && !/svg/i.test(type)
+}
+
+/**
+ * Decode an RFC 2397 `data:` URL to a Blob without going through `fetch`.
+ * Uses the native `Uint8Array.fromBase64` where available (Chrome 140+,
+ * ~4× faster than the `atob` loop on multi-MB payloads).
+ */
+function dataUrlToBlob(url: string): Blob {
+  const comma = url.indexOf(',')
+  if (comma < 0) {
+    throw new Error('compressTexture: malformed data: URL (no comma)')
+  }
+  // `data:[<mediatype>][;base64],<data>` — `;base64` is always last.
+  const header = url.slice(5, comma)
+  const isBase64 = /;base64$/i.test(header)
+  const type = header.replace(/;base64$/i, '')
+  if (!isBase64) {
+    return new Blob([decodeURIComponent(url.slice(comma + 1))], { type })
+  }
+  const payload = url.slice(comma + 1)
+  const fromBase64 = (Uint8Array as unknown as { fromBase64?: (s: string) => Uint8Array<ArrayBuffer> }).fromBase64
+  if (fromBase64) {
+    return new Blob([fromBase64(payload)], { type })
+  }
+  const bin = atob(payload)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return new Blob([bytes], { type })
 }
 
 /**
@@ -365,7 +414,9 @@ export async function compressTexture(
   } = options
 
   const srgb = colorSpace === 'srgb'
+  const t0 = performance.now()
   const bitmap = await sourceToBitmap(source, svgSize)
+  const decodeMs = performance.now() - t0
 
   // Tier 1: WebGPU compute path. Tier 2: WebGL2 fragment-shader fallback.
   // Tier 3: uncompressed RGBA8.
@@ -389,6 +440,8 @@ export async function compressTexture(
     height: bitmap.height,
     mipLevels: 1,
     encodeMs: 0,
+    decodeMs,
+    totalMs: performance.now() - t0,
     destroy: () => {
       tex.dispose()
     },
@@ -464,6 +517,8 @@ export async function compressTexture(
           height: bytes.height,
           mipLevels: 1,
           encodeMs: bytes.encodeMs,
+          decodeMs,
+          totalMs: performance.now() - t0,
           destroy: () => {
             tex.dispose()
             destroyEncoder()
@@ -489,6 +544,8 @@ export async function compressTexture(
         height: level0.height,
         mipLevels: levels.length,
         encodeMs,
+        decodeMs,
+        totalMs: performance.now() - t0,
         destroy: () => {
           tex.dispose()
           destroyEncoder()
@@ -533,6 +590,8 @@ export async function compressTexture(
           height: bytes.height,
           mipLevels: 1,
           encodeMs: bytes.encodeMs,
+          decodeMs,
+          totalMs: performance.now() - t0,
           destroy: () => {
             tex.dispose()
             encoder.destroy()
@@ -565,6 +624,8 @@ export async function compressTexture(
         height: level0.height,
         mipLevels: encodedLevels.length,
         encodeMs: totalEncodeMs,
+        decodeMs,
+        totalMs: performance.now() - t0,
         destroy: () => {
           tex.dispose()
           encoder.destroy()
