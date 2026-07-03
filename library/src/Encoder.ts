@@ -161,6 +161,14 @@ export abstract class Encoder {
   private _cachedSrcTex: GPUTexture | null = null
   private _cachedSrcW = 0
   private _cachedSrcH = 0
+  // Upload memoisation: the ImageBitmap whose pixels the cached source
+  // texture currently holds. ImageBitmaps are immutable, so encoding the
+  // same bitmap again (benchmark loops, quality-ladder re-encodes, format
+  // A/B) can skip the copyExternalImageToTexture entirely — at 4096² that
+  // upload is ~9 ms, dominating the whole encode. Mutable sources
+  // (ImageData, canvases, video) are never memoised.
+  private _cachedSrcSource: ImageBitmap | null = null
+  private _cachedSrcFlipY = false
   private _cachedDst: GPUBuffer | null = null
   private _cachedStaging: GPUBuffer | null = null
   private _cachedParams: GPUBuffer | null = null
@@ -197,6 +205,7 @@ export abstract class Encoder {
     this._cachedStaging?.destroy()
     this._cachedParams?.destroy()
     this._cachedSrcTex = null
+    this._cachedSrcSource = null
     this._cachedDst = null
     this._cachedStaging = null
     this._cachedParams = null
@@ -322,7 +331,18 @@ export abstract class Encoder {
           this._cachedSrcH = paddedHeight
         }
       }
-      uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
+      const uploadSkippable =
+        !srcTexIsNew &&
+        source instanceof ImageBitmap &&
+        this._cachedSrcSource === source &&
+        this._cachedSrcFlipY === flipY
+      if (!uploadSkippable) {
+        uploadSourceTexture(device, srcTex, source, width, height, flipY, source instanceof ImageData)
+      }
+      if (useCache) {
+        this._cachedSrcSource = source instanceof ImageBitmap ? source : null
+        this._cachedSrcFlipY = flipY
+      }
 
       // 2. Output storage buffer + readback staging buffer (grow-only: a
       //    larger cached buffer serves smaller encodes, e.g. mip levels).

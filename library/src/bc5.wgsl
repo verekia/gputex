@@ -17,13 +17,23 @@
 // We always produce the 6-interpolation mode (red0 > red1). See `bc4_ref.ts`
 // for the reference this encoder is validated against.
 //
-// Pipeline per channel: bbox endpoints + O(1) projection assignment per
-// texel. The 8-entry palette in 6-interp mode is COLINEAR and EVENLY spaced
-// from r0 to r1 (levels 0..7 in palette order 0,2,3,4,5,6,7,1), so the
-// nearest entry is the rounded projection onto the r0→r1 axis — no 8-entry
-// search, and the 3-bit indices are packed on the fly. The LSQ refit sums
-// are accumulated in the same fused pass; the requantised refit is accepted
-// only if it lowers the block error (worth ~1.3 dB on the normal-map card).
+// Same algorithm as bc5_fast_f16.wgsl (see that file for the full notes):
+//   • both channels processed as vec2 lanes of one fused pass — projection
+//     assignment, branch-free packed indices, and LSQ sums in residual
+//     coordinates;
+//   • the refit is accepted CLOSED-FORM from the sums (no trial projection
+//     pass): E(δ) = sErr − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB + δ1²sBB
+//     for the re-quantised endpoint deltas δ, compared against the seed's
+//     error; one reprojection pass then re-optimises the indices, which can
+//     only improve on E;
+//   • 3-bit indices accumulate branch-free into two 24-bit words (pixels
+//     0..7 and 8..15) recombined with constant shifts — no per-pixel
+//     straddle branches.
+// Values are kept in the [0,255] f32 domain; the only difference from the
+// f16 module is that no /16 range scaling is needed.
+//
+// Level → BC4 index LUT (0,2,3,4,5,6,7,1) packed as 3-bit entries in
+// 0x3F58D0.
 
 struct Params {
   blocks_x: u32,
@@ -36,152 +46,127 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-fn quantize8(v: f32) -> u32 {
-  // Round-to-nearest, clamp to [0, 255]. floor(x + 0.5) is the same
-  // rounding rule the CPU reference uses.
-  return u32(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
-}
-
-// Encode 16 single-channel values into an 8-byte BC4 block, packed as
-// two little-endian u32s (u32[0] = bytes 0..3, u32[1] = bytes 4..7).
-// vmin/vmax are the channel's min/max, computed in the caller's load loop —
-// fusing that scan there saves a 16-value pass per channel.
-fn encode_bc4(values: ptr<function, array<f32, 16>>, vmin: f32, vmax: f32) -> vec2<u32> {
-  var r0: u32 = quantize8(vmax);
-  var r1: u32 = quantize8(vmin);
-  // Force 6-interp mode: red0 > red1 strictly.
-  if (r0 == r1) {
-    if (r1 > 0u) { r1 = r1 - 1u; }
-    else         { r0 = r0 + 1u; }
-  }
-
-  // ONE fused pass: level = round(7·(v − r0)/(r1 − r0)) projection
-  // assignment (the 8-entry 6-interp palette is colinear and evenly
-  // spaced, so the rounded projection IS the nearest-entry search), the
-  // seed solution's packed indices and squared error, and the least-
-  // squares normal-equation sums. The refit endpoints are re-quantised,
-  // reprojected, and accepted only if the block error decreases.
-  // Level → BC4 index LUT (0,2,3,4,5,6,7,1) packed as 3-bit entries in
-  // 0x3F58D0. Pixel k's 3 bits start at bit 3k+16 of the (w0,w1) pair
-  // (bytes 0..1 are the endpoints); k = 5 straddles the word boundary.
-  let r0f = f32(r0) / 255.0;
-  let dir = f32(r1) / 255.0 - r0f;
-  let scale = 7.0 / dir;
-  var w0 = r0 | (r1 << 8u);
-  var w1 = 0u;
-  var sAA = 0.0; var sBB = 0.0; var sAB = 0.0;
-  var sAV = 0.0; var sBV = 0.0;
-  var s_min = 7.0; var s_max = 0.0;
-  var seed_err = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let vr = (*values)[k] - r0f;
-    let L = clamp(floor(vr * scale + 0.5), 0.0, 7.0);
-    s_min = min(s_min, L); s_max = max(s_max, L);
-    let b = L * (1.0 / 7.0); let a = 1.0 - b;
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAV = sAV + a * vr; sBV = sBV + b * vr;
-    let e = vr - b * dir;
-    seed_err = seed_err + e * e;
-    let idx = (0x3F58D0u >> (u32(L) * 3u)) & 7u;
-    let bit = 3u * k + 16u;
-    if (bit <= 29u) {
-      w0 = w0 | (idx << bit);
-    } else if (bit >= 32u) {
-      w1 = w1 | (idx << (bit - 32u));
-    } else {
-      w0 = w0 | (idx << bit);
-      w1 = w1 | (idx >> (32u - bit));
-    }
-  }
-
-  // Rank-1 guard: with every pixel on ONE level the system is singular
-  // (det is float rounding noise); with ≥2 distinct levels
-  // det = Σ_i<j (b_j − b_i)² ≥ 15/49 ≈ 0.306.
-  if (s_min < s_max) {
-    let det = sAA * sBB - sAB * sAB;
-    if (abs(det) > 1e-3) {
-      // Clamp to [0,1], NOT the block's value range: for a scalar channel,
-      // endpoints beyond the data range are often genuinely optimal (they
-      // centre the palette levels on the data) and there is no colour axis
-      // to bend — the bbox clamp the colour formats need costs ~0.3 dB
-      // here. The accept-if-better guard still protects against a refit
-      // that loses after quantisation.
-      let e0 = clamp(r0f + (sBB * sAV - sAB * sBV) / det, 0.0, 1.0);
-      let e1 = clamp(r0f + (sAA * sBV - sAB * sAV) / det, 0.0, 1.0);
-      let n0 = quantize8(e0);
-      let n1 = quantize8(e1);
-      // Keep 6-interp mode (r0 > r1 strictly); skip the no-op refit.
-      if (n0 > n1 && !(n0 == r0 && n1 == r1)) {
-        let n0f = f32(n0) / 255.0;
-        let ndir = f32(n1) / 255.0 - n0f;
-        let nscale = 7.0 / ndir;
-        var nw0 = n0 | (n1 << 8u);
-        var nw1 = 0u;
-        var refit_err = 0.0;
-        for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-          let vr = (*values)[k] - n0f;
-          let L = clamp(floor(vr * nscale + 0.5), 0.0, 7.0);
-          let e = vr - L * (1.0 / 7.0) * ndir;
-          refit_err = refit_err + e * e;
-          let idx = (0x3F58D0u >> (u32(L) * 3u)) & 7u;
-          let bit = 3u * k + 16u;
-          if (bit <= 29u) {
-            nw0 = nw0 | (idx << bit);
-          } else if (bit >= 32u) {
-            nw1 = nw1 | (idx << (bit - 32u));
-          } else {
-            nw0 = nw0 | (idx << bit);
-            nw1 = nw1 | (idx >> (32u - bit));
-          }
-        }
-        if (refit_err < seed_err) {
-          return vec2<u32>(nw0, nw1);
-        }
-      }
-    }
-  }
-  return vec2<u32>(w0, w1);
-}
+const IDX_LUT: u32 = 0x3F58D0u;
 
 @compute @workgroup_size(8, 8, 1)
 fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= params.blocks_x || gid.y >= params.blocks_y) {
     return;
   }
+  let bi = gid.y * params.blocks_x + gid.x;
+  let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
+  let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  let bx = gid.x;
-  let by = gid.y;
-  let block_index = by * params.blocks_x + bx;
-
-  let base   = vec2<i32>(i32(bx) * 4, i32(by) * 4);
-  let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
-
-  // Load 4×4 RG values, splitting into per-channel arrays so each can
-  // be handed to encode_bc4 independently; the per-channel min/max scan is
-  // fused into the same loop.
-  var r_values: array<f32, 16>;
-  var g_values: array<f32, 16>;
-  var r_min: f32 = 1.0; var r_max: f32 = 0.0;
-  var g_min: f32 = 1.0; var g_max: f32 = 0.0;
+  // Load 4×4 R/G pairs (x = R, y = G throughout), min/max fused in.
+  // Clamp to edge for non-multiple-of-4 input sizes.
+  var v: array<vec2<f32>, 16>;
+  var vmin = vec2<f32>(255.0);
+  var vmax = vec2<f32>(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let lx = i32(i & 3u);
-    let ly = i32(i >> 2u);
-    // Clamp to edge for non-multiple-of-4 input sizes.
-    let p  = clamp(base + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
-    let c  = textureLoad(src_tex, p, 0);
-    r_values[i] = c.r;
-    g_values[i] = c.g;
-    r_min = min(r_min, c.r); r_max = max(r_max, c.r);
-    g_min = min(g_min, c.g); g_max = max(g_max, c.g);
+    let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
+    let c = textureLoad(src_tex, p, 0);
+    let val = vec2<f32>(c.r, c.g) * 255.0;
+    v[i] = val; vmin = min(vmin, val); vmax = max(vmax, val);
   }
 
-  let r_block = encode_bc4(&r_values, r_min, r_max);
-  let g_block = encode_bc4(&g_values, g_min, g_max);
+  // Seed endpoints at the exact per-channel extremes (round-to-nearest, the
+  // same rule the CPU reference uses). Flat blocks get nudged apart to keep
+  // the 6-interp mode (r0 > r1 strictly).
+  var r0 = vec2<u32>(clamp(floor(vmax + 0.5), vec2<f32>(0.0), vec2<f32>(255.0)));
+  var r1 = vec2<u32>(clamp(floor(vmin + 0.5), vec2<f32>(0.0), vec2<f32>(255.0)));
+  if (r0.x == r1.x) { if (r1.x > 0u) { r1.x = r1.x - 1u; } else { r0.x = r0.x + 1u; } }
+  if (r0.y == r1.y) { if (r1.y > 0u) { r1.y = r1.y - 1u; } else { r0.y = r0.y + 1u; } }
+
+  let r0f = vec2<f32>(r0);
+  let r1f = vec2<f32>(r1);
+  let dir = r1f - r0f;
+  let scale = vec2<f32>(7.0) / dir;
+
+  // ONE fused pass, both channels: projection assignment, branch-free packed
+  // indices, and the least-squares sums in residual coordinates.
+  var sAA = vec2<f32>(0.0); var sBB = vec2<f32>(0.0); var sAB = vec2<f32>(0.0);
+  var sAR = vec2<f32>(0.0); var sBR = vec2<f32>(0.0); var sErr = vec2<f32>(0.0);
+  var lmin = vec2<f32>(7.0); var lmax = vec2<f32>(0.0);
+  var iAx = 0u; var iBx = 0u; var iAy = 0u; var iBy = 0u;
+  for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+    let vr = v[k] - r0f;
+    let L = clamp(floor(vr * scale + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
+    lmin = min(lmin, L); lmax = max(lmax, L);
+    let b = L * (1.0 / 7.0);
+    let a = 1.0 - b;
+    let r = vr - b * dir;
+    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
+    sAR = sAR + a * r; sBR = sBR + b * r; sErr = sErr + r * r;
+    iAx = iAx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << (k * 3u));
+    iAy = iAy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << (k * 3u));
+  }
+  for (var k: u32 = 8u; k < 16u; k = k + 1u) {
+    let vr = v[k] - r0f;
+    let L = clamp(floor(vr * scale + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
+    lmin = min(lmin, L); lmax = max(lmax, L);
+    let b = L * (1.0 / 7.0);
+    let a = 1.0 - b;
+    let r = vr - b * dir;
+    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
+    sAR = sAR + a * r; sBR = sBR + b * r; sErr = sErr + r * r;
+    iBx = iBx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << ((k - 8u) * 3u));
+    iBy = iBy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << ((k - 8u) * 3u));
+  }
+
+  // Closed-form LSQ refit per channel. Rank-1 guard: with every pixel on ONE
+  // level the system is singular (det is float rounding noise); with ≥2
+  // distinct levels det = Σ_i<j (b_j − b_i)² ≥ 15/49 ≈ 0.306. Endpoints
+  // clamp to [0,255], NOT the block's value range: for a scalar channel,
+  // endpoints beyond the data range are often genuinely optimal and there is
+  // no colour axis to bend.
+  let det = sAA * sBB - sAB * sAB;
+  let d0 = sBB * sAR - sAB * sBR;
+  let d1 = sAA * sBR - sAB * sAR;
+  var n0 = r0; var n1 = r1;
+  var accept = false;
+  for (var c: u32 = 0u; c < 2u; c = c + 1u) {
+    if (lmin[c] < lmax[c] && abs(det[c]) > 1e-3) {
+      let e0 = clamp(r0f[c] + d0[c] / det[c], 0.0, 255.0);
+      let e1 = clamp(r1f[c] + d1[c] / det[c], 0.0, 255.0);
+      let q0 = u32(floor(e0 + 0.5));
+      let q1 = u32(floor(e1 + 0.5));
+      // Keep 6-interp mode (q0 > q1 strictly); skip the no-op refit.
+      if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
+        let dd0 = f32(q0) - r0f[c];
+        let dd1 = f32(q1) - r1f[c];
+        let eNew = sErr[c] - 2.0 * (dd0 * sAR[c] + dd1 * sBR[c])
+          + dd0 * dd0 * sAA[c] + 2.0 * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
+        if (eNew < sErr[c]) {
+          n0[c] = q0; n1[c] = q1;
+          accept = true;
+        }
+      }
+    }
+  }
+
+  // One reprojection pass against the final endpoints when either channel's
+  // refit was accepted; the unchanged channel just reproduces its seed
+  // output.
+  if (accept) {
+    let f0 = vec2<f32>(n0);
+    let fscale = vec2<f32>(7.0) / (vec2<f32>(n1) - f0);
+    iAx = 0u; iBx = 0u; iAy = 0u; iBy = 0u;
+    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+      let L = clamp(floor((v[k] - f0) * fscale + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
+      iAx = iAx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << (k * 3u));
+      iAy = iAy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << (k * 3u));
+    }
+    for (var k: u32 = 8u; k < 16u; k = k + 1u) {
+      let L = clamp(floor((v[k] - f0) * fscale + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
+      iBx = iBx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << ((k - 8u) * 3u));
+      iBy = iBy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << ((k - 8u) * 3u));
+    }
+  }
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.
-  let out = block_index * 4u;
-  dst[out + 0u] = r_block.x;
-  dst[out + 1u] = r_block.y;
-  dst[out + 2u] = g_block.x;
-  dst[out + 3u] = g_block.y;
+  let o = bi * 4u;
+  dst[o] = n0.x | (n1.x << 8u) | (iAx << 16u);
+  dst[o + 1u] = (iAx >> 16u) | (iBx << 8u);
+  dst[o + 2u] = n0.y | (n1.y << 8u) | (iAy << 16u);
+  dst[o + 3u] = (iAy >> 16u) | (iBy << 8u);
 }

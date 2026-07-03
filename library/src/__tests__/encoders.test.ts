@@ -67,7 +67,7 @@ describe('BC5Encoder', () => {
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
     // Sanity: the shader mentions the BC5-specific concepts.
-    expect(src).toContain('encode_bc4')
+    expect(src).toContain('BC4')
     expect(src).toMatch(/6-interp/i)
   })
 })
