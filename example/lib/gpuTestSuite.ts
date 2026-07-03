@@ -47,8 +47,12 @@ export interface QualityResult {
   variant: 'f16' | 'f32'
   image: string
   psnrDb: number
-  /** PSNR of the exhaustive CPU reference encode on the same image. */
-  refPsnrDb: number
+  /**
+   * PSNR of the exhaustive CPU reference encode on the same image, or null
+   * for the PSNR-floor-only rows (2K/4K real textures) where the reference
+   * encode is prohibitively slow (~16 s per format at 4096²).
+   */
+  refPsnrDb: number | null
   thresholdDb: number
   /**
    * Worst EASY block: max over blocks that the CPU reference encodes
@@ -57,10 +61,10 @@ export interface QualityResult {
    * turning the wrong colour) barely move aggregate PSNR but explode this
    * metric; genuinely hard blocks (noise), where a single-line encoder may
    * legitimately trail the exhaustive search, are excluded. Also reported:
-   * the overall worst excess, for context.
+   * the overall worst excess, for context. Null on PSNR-floor-only rows.
    */
-  worstEasyBlockExcess: number
-  worstBlockExcess: number
+  worstEasyBlockExcess: number | null
+  worstBlockExcess: number | null
   excessLimit: number | null
   pass: boolean
 }
@@ -97,20 +101,51 @@ export type ProgressFn = (message: string) => void
 // cross-GPU float jitter passes. `null` = record only.
 // ---------------------------------------------------------------------------
 const PSNR_THRESHOLDS: Record<string, number | null> = {
-  // `${format}:${image}` — measured on the FULL 1024² committed test cards
-  // (2026-07, Apple/metal-3, 16-tile colour card + structured normal map)
-  // minus ~0.15 dB: 29.26, 53.18 (equal to the exhaustive reference), 31.84,
-  // 30.57, alpha 34.73/33.22. The `:normal` colour-format entries track the
-  // cross-card matrix without gating.
+  // `${format}:${image}` — measured on the committed test images (2026-07,
+  // Apple/metal-3, mode-6-only BC7 with the 8-step power iteration) minus
+  // ~0.15 dB. BC7 rows on multi-modal content (packed-*, rock-color) sit at
+  // the mode-6 exhaustive reference level — the mode 1 candidate that
+  // lifted them ~+1.3 dB was dropped for speed (see bc7_fast_f16.wgsl).
+  // Unlisted rows and the `:normal` colour-format cross-card entries are
+  // record-only.
   'bc1:color': 29.05,
   'bc5:normal': 53.0,
-  'bc7:color': 31.7,
+  'bc7:color': 31.9,
   'astc:color': 30.4,
   'bc7:alpha': 34.5,
   'astc:alpha': 33.05,
   'bc1:normal': null,
   'bc7:normal': null,
   'astc:normal': null,
+  // Real textures (2026-07 baselines, min over f16/f32, minus ~0.15 dB).
+  'bc7:packed-256': 32.75,
+  'bc7:packed-512': 35.0,
+  'bc1:packed-1024': 34.75,
+  'bc7:packed-1024': 37.65,
+  'astc:packed-1024': 36.6,
+  'bc7:packed-2048': 45.15,
+  'bc7:packed-4096': 49.95,
+  'bc1:rock-color-1k': 33.9,
+  'bc7:rock-color-1k': 38.1,
+  'astc:rock-color-1k': 35.35,
+  'bc5:rock-normal-1k': 46.3,
+  'bc1:rock-roughness-1k': 39.1,
+  'bc1:rock-ao-1k': 41.25,
+  'bc1:rock-displacement-1k': 44.7,
+  'bc7:rock-color-2k': 38.75,
+  'bc5:rock-normal-2k': 44.9,
+  'bc7:rock-color-4k': 39.15,
+  'bc5:rock-normal-4k': 43.75,
+  'bc1:wood-color-1k': 41.9,
+  'bc7:wood-color-1k': 49.4,
+  'astc:wood-color-1k': 46.65,
+  'bc5:wood-normal-1k': 48.0,
+  'bc1:wood-roughness-1k': 40.4,
+  'bc1:wood-displacement-1k': 42.95,
+  'bc7:wood-color-2k': 50.65,
+  'bc5:wood-normal-2k': 48.9,
+  'bc7:wood-color-4k': 51.7,
+  'bc5:wood-normal-4k': 47.6,
 }
 
 // Worst-EASY-block gate: over blocks that the CPU reference encodes
@@ -123,14 +158,33 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
 const EASY_BLOCK_SSE = 0.05
 const EXCESS_LIMITS: Record<string, number | null> = {
   // `${format}:${image}` — ~2–3× the observed values (2026-07, Apple/metal-3:
-  // 0.061, 0.006, 0.016, 0.050, alpha 0.002/0.004), still 10×+ below
-  // catastrophic-artifact level.
+  // 0.061, 0.006, 0.016, 0.050, alpha 0.002/0.004, packed-materials
+  // 0.061/0.054/0.055), still 10×+ below catastrophic-artifact level.
   'bc1:color': 0.15,
   'bc5:normal': 0.05,
   'bc7:color': 0.12,
   'astc:color': 0.15,
   'bc7:alpha': 0.05,
   'astc:alpha': 0.1,
+  // Real textures (observed 0.001–0.06).
+  'bc7:packed-256': 0.05,
+  'bc7:packed-512': 0.1,
+  'bc1:packed-1024': 0.15,
+  'bc7:packed-1024': 0.15,
+  'astc:packed-1024': 0.15,
+  'bc1:rock-color-1k': 0.15,
+  'bc7:rock-color-1k': 0.05,
+  'astc:rock-color-1k': 0.15,
+  'bc5:rock-normal-1k': 0.05,
+  'bc1:rock-roughness-1k': 0.05,
+  'bc1:rock-ao-1k': 0.1,
+  'bc1:rock-displacement-1k': 0.05,
+  'bc1:wood-color-1k': 0.05,
+  'bc7:wood-color-1k': 0.05,
+  'astc:wood-color-1k': 0.05,
+  'bc5:wood-normal-1k': 0.05,
+  'bc1:wood-roughness-1k': 0.1,
+  'bc1:wood-displacement-1k': 0.05,
 }
 
 // ------------------------------------------------------------------ helpers
@@ -432,69 +486,144 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   }
 
   // -------------------------------------------------------------- quality
-  // Quality runs on the FULL committed test cards — every tile (smooth
+  // Quality runs on the FULL synthetic test cards — every tile (smooth
   // gradients, hard edges, Nyquist checkers, zone plate, noise, disc-over-
   // checker probe, natural-ish content) stresses a different failure mode,
-  // and a crop would hide localized bugs. The `:normal` colour-format rows
-  // are record-only (null thresholds): anti-correlated R/G is exactly where
-  // a bbox-diagonal endpoint seed collapses, so they track the PCA seeding's
-  // headline win without gating.
-  const qualityCases: Array<{ format: FormatKey; image: string; img: ImageData }> = [
-    { format: 'bc1', image: 'color', img: colorFull },
-    { format: 'bc5', image: 'normal', img: normalFull },
-    { format: 'bc7', image: 'color', img: colorFull },
-    { format: 'astc', image: 'color', img: colorFull },
-    { format: 'bc7', image: 'alpha', img: alpha },
-    { format: 'astc', image: 'alpha', img: alpha },
-    { format: 'bc1', image: 'normal', img: normalFull },
-    { format: 'bc7', image: 'normal', img: normalFull },
-    { format: 'astc', image: 'normal', img: normalFull },
+  // and a crop would hide localized bugs — plus a set of REAL textures: the
+  // packed-materials game atlas (channel-packed monochrome maps, the
+  // multi-modal probe that synthetic images hid) and the Rock064 /
+  // WoodFloor004 PBR sets (photographic colour, tangent-space normals, and
+  // grayscale roughness/AO/displacement maps).
+  //
+  // Rows with `ref: true` are gated against the exhaustive CPU reference
+  // (PSNR floor + worst-easy-block excess). The reference encode costs ~1 s
+  // per format at 1024² but ~16 s at 4096², so the 2K/4K rows are
+  // PSNR-floor-only and run just the default shader variant — the f16↔f32
+  // and per-block gates are already covered by the 1K row of the same
+  // content. The `:normal` colour-format rows are record-only (null
+  // thresholds): anti-correlated R/G is exactly where a bbox-diagonal
+  // endpoint seed collapses, so they track the PCA seeding's headline win
+  // without gating.
+  //
+  // Images load lazily per spec — a 4096² ImageData is 64 MB, so holding
+  // the whole set at once would cost ~½ GB.
+  const rock = (size: string, map: string) => `/textures/Rock064_${size}-JPG/Rock064_${size}-JPG_${map}.jpg`
+  const wood = (size: string, map: string) => `/textures/WoodFloor004_${size}-JPG/WoodFloor004_${size}-JPG_${map}.jpg`
+  const packed = (size: number) => `/textures/packed-materials/packed-materials-${size}.png`
+  interface QualitySpec {
+    image: string
+    formats: FormatKey[]
+    src: string | ImageData
+    /** Run the exhaustive CPU reference + per-block gates. */
+    ref: boolean
+    /** Also run the f32-forced variant (default true for ref'd rows). */
+    bothVariants: boolean
+  }
+  const gated = (image: string, formats: FormatKey[], src: string | ImageData): QualitySpec => ({
+    image,
+    formats,
+    src,
+    ref: true,
+    bothVariants: true,
+  })
+  const floorOnly = (image: string, formats: FormatKey[], src: string): QualitySpec => ({
+    image,
+    formats,
+    src,
+    ref: false,
+    bothVariants: false,
+  })
+  const qualitySpecs: QualitySpec[] = [
+    // Synthetic cards.
+    gated('color', ['bc1', 'bc7', 'astc'], colorFull),
+    gated('normal', ['bc5', 'bc1', 'bc7', 'astc'], normalFull),
+    gated('alpha', ['bc7', 'astc'], alpha),
+    // Packed-materials game atlas (channel-packed, has alpha at 1024).
+    gated('packed-256', ['bc7'], packed(256)),
+    gated('packed-512', ['bc7'], packed(512)),
+    gated('packed-1024', ['bc1', 'bc7', 'astc'], packed(1024)),
+    floorOnly('packed-2048', ['bc7'], packed(2048)),
+    floorOnly('packed-4096', ['bc7'], packed(4096)),
+    // Rock064 PBR set (photographic).
+    gated('rock-color-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Color')),
+    gated('rock-normal-1k', ['bc5'], rock('1K', 'NormalGL')),
+    gated('rock-roughness-1k', ['bc1'], rock('1K', 'Roughness')),
+    gated('rock-ao-1k', ['bc1'], rock('1K', 'AmbientOcclusion')),
+    gated('rock-displacement-1k', ['bc1'], rock('1K', 'Displacement')),
+    floorOnly('rock-color-2k', ['bc7'], rock('2K', 'Color')),
+    floorOnly('rock-normal-2k', ['bc5'], rock('2K', 'NormalGL')),
+    floorOnly('rock-color-4k', ['bc7'], rock('4K', 'Color')),
+    floorOnly('rock-normal-4k', ['bc5'], rock('4K', 'NormalGL')),
+    // WoodFloor004 PBR set (photographic, strong plank seams).
+    gated('wood-color-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Color')),
+    gated('wood-normal-1k', ['bc5'], wood('1K', 'NormalGL')),
+    gated('wood-roughness-1k', ['bc1'], wood('1K', 'Roughness')),
+    gated('wood-displacement-1k', ['bc1'], wood('1K', 'Displacement')),
+    floorOnly('wood-color-2k', ['bc7'], wood('2K', 'Color')),
+    floorOnly('wood-normal-2k', ['bc5'], wood('2K', 'NormalGL')),
+    floorOnly('wood-color-4k', ['bc7'], wood('4K', 'Color')),
+    floorOnly('wood-normal-4k', ['bc5'], wood('4K', 'NormalGL')),
   ]
 
-  for (const { format, image, img } of qualityCases) {
-    // Per-block error of the exhaustive CPU reference encode — the yardstick
-    // for the worst-block gate. Aggregate PSNR alone is insensitive to a
-    // handful of catastrophically wrong blocks.
-    onProgress(`Quality: ${format} CPU reference baseline on ${image}`)
-    const refData = referenceEncode(format, img)
-    const refSse = perBlockSse(format, img, refData)
-    const refPsnrDb = computePsnr(format, img, refData)
+  for (const spec of qualitySpecs) {
+    const { image, ref } = spec
+    onProgress(`Quality: loading ${image}…`)
+    const img = typeof spec.src === 'string' ? await loadImageData(spec.src) : spec.src
 
-    const variants: Array<['f16' | 'f32', Encoder]> = hasF16
-      ? [
-          ['f16', encoders[format]],
-          ['f32', encodersF32[format]],
-        ]
-      : [['f32', encoders[format]]]
-    for (const [variant, enc] of variants) {
-      onProgress(`Quality: ${format} (${variant}) PSNR on ${image}`)
-      const { data } = await enc.encodeToBytes(img)
-      const psnrDb = computePsnr(format, img, data)
-      const threshold = PSNR_THRESHOLDS[`${format}:${image}`] ?? null
-
-      let worstBlockExcess = 0
-      let worstEasyBlockExcess = 0
-      const sse = perBlockSse(format, img, data)
-      for (let i = 0; i < sse.length; i++) {
-        const excess = sse[i]! - refSse[i]!
-        if (excess > worstBlockExcess) worstBlockExcess = excess
-        if (refSse[i]! <= EASY_BLOCK_SSE && excess > worstEasyBlockExcess) worstEasyBlockExcess = excess
+    for (const format of spec.formats) {
+      // Per-block error of the exhaustive CPU reference encode — the
+      // yardstick for the worst-block gate. Aggregate PSNR alone is
+      // insensitive to a handful of catastrophically wrong blocks.
+      let refSse: Float64Array | null = null
+      let refPsnrDb: number | null = null
+      if (ref) {
+        onProgress(`Quality: ${format} CPU reference baseline on ${image}`)
+        const refData = referenceEncode(format, img)
+        refSse = perBlockSse(format, img, refData)
+        refPsnrDb = computePsnr(format, img, refData)
       }
-      const excessLimit = EXCESS_LIMITS[`${format}:${image}`] ?? null
-      quality.push({
-        format,
-        variant,
-        image,
-        psnrDb,
-        refPsnrDb,
-        thresholdDb: threshold ?? 0,
-        worstEasyBlockExcess,
-        worstBlockExcess,
-        excessLimit,
-        pass:
-          (threshold === null ? true : psnrDb >= threshold) &&
-          (excessLimit === null ? true : worstEasyBlockExcess <= excessLimit),
-      })
+
+      const variants: Array<['f16' | 'f32', Encoder]> =
+        hasF16 && spec.bothVariants
+          ? [
+              ['f16', encoders[format]],
+              ['f32', encodersF32[format]],
+            ]
+          : [[hasF16 ? 'f16' : 'f32', encoders[format]]]
+      for (const [variant, enc] of variants) {
+        onProgress(`Quality: ${format} (${variant}) PSNR on ${image}`)
+        const { data } = await enc.encodeToBytes(img)
+        const psnrDb = computePsnr(format, img, data)
+        const threshold = PSNR_THRESHOLDS[`${format}:${image}`] ?? null
+
+        let worstBlockExcess: number | null = null
+        let worstEasyBlockExcess: number | null = null
+        if (refSse) {
+          worstBlockExcess = 0
+          worstEasyBlockExcess = 0
+          const sse = perBlockSse(format, img, data)
+          for (let i = 0; i < sse.length; i++) {
+            const excess = sse[i]! - refSse[i]!
+            if (excess > worstBlockExcess) worstBlockExcess = excess
+            if (refSse[i]! <= EASY_BLOCK_SSE && excess > worstEasyBlockExcess) worstEasyBlockExcess = excess
+          }
+        }
+        const excessLimit = ref ? (EXCESS_LIMITS[`${format}:${image}`] ?? null) : null
+        quality.push({
+          format,
+          variant,
+          image,
+          psnrDb,
+          refPsnrDb,
+          thresholdDb: threshold ?? 0,
+          worstEasyBlockExcess,
+          worstBlockExcess,
+          excessLimit,
+          pass:
+            (threshold === null ? true : psnrDb >= threshold) &&
+            (excessLimit === null || worstEasyBlockExcess === null ? true : worstEasyBlockExcess <= excessLimit),
+        })
+      }
     }
   }
 

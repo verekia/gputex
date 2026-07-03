@@ -141,11 +141,11 @@ const TestPage = () => {
                     <Td>{q.variant}</Td>
                     <Td>{q.image}</Td>
                     <Td>{fmtDb(q.psnrDb)}</Td>
-                    <Td>{fmtDb(q.refPsnrDb)}</Td>
+                    <Td>{q.refPsnrDb !== null ? fmtDb(q.refPsnrDb) : '—'}</Td>
                     <Td>{q.thresholdDb ? fmtDb(q.thresholdDb) : '—'}</Td>
-                    <Td>{q.worstEasyBlockExcess.toFixed(4)}</Td>
+                    <Td>{q.worstEasyBlockExcess !== null ? q.worstEasyBlockExcess.toFixed(4) : '—'}</Td>
                     <Td>{q.excessLimit !== null ? q.excessLimit.toFixed(2) : '—'}</Td>
-                    <Td>{q.worstBlockExcess.toFixed(2)}</Td>
+                    <Td>{q.worstBlockExcess !== null ? q.worstBlockExcess.toFixed(2) : '—'}</Td>
                     <Td mono={false}>
                       <Badge pass={q.pass} />
                     </Td>
