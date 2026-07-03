@@ -1,6 +1,7 @@
 import {
   encodeBC7Mode6Block,
   decodeBC7Mode6Block,
+  decodeBC7Mode4Block,
   decodeBC7Block,
   encodeBC7Block,
   readBC7Mode,
@@ -299,5 +300,71 @@ describe('BC7 mode 1 decode', () => {
     const s1e0 = [203, 207, 211] // v7=101→e8=202|1=203, 103→207, 105→211
     for (const k of [0, 4, 5, 6, 8, 15]) expect(at(k)).toEqual(s0e0)
     for (const k of [1, 2, 3, 7]) expect(at(k)).toEqual(s1e0)
+  })
+})
+
+describe('BC7 mode 4 decode', () => {
+  /** Pack a mode 4 block from raw fields, LSB-first like the spec. */
+  function packMode4(
+    rotation: number,
+    idxMode: number,
+    c5: number[], // R0 R1 G0 G1 B0 B1
+    a6: [number, number],
+    w2: number[], // 16 2-bit indices (idx0 MSB must be 0)
+    w3: number[], // 16 3-bit indices (idx0 MSB must be 0)
+  ): Uint8Array {
+    const out = new Uint8Array(16)
+    let pos = 0
+    const w = (value: number, bits: number) => {
+      for (let i = 0; i < bits; i++) {
+        if ((value >> i) & 1) out[pos >> 3] = out[pos >> 3]! | (1 << (pos & 7))
+        pos++
+      }
+    }
+    w(0b10000, 5) // mode 4: four zeros then a 1, LSB-first
+    w(rotation, 2)
+    w(idxMode, 1)
+    for (const v of c5) w(v, 5)
+    for (const v of a6) w(v, 6)
+    for (let k = 0; k < 16; k++) w(w2[k]!, k === 0 ? 1 : 2)
+    for (let k = 0; k < 16; k++) w(w3[k]!, k === 0 ? 2 : 3)
+    if (pos !== 128) throw new Error(`packed ${pos} bits`)
+    return out
+  }
+
+  it('decodes endpoints, weights and rotation (validated bit-exact vs hardware)', () => {
+    // rotation 1 (A↔R): colour plane carries (A,G,B), scalar plane carries R.
+    const w2 = Array.from({ length: 16 }, () => 0)
+    const w3 = Array.from({ length: 16 }, () => 0)
+    w2[5] = 3
+    w3[5] = 7
+    const block = packMode4(1, 0, [0, 31, 0, 31, 0, 31], [0, 63], w2, w3)
+    const px = decodeBC7Mode4Block(block)
+    // Pixel 0: colour plane at weight 0 → (0,0,0) rotated, scalar 0 → all 0.
+    expect(px[0]).toBe(0)
+    expect(px[1]).toBe(0)
+    expect(px[2]).toBe(0)
+    expect(px[3]).toBe(0)
+    // Pixel 5: colour at weight 3 (unq 64) and scalar at weight 7 (unq 64)
+    // → all channels 1 after un-rotation.
+    expect(px[5 * 4]).toBe(1)
+    expect(px[5 * 4 + 1]).toBe(1)
+    expect(px[5 * 4 + 2]).toBe(1)
+    expect(px[5 * 4 + 3]).toBe(1)
+    // Pixel 1: same as pixel 0 (all-zero weights).
+    expect(px[4]).toBe(0)
+  })
+
+  it('applies 5-bit and 6-bit endpoint bit replication', () => {
+    // Colour lo = 16 → e8 = (16<<3)|(16>>2) = 132; alpha lo = 32 →
+    // (32<<2)|(32>>4) = 130. rotation 0: alpha stays alpha.
+    const w2 = Array.from({ length: 16 }, () => 0)
+    const w3 = Array.from({ length: 16 }, () => 0)
+    const block = packMode4(0, 0, [16, 16, 16, 16, 16, 16], [32, 32], w2, w3)
+    const px = decodeBC7Mode4Block(block)
+    expect(Math.round(px[0]! * 255)).toBe(132)
+    expect(Math.round(px[1]! * 255)).toBe(132)
+    expect(Math.round(px[2]! * 255)).toBe(132)
+    expect(Math.round(px[3]! * 255)).toBe(130)
   })
 })

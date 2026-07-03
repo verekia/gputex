@@ -102,6 +102,12 @@ fn principal_axis4(
   return v;
 }
 
+// NOTE: this f32 fallback (and the WebGL2 port) deliberately stays
+// mode-6-only + the gray fast path. The adaptive mode-4 path lives in
+// bc7_fast_f16.wgsl — the kernel every f16-capable device (and the
+// external comparisons) actually runs; porting it here is tracked as a
+// follow-up and the CPU reference already decodes mode 4.
+
 // ------------------------------- Entry --------------------------------- //
 
 @compute @workgroup_size(8, 8, 1)

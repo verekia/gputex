@@ -21,6 +21,7 @@ export {
   encodeBC7Mode6Block,
   decodeBC7Mode6Block,
   decodeBC7Mode1Block,
+  decodeBC7Mode4Block,
   readBC7Mode,
   type BC7Pixels,
   type BC7Block,

@@ -615,6 +615,87 @@ export function decodeBC7Mode1Block(block: BC7Block): Float32Array {
   return out
 }
 
+// --- Mode 4 decode ----------------------------------------------------------
+//
+// MODE 4 LAYOUT (LSB-first):
+//   bits 0..4    mode field (0b00001 — four zero bits then a 1)
+//   bits 5..6    rotation: 0 = none, 1 = A↔R, 2 = A↔G, 3 = A↔B (the swap is
+//                applied to each decoded pixel at the END, so the "colour"
+//                triple and the "alpha" scalar below are in rotated space)
+//   bit  7       idxMode: 0 → colour uses the 2-bit index field and alpha
+//                the 3-bit field; 1 → swapped
+//   bits 8..37   colour endpoints, 5 bits each: R0 R1 G0 G1 B0 B1
+//   bits 38..49  alpha endpoints, 6 bits each: A0 A1
+//   bits 50..80  31-bit index field: 16 × 2-bit, pixel 0 anchored (1 bit)
+//   bits 81..127 47-bit index field: 16 × 3-bit, pixel 0 anchored (2 bits)
+//
+// Endpoint dequant: colour e8 = (v5 << 3) | (v5 >> 2), alpha
+// e8 = (v6 << 2) | (v6 >> 4). No p-bits. Weights: W2 for the 2-bit set,
+// W3 for the 3-bit set. Layout cross-checked against bc7enc's
+// bc7decomp.cpp (public domain) and validated against hardware
+// bc7-rgba-unorm sampling.
+
+/** 2-bit interpolation weights (× 1/64). Fixed by the spec. */
+const W2: readonly number[] = [0, 21, 43, 64]
+
+/**
+ * Decode a BC7 mode 4 block to 16 normalized [0, 1] RGBA pixels (64 floats).
+ * Throws if the block doesn't start with the mode 4 field.
+ */
+export function decodeBC7Mode4Block(block: BC7Block): Float32Array {
+  if (block.length !== 16) {
+    throw new Error(`decodeBC7Mode4Block: expected 16 bytes, got ${block.length}`)
+  }
+  const mode = readBC7Mode(block)
+  if (mode !== 4) {
+    throw new Error(`decodeBC7Mode4Block: expected mode 4, got mode ${mode}`)
+  }
+
+  const br = new BitReader128(block)
+  br.read(5) // skip mode field
+  const rotation = br.read(2)
+  const idxMode = br.read(1)
+
+  const c5: number[] = []
+  for (let i = 0; i < 6; i++) c5.push(br.read(5))
+  const a6 = [br.read(6), br.read(6)]
+
+  // Dequantize (bit replication).
+  const c8 = c5.map(v => (v << 3) | (v >> 2))
+  const a8 = a6.map(v => (v << 2) | (v >> 4))
+  const e0 = [c8[0]!, c8[2]!, c8[4]!]
+  const e1 = [c8[1]!, c8[3]!, c8[5]!]
+
+  // Index fields: 2-bit set first (31 bits), then 3-bit set (47 bits).
+  const w2idx = new Uint8Array(16)
+  for (let k = 0; k < 16; k++) w2idx[k] = br.read(k === 0 ? 1 : 2)
+  const w3idx = new Uint8Array(16)
+  for (let k = 0; k < 16; k++) w3idx[k] = br.read(k === 0 ? 2 : 3)
+
+  const out = new Float32Array(64)
+  for (let k = 0; k < 16; k++) {
+    const cw = idxMode === 0 ? W2[w2idx[k]!]! : W3[w3idx[k]!]!
+    const aw = idxMode === 0 ? W3[w3idx[k]!]! : W2[w2idx[k]!]!
+    const px = [
+      interp8(e0[0]!, e1[0]!, cw),
+      interp8(e0[1]!, e1[1]!, cw),
+      interp8(e0[2]!, e1[2]!, cw),
+      interp8(a8[0]!, a8[1]!, aw),
+    ]
+    if (rotation > 0) {
+      const c = rotation - 1
+      const t = px[3]!
+      px[3] = px[c]!
+      px[c] = t
+    }
+    out[k * 4] = px[0]! / 255
+    out[k * 4 + 1] = px[1]! / 255
+    out[k * 4 + 2] = px[2]! / 255
+    out[k * 4 + 3] = px[3]! / 255
+  }
+  return out
+}
+
 // --- Top-level entry points -------------------------------------------------
 
 /**
@@ -627,16 +708,18 @@ export function encodeBC7Block(pixels: BC7Pixels): BC7Block {
 
 /**
  * Decode a BC7 block, dispatching on the mode field. This reference
- * supports modes 1 and 6 — the two modes the GPU encoder emits; other
- * modes throw. Encoders outside this project (AMD Compressonator,
- * bc7enc, ...) routinely pick other modes, so this decoder is mainly
- * for round-tripping our own output.
+ * supports modes 1, 4 and 6 — the modes the GPU encoder emits (or has
+ * emitted); other modes throw. Encoders outside this project (AMD
+ * Compressonator, bc7enc, ...) routinely pick other modes, so this
+ * decoder is mainly for round-tripping our own output.
  */
 export function decodeBC7Block(block: BC7Block): Float32Array {
   const mode = readBC7Mode(block)
   switch (mode) {
     case 1:
       return decodeBC7Mode1Block(block)
+    case 4:
+      return decodeBC7Mode4Block(block)
     case 6:
       return decodeBC7Mode6Block(block)
     default:
