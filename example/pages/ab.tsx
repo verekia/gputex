@@ -114,7 +114,10 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
   for (const f of ['shader-f16', 'timestamp-query'] as GPUFeatureName[]) {
     if (!adapter.features.has(f)) throw new Error(`adapter lacks ${f}`)
   }
-  const device = await adapter.requestDevice({ requiredFeatures: ['shader-f16', 'timestamp-query'] })
+  const requested: GPUFeatureName[] = ['shader-f16', 'timestamp-query']
+  // Subgroup experiments opt in when the adapter offers the feature.
+  if (adapter.features.has('subgroups')) requested.push('subgroups')
+  const device = await adapter.requestDevice({ requiredFeatures: requested })
 
   onProgress('Preparing source texture…')
   const img = imageParam.startsWith('/')
@@ -131,6 +134,17 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
   })
   device.queue.writeTexture({ texture: tex }, img.data, { bytesPerRow: w * 4 }, [w, h])
+
+  // Buffer-source experiments: a shader that declares `src_buf` at binding 0
+  // reads the same pixels as packed RGBA8 words from a storage buffer.
+  let srcBuf: GPUBuffer | null = null
+  const getSrcBuf = (): GPUBuffer => {
+    if (!srcBuf) {
+      srcBuf = device.createBuffer({ size: w * h * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+      device.queue.writeBuffer(srcBuf, 0, img.data.buffer, img.data.byteOffset, w * h * 4)
+    }
+    return srcBuf
+  }
 
   const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
   device.queue.writeBuffer(uniform, 0, new Uint32Array([blocksX, blocksY, w, h]))
@@ -150,8 +164,9 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const errors = info.messages.filter(m => m.type === 'error')
     if (errors.length) throw new Error(`${name}: ${errors.map(m => `${m.lineNum}: ${m.message}`).join('\n')}`)
     const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'encode' } })
+    const usesBuf = /var<storage,\s*read>\s*src_buf/.test(code)
     const entries: GPUBindGroupEntry[] = [
-      { binding: 0, resource: tex.createView() },
+      usesBuf ? { binding: 0, resource: { buffer: getSrcBuf() } } : { binding: 0, resource: tex.createView() },
       { binding: 1, resource: { buffer: dst } },
       { binding: 2, resource: { buffer: uniform } },
     ]
