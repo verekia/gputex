@@ -152,16 +152,24 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (lmin[c] < lmax[c] && abs(det[c]) > 1e-3) {
       let e0 = clamp(r0f[c] + d0[c] / det[c], 0.0, 255.0);
       let e1 = clamp(r1f[c] + d1[c] / det[c], 0.0, 255.0);
-      let q0 = u32(floor(e0 + 0.5));
-      let q1 = u32(floor(e1 + 0.5));
-      // Keep 6-interp mode (q0 > q1 strictly); skip the no-op refit.
-      if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
-        let dd0 = f32(q0) - r0f[c];
-        let dd1 = f32(q1) - r1f[c];
-        let eNew = sErr[c] - 2.0 * (dd0 * sAR[c] + dd1 * sBR[c])
-          + dd0 * dd0 * sAA[c] + 2.0 * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
-        if (eNew < sErr[c]) {
-          n0[c] = q0; n1[c] = q1;
+      // Price all four floor/ceil roundings of the fractional solve
+      // closed-form (see bc5_fast_f16.wgsl); keep the best that stays in
+      // 6-interp mode and beats the seed.
+      var bestE = 0.0;
+      for (var m: u32 = 0u; m < 4u; m = m + 1u) {
+        let q0f = clamp(floor(e0) + f32(m & 1u), 0.0, 255.0);
+        let q1f = clamp(floor(e1) + f32(m >> 1u), 0.0, 255.0);
+        let q0 = u32(q0f);
+        let q1 = u32(q1f);
+        if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
+          let dd0 = q0f - r0f[c];
+          let dd1 = q1f - r1f[c];
+          let eNew = -2.0 * (dd0 * sAR[c] + dd1 * sBR[c])
+            + dd0 * dd0 * sAA[c] + 2.0 * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
+          if (eNew < bestE) {
+            bestE = eNew;
+            n0[c] = q0; n1[c] = q1;
+          }
         }
       }
     }

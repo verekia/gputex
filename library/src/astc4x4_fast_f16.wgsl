@@ -22,8 +22,11 @@
 //     gradients). Scaling dir by 32 puts every intermediate in f16's
 //     normal range; s = dot·(32·L/dd₃₂) is the same quantity (worst case
 //     for L = 7 levels: inv = 224/0.0157 ≈ 1.4e4).
-//   • The seed pass only accumulates the LSQ sums (no weight output) — the
-//     final weights come from reprojecting against the refit endpoints.
+//   • Opaque blocks ship the quantised PCA extents directly (no LSQ fit
+//     pass, 8 power iterations — see the endpoint-selection comment); only
+//     the translucent CEM 12 path still refits, and its seed pass only
+//     accumulates the LSQ sums — final weights always come from a
+//     reprojection against the final endpoints.
 //   • Endpoint ordering (the blue-contraction rule: sum(e0.rgb) must not
 //     exceed sum(e1.rgb)) is applied BEFORE the final projection, so no
 //     weight-reflection pass is needed.
@@ -54,11 +57,12 @@ struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, };
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-// Fused projection + least-squares refit against an `lmax`-level palette
-// (lmax = levels − 1, inv_lmax = 1/lmax, inv_scale = lmax·32 for the
-// ×32-pre-scaled direction — see header).
+// Fused projection + least-squares refit against the 4-level QUANT_4
+// palette — only the translucent (CEM 12) path still refits: the 2-bit
+// weight grid is coarse enough to need it, while the opaque paths get
+// more from spending the same time elsewhere (see header).
 struct Fit { e0: h4, e1: h4, valid: bool };
-fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4, lmax: h, inv_lmax: h, inv_scale: h) -> Fit {
+fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   var out: Fit;
   out.valid = false;
   // dir pre-scaled by 32 to keep dd and the projection dots in f16's normal
@@ -67,31 +71,30 @@ fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4, lmax: h, inv_lmax
   let dir = (e1 - e0) * h(32.0);
   let dd = dot(dir, dir);
   if (dd < h(0.008)) { return out; }
-  let inv = inv_scale / dd;
+  let inv = h(96.0) / dd; // 32·3/dd₃₂ ≡ 3/dd
   var sAA = h(0.0); var sBB = h(0.0); var sAB = h(0.0);
   var sAV = h4(0.0); var sBV = h4(0.0);
-  var s_min = lmax; var s_max = h(0.0);
+  var s_min = h(3.0); var s_max = h(0.0);
   // Value sums accumulate v − e0 (basis is affine, a + b = 1, so the fit
   // commutes with the shift): accumulators scale with the block span, keeping
   // f16 rounding a fraction of the span instead of ±1 level at high absolute
   // values.
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let vr = (*pix)[k] - e0;
-    let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), lmax);
+    let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), h(3.0));
     s_min = min(s_min, s); s_max = max(s_max, s);
-    let b = s * inv_lmax;
+    let b = s * h(1.0 / 3.0);
     let a = h(1.0) - b;
     sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
     sAV = sAV + a * vr; sBV = sBV + b * vr;
   }
   // Rank-1 guard: if every pixel projects to ONE level the system is
-  // singular — det/numerators are pure f16 rounding noise (≲0.03) and the
-  // solve returns garbage endpoints. With ≥2 distinct levels
-  // det = Σ_i<j (b_j − b_i)² ≥ 15·(1/7)² ≈ 0.306 even at 8 levels — 0.1
-  // separates cleanly (same guard as the BC5 kernel's 8-level system).
+  // singular — det/numerators are pure f16 rounding noise and the solve
+  // returns garbage endpoints. With ≥2 distinct levels
+  // det = Σ_i<j (b_j − b_i)² ≥ 15·(1/3)² ≈ 1.67 — 0.5 separates cleanly.
   if (s_min == s_max) { return out; }
   let det = sAA * sBB - sAB * sAB;
-  if (abs(det) < h(0.1)) { return out; }
+  if (abs(det) < h(0.5)) { return out; }
   out.e0 = clamp(e0 + (sBB * sAV - sAB * sBV) / det, h4(0.0), h4(1.0));
   out.e1 = clamp(e0 + (sAA * sBV - sAB * sAV) / det, h4(0.0), h4(1.0));
   out.valid = true;
@@ -193,7 +196,10 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var axis = hi - lo;
     var axis_ok = true;
-    for (var it: u32 = 0u; it < 4u; it = it + 1u) {
+    // 8 iterations, matching the f32 fallback and the BC7 kernel: 4 was
+    // under-converged on noisy 4-D blocks, and with the opaque path now
+    // shipping the PCA extents directly the axis IS the endpoint quality.
+    for (var it: u32 = 0u; it < 8u; it = it + 1u) {
       let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
       let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
       if (m < h(1e-4)) { axis_ok = false; break; }
@@ -212,21 +218,31 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       seed_hi = clamp(mean + t_max * axis, h4(0.0), h4(1.0));
     }
 
-    // Opaque blocks fit/reproject against the 8-level QUANT_8 palette
-    // (CEM 8), translucent against the 4-level QUANT_4 one (CEM 12).
-    let lmax = select(h(3.0), h(7.0), opaque);
-    let inv_lmax = select(h(1.0 / 3.0), h(1.0 / 7.0), opaque);
-    let inv_scale = select(h(96.0), h(224.0), opaque);
-
-    // The refit is clamped to the block bbox: on multi-cluster blocks the
-    // unconstrained solve extrapolates far outside the block's colours and
-    // the per-channel [0,1] clamp then bends the hue — fringe pixels decode
-    // to colours that exist nowhere in the block. Constraining to the bbox
-    // also measures better in plain SSE (+1.8 dB on the colour test card).
-    let r = proj_fit(&pix, seed_lo, seed_hi, lmax, inv_lmax, inv_scale);
+    // Endpoint selection. OPAQUE blocks (CEM 8, 8-level weights) quantise
+    // the PCA-extent seed directly, BC7-style — the LSQ fit pass measured
+    // +26% GPU for −0.06..+0.31 dB against the converged 8-step axis
+    // (/ab + PSNR A/B, 2026-07): at 8 weight levels the projection is fine
+    // enough that a good axis, not a refit, carries the quality.
+    // TRANSLUCENT blocks (CEM 12) keep the fit: 4 levels are coarse enough
+    // that dropping it costs 0.5+ dB. Its result is clamped to the block
+    // bbox: on multi-cluster blocks the unconstrained solve extrapolates
+    // far outside the block's colours and the per-channel [0,1] clamp then
+    // bends the hue — fringe pixels decode to colours that exist nowhere
+    // in the block (and the bbox constraint also measures better in plain
+    // SSE, +1.8 dB on the colour test card).
     var e0 = lo;
     var e1 = hi;
-    if (r.valid) { e0 = clamp(r.e0, lo, hi); e1 = clamp(r.e1, lo, hi); }
+    if (opaque) {
+      // Bbox-clamped like the fit output: on multi-cluster blocks the axis
+      // extents overshoot the data per-channel and decode to colours that
+      // exist nowhere in the block (the odd-size padding gate caught a
+      // −3.9 dB crop without this).
+      e0 = clamp(seed_lo, lo, hi);
+      e1 = clamp(seed_hi, lo, hi);
+    } else {
+      let r = proj_fit(&pix, seed_lo, seed_hi);
+      if (r.valid) { e0 = clamp(r.e0, lo, hi); e1 = clamp(r.e1, lo, hi); }
+    }
     var E0 = q8(e0);
     var E1 = q8(e1);
 

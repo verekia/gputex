@@ -83,19 +83,30 @@ uvec2 encodeBC4(float values[16], float vmin, float vmax) {
   // formats need costs ~0.3 dB here. Keep 6-interp mode (r0 > r1 strictly).
   float det = seed.sAA * seed.sBB - seed.sAB * seed.sAB;
   if (abs(det) > 1e-9) {
-    float e0 = clamp((seed.sBB * seed.sAV - seed.sAB * seed.sBV) / det, 0.0, 1.0);
-    float e1 = clamp((seed.sAA * seed.sBV - seed.sAB * seed.sAV) / det, 0.0, 1.0);
-    uint n0 = quantize8(e0);
-    uint n1 = quantize8(e1);
-    if (n0 > n1 && !(n0 == r0 && n1 == r1)) {
-      float n0f = float(n0) / 255.0;
-      float n1f = float(n1) / 255.0;
-      float quadSeed = seed.sAA * r0f * r0f + seed.sBB * r1f * r1f
-        + 2.0 * (seed.sAB * r0f * r1f - r0f * seed.sAV - r1f * seed.sBV);
-      float quadNew = seed.sAA * n0f * n0f + seed.sBB * n1f * n1f
-        + 2.0 * (seed.sAB * n0f * n1f - n0f * seed.sAV - n1f * seed.sBV);
-      if (quadNew < quadSeed) {
-        r0 = n0; r1 = n1;
+    float e0 = clamp((seed.sBB * seed.sAV - seed.sAB * seed.sBV) / det, 0.0, 1.0) * 255.0;
+    float e1 = clamp((seed.sAA * seed.sBV - seed.sAB * seed.sAV) / det, 0.0, 1.0) * 255.0;
+    // Price all four floor/ceil roundings of the fractional solve
+    // closed-form (see bc5_fast_f16.wgsl); keep the best that stays in
+    // 6-interp mode and beats the seed.
+    float quadSeed = seed.sAA * r0f * r0f + seed.sBB * r1f * r1f
+      + 2.0 * (seed.sAB * r0f * r1f - r0f * seed.sAV - r1f * seed.sBV);
+    float bestQuad = quadSeed;
+    uint seed0 = r0;
+    uint seed1 = r1;
+    for (uint m = 0u; m < 4u; m++) {
+      float q0f = clamp(floor(e0) + float(m & 1u), 0.0, 255.0);
+      float q1f = clamp(floor(e1) + float(m >> 1u), 0.0, 255.0);
+      uint n0 = uint(q0f);
+      uint n1 = uint(q1f);
+      if (n0 > n1 && !(n0 == seed0 && n1 == seed1)) {
+        float n0f = q0f / 255.0;
+        float n1f = q1f / 255.0;
+        float quadNew = seed.sAA * n0f * n0f + seed.sBB * n1f * n1f
+          + 2.0 * (seed.sAB * n0f * n1f - n0f * seed.sAV - n1f * seed.sBV);
+        if (quadNew < bestQuad) {
+          bestQuad = quadNew;
+          r0 = n0; r1 = n1;
+        }
       }
     }
   }

@@ -167,10 +167,8 @@ void main() {
     w2 = rev32(s1);
     w3 = rev32(s0);
   } else {
-    // ------------- Colour paths: shared PCA seed + LSQ refit --------------
+    // ------------- Colour paths: shared PCA seed ---------------------------
     vec4 mean = vec4(isum) / 16.0;
-    // Opaque blocks fit/reproject against the 8-level QUANT_8 palette
-    // (CEM 8), translucent against the 4-level QUANT_4 one (CEM 12).
     float lmax = opaque ? 7.0 : 3.0;
     uint wmax = opaque ? 7u : 3u;
 
@@ -188,16 +186,24 @@ void main() {
       e0 = ivec4(clamp(floor(mean + tMin * axis + 0.5), vec4(0.0), vec4(255.0)));
       e1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
     }
-    Fit r = projAssign(e0, e1, lmax, true);
-    if (r.valid) {
-      // Clamp the refit to the block bbox: on multi-cluster blocks the
-      // unconstrained LSQ solve extrapolates far outside the block's colours and
-      // the per-channel [0,255] clamp then bends the hue — fringe pixels decode
-      // to colours that exist nowhere in the block. Constraining to the bbox
-      // also measures better in plain SSE (+1.8 dB on the colour test card).
-      e0 = clamp(r.e0, lo, hi);
-      e1 = clamp(r.e1, lo, hi);
+    if (opaque) {
+      // CEM 8 ships the quantised PCA extents directly (no LSQ fit — see
+      // astc4x4_fast_f16.wgsl for the measured trade), bbox-clamped like
+      // the fit output; one assignment pass fills gIdx for the packer.
+      e0 = clamp(e0, lo, hi);
+      e1 = clamp(e1, lo, hi);
       projAssign(e0, e1, lmax, false);
+    } else {
+      Fit r = projAssign(e0, e1, lmax, true);
+      if (r.valid) {
+        // Clamp the refit to the block bbox: on multi-cluster blocks the
+        // unconstrained LSQ solve extrapolates far outside the block's
+        // colours and the per-channel [0,255] clamp then bends the hue —
+        // fringe pixels decode to colours that exist nowhere in the block.
+        e0 = clamp(r.e0, lo, hi);
+        e1 = clamp(r.e1, lo, hi);
+        projAssign(e0, e1, lmax, false);
+      }
     }
 
     // Endpoint ordering so the decoder doesn't apply blue contraction.

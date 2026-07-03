@@ -25,7 +25,12 @@
 //     sums don't cancel): the refit solve is e = seed + M⁻¹(sAR,sBR), and
 //     the error of the re-quantised refit endpoints ON THE SEED'S INDICES is
 //       E(δ) = sErr − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB + δ1²sBB
-//     with δ = quantised endpoint − seed endpoint. E < sErr accepts.
+//     with δ = quantised endpoint − seed endpoint. E < sErr accepts (the
+//     code compares the delta form E − sErr < 0, so sErr itself is only
+//     accumulated for the derivation's sake — see below). All four
+//     floor/ceil roundings of the fractional solve are priced, since the
+//     integer optimum of a correlated 2-D quadratic isn't always the
+//     component-wise nearest rounding (+0.01 dB, free).
 //   • Accepted refits SHIP THE SEED INDICES — there is no reprojection
 //     pass, so E(δ) is exactly the shipped error and the accept test is
 //     exact. Re-optimising the indices against the refit endpoints was
@@ -169,16 +174,26 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (lmin[c] < lmax[c] && abs(det[c]) > h(0.1)) {
       let e0 = clamp(r0f[c] + d0[c] / det[c], h(0.0), h(255.0));
       let e1 = clamp(r1f[c] + d1[c] / det[c], h(0.0), h(255.0));
-      let q0 = u32(floor(e0 + h(0.5)));
-      let q1 = u32(floor(e1 + h(0.5)));
-      // Keep 6-interp mode (q0 > q1 strictly); skip the no-op refit.
-      if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
-        let dd0 = (h(f32(q0)) - r0f[c]) * h(1.0 / 16.0);
-        let dd1 = (h(f32(q1)) - r1f[c]) * h(1.0 / 16.0);
-        let eNew = sErr[c] - h(2.0) * (dd0 * sAR[c] + dd1 * sBR[c])
-          + dd0 * dd0 * sAA[c] + h(2.0) * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
-        if (eNew < sErr[c]) {
-          n0[c] = q0; n1[c] = q1;
+      // The integer optimum of the E() quadratic isn't always the
+      // component-wise rounding of the fractional solve, so price all four
+      // floor/ceil combinations — closed-form, no per-pixel work — and
+      // keep the best that stays in 6-interp mode (q0 > q1 strictly) and
+      // beats the seed (E(seed) − sErr = 0).
+      var bestE = h(0.0);
+      for (var m: u32 = 0u; m < 4u; m = m + 1u) {
+        let q0f = clamp(floor(e0) + h(f32(m & 1u)), h(0.0), h(255.0));
+        let q1f = clamp(floor(e1) + h(f32(m >> 1u)), h(0.0), h(255.0));
+        let q0 = u32(q0f);
+        let q1 = u32(q1f);
+        if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
+          let dd0 = (q0f - r0f[c]) * h(1.0 / 16.0);
+          let dd1 = (q1f - r1f[c]) * h(1.0 / 16.0);
+          let eNew = -h(2.0) * (dd0 * sAR[c] + dd1 * sBR[c])
+            + dd0 * dd0 * sAA[c] + h(2.0) * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
+          if (eNew < bestE) {
+            bestE = eNew;
+            n0[c] = q0; n1[c] = q1;
+          }
         }
       }
     }

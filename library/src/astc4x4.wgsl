@@ -54,29 +54,28 @@ fn to8(v: vec4<f32>) -> vec4<i32> {
 // solve for the refit endpoints. Weights are not produced here — the
 // caller reprojects against the quantised refit endpoints anyway.
 struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
-fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4<i32>, lmax: f32) -> Fit {
+fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4<i32>) -> Fit {
   var out: Fit;
   out.valid = false;
   let dir = vec4<f32>(e1 - e0);
   let dd = dot(dir, dir);
   if (dd == 0.0) { return out; }
   let e0f = vec4<f32>(e0);
-  let inv = lmax / dd;
-  let inv_lmax = 1.0 / lmax;
+  let inv = 3.0 / dd;
   var sAA: f32 = 0.0; var sBB: f32 = 0.0; var sAB: f32 = 0.0;
   var sAV: vec4<f32> = vec4<f32>(0.0); var sBV: vec4<f32> = vec4<f32>(0.0);
-  var s_min = lmax; var s_max = 0.0;
+  var s_min = 3.0; var s_max = 0.0;
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let v = vec4<f32>((*pixels)[k]);
-    let s = clamp(floor(dot(v - e0f, dir) * inv + 0.5), 0.0, lmax);
+    let s = clamp(floor(dot(v - e0f, dir) * inv + 0.5), 0.0, 3.0);
     s_min = min(s_min, s); s_max = max(s_max, s);
-    let b = s * inv_lmax; let a = 1.0 - b;
+    let b = s * (1.0 / 3.0); let a = 1.0 - b;
     sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
     sAV = sAV + a * v; sBV = sBV + b * v;
   }
   // Rank-1 guard: if every pixel projects to ONE level the system is
   // singular — det and the numerators are pure float rounding noise and the
-  // solve returns garbage endpoints. With ≥2 levels det ≥ 15·(1/7)² ≈ 0.3.
+  // solve returns garbage endpoints. With ≥2 levels det ≥ 15·(1/3)² ≈ 1.67.
   if (s_min == s_max) { return out; }
   let det = sAA * sBB - sAB * sAB;
   if (abs(det) < 1e-3) { return out; }
@@ -187,11 +186,8 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     w2 = reverseBits(s1);
     w3 = reverseBits(s0);
   } else {
-    // ------------- Colour paths: shared PCA seed + LSQ refit --------------
+    // ------------- Colour paths: shared PCA seed ---------------------------
     let mean = vec4<f32>(isum) * (1.0 / 16.0);
-    // Opaque blocks fit/reproject against the 8-level QUANT_8 palette
-    // (CEM 8), translucent against the 4-level QUANT_4 one (CEM 12).
-    let lmax = select(3.0, 7.0, opaque);
 
     // Fused LSQ fit seeded from the block's principal colour axis at the
     // exact projection extents, quantised refit endpoints, ordering applied
@@ -216,10 +212,19 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
       seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
     }
-    let r = proj_fit(&pixels, seed0, seed1, lmax);
+    // Opaque blocks (CEM 8, 8-level weights) ship the quantised PCA
+    // extents directly; only the translucent CEM 12 path refits its coarse
+    // 4-level grid (see astc4x4_fast_f16.wgsl for the measured trade).
     var e0 = lo;
     var e1 = hi;
-    if (r.valid) { e0 = clamp(r.e0, lo, hi); e1 = clamp(r.e1, lo, hi); }
+    if (opaque) {
+      // Bbox-clamped like the fit output (see astc4x4_fast_f16.wgsl).
+      e0 = clamp(seed0, lo, hi);
+      e1 = clamp(seed1, lo, hi);
+    } else {
+      let r = proj_fit(&pixels, seed0, seed1);
+      if (r.valid) { e0 = clamp(r.e0, lo, hi); e1 = clamp(r.e1, lo, hi); }
+    }
     if (e0.x + e0.y + e0.z > e1.x + e1.y + e1.z) {
       let tmp = e0; e0 = e1; e1 = tmp;
     }
