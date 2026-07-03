@@ -113,8 +113,10 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc5:normal': 52.95,
   'bc7:color': 31.9,
   'astc:color': 31.75,
-  'bc7:alpha': 34.5,
-  'astc:alpha': 33.0,
+  // 1024² committed alpha card (2026-07): bc7 38.43/38.38 f16/f32, astc
+  // 37.28/37.27 — both above the exhaustive reference on this content.
+  'bc7:alpha': 38.2,
+  'astc:alpha': 37.1,
   'bc1:normal': null,
   'bc7:normal': null,
   'astc:normal': null,
@@ -179,8 +181,9 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc5:normal': 0.05,
   'bc7:color': 0.12,
   'astc:color': 0.15,
+  // 1024² alpha card: observed easy-block excess 0.014 / 0.052.
   'bc7:alpha': 0.05,
-  'astc:alpha': 0.1,
+  'astc:alpha': 0.15,
   // Real textures (observed 0.001–0.06).
   'bc7:packed-256': 0.05,
   'bc7:packed-512': 0.1,
@@ -472,7 +475,6 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   // Odd size → exercises the clamp-to-edge padding path (not multiples of 4).
   const colorOdd = cropImageData(colorFull, 17, 9, 133, 61)
   const normalOdd = cropImageData(normalFull, 17, 9, 133, 61)
-  const alpha = makeProceduralImage(128, 128, true)
 
   const correctness: CorrectnessResult[] = []
   const quality: QualityResult[] = []
@@ -565,7 +567,11 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     // Synthetic cards.
     gated('color', ['bc1', 'bc7', 'astc'], colorFull),
     gated('normal', ['bc5', 'bc1', 'bc7', 'astc'], normalFull),
-    gated('alpha', ['bc7', 'astc'], alpha),
+    // Committed 1024² alpha card (gen-test-textures.mjs): smooth alpha
+    // ramps, cutout edges, Nyquist/noise alpha, low-alpha precision, plus
+    // opaque and exactly-gray tiles so the per-block class selection and
+    // its transitions are gated on one image.
+    gated('alpha', ['bc7', 'astc'], '/textures/alpha.png'),
     // Packed-materials game atlas (channel-packed, has alpha at 1024).
     gated('packed-256', ['bc7'], packed(256)),
     gated('packed-512', ['bc7'], packed(512)),

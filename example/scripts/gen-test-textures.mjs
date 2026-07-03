@@ -4,6 +4,19 @@
 //   node scripts/gen-test-textures.mjs
 //
 // Outputs into public/textures/:
+//   • alpha.png  — 1024² RGBA test card for the alpha-capable formats
+//     (BC7, ASTC): a 4×4 grid of 256² tiles, each stressing ONE
+//     alpha-specific failure mode. Row 1: smooth alpha gradients (alpha
+//     banding — over flat colour, radial falloff, joint colour+alpha ramp,
+//     shallow low-contrast alpha). Row 2: hard alpha edges (decal cutout
+//     over mismatched RGB, foliage mask, diagonal chevrons, thin strokes).
+//     Row 3: high-frequency/mixed alpha (Nyquist checker, alpha noise,
+//     UI-like translucent panes at fixed alpha flats, per-cell Voronoi
+//     alpha). Row 4: natural-ish + class boundaries (smoke wisps, low-alpha
+//     glass, a fully OPAQUE plasma tile and an exactly-GRAY opaque tile so
+//     the per-block class selection and its tile-border transitions are
+//     exercised inside one image). Transparent regions keep meaningful RGB
+//     underneath — encoders must preserve colour under alpha ≈ 0 too.
 //   • color.png  — 1024² RGB test card used by the BC1/BC7/ASTC pages: a 4×4
 //     grid of 256² tiles, each stressing ONE codec failure mode so artifacts
 //     are attributable at a glance. Row 1: smooth gradients (banding). Row 2:
@@ -315,6 +328,169 @@ const genColor = () => {
   return px
 }
 
+// ---------------------------------------------------------------- alpha card
+//
+// Same 4×4 tile grid as the colour card, but every tile is an ALPHA
+// stressor; tiles return [r, g, b, a]. See the header for the row plan.
+
+const ALPHA_TILES = [
+  // ---- Row 1: smooth alpha gradients — alpha banding. ----
+  // Pure alpha ramp over a flat warm colour (only alpha varies).
+  u => [0.9, 0.45, 0.12, u],
+  // Radial soft-particle falloff (gaussian-ish glow).
+  (u, v) => {
+    const d = Math.hypot(u - 0.5, v - 0.5) / 0.5
+    return [0.95, 0.8, 0.35, Math.exp(-d * d * 3.2)]
+  },
+  // Joint colour + alpha ramp — the single-RGBA-line case.
+  (u, v) => {
+    const [r, g, b] = hsv2rgb(u * 0.8, 0.6, 0.9)
+    return [r, g, b, v]
+  },
+  // Shallow alpha dome (span ~0.14) over a textured ground — the alpha
+  // analogue of the colour card's banding-killer tile.
+  (u, v, x, y) => {
+    const d = Math.hypot(u - 0.5, v - 0.5) / 0.7071
+    const t = fbm(x / 40, y / 40)
+    const [r, g, b] = mix3([0.2, 0.3, 0.5], [0.4, 0.55, 0.7], t)
+    return [r, g, b, 0.36 + 0.14 * (1 - clamp01(d))]
+  },
+
+  // ---- Row 2: hard alpha edges — cutout/decal artifacts. ----
+  // Opaque patterned disc over a fully transparent ground whose RGB
+  // deliberately clashes — blocks on the rim mix a=1 and a=0 clusters.
+  (u, v) => {
+    const d = Math.hypot(u - 0.5, v - 0.5) / 0.42
+    if (d < 1) {
+      const ring = 0.5 + 0.5 * Math.sin(d * 18)
+      return [0.9 - 0.5 * ring, 0.25 + 0.55 * ring, 0.2, 1]
+    }
+    return [0.05, 0.9, 0.05, 0]
+  },
+  // Foliage mask: fBm thresholded into leaf clumps, green shades.
+  (u, v, x, y) => {
+    const t = fbm(x / 26, y / 26)
+    const a = t > 0.52 ? 1 : 0
+    const [r, g, b] = mix3([0.1, 0.35, 0.08], [0.35, 0.7, 0.2], fbm(x / 9 + 40, y / 9))
+    return [r, g, b, a]
+  },
+  // 45° alpha chevrons over a colour gradient — diagonal alpha edges cut
+  // every 4×4 block.
+  (u, v, x, y) => {
+    const [r, g, b] = mix3([0.85, 0.3, 0.5], [0.2, 0.4, 0.85], u)
+    return [r, g, b, Math.floor((x + y) / 8) & 1 ? 1 : 0]
+  },
+  // Thin strokes: 2px bars in a grid — text/UI-like alpha features.
+  (u, v, x, y) => {
+    const on = x % 12 < 2 || y % 10 < 2
+    return [0.95, 0.95, 0.9, on ? 1 : 0.08]
+  },
+
+  // ---- Row 3: high-frequency / mixed alpha. ----
+  // 1px alpha checker — Nyquist alpha over constant colour.
+  (u, v, x, y) => [0.8, 0.6, 0.2, (x + y) & 1 ? 1 : 0],
+  // Independent alpha noise over a smooth colour gradient.
+  (u, v, x, y) => {
+    const [r, g, b] = mix3([0.15, 0.5, 0.6], [0.7, 0.25, 0.5], v)
+    return [r, g, b, 0.15 + 0.7 * hash(x + 131, y + 57)]
+  },
+  // UI panes: overlapping rectangles at alpha flats {0.25, 0.5, 0.75, 1} —
+  // hard alpha steps between large flat regions.
+  (u, v) => {
+    let a = 0.0
+    let c = [0.12, 0.12, 0.16]
+    const PANES = [
+      [0.05, 0.08, 0.6, 0.55, 0.25, [0.9, 0.9, 0.95]],
+      [0.3, 0.25, 0.92, 0.7, 0.5, [0.25, 0.6, 0.9]],
+      [0.15, 0.5, 0.7, 0.93, 0.75, [0.95, 0.6, 0.25]],
+      [0.55, 0.05, 0.95, 0.4, 1.0, [0.4, 0.85, 0.45]],
+    ]
+    for (const [x0, y0, x1, y1, pa, pc] of PANES) {
+      if (u >= x0 && u < x1 && v >= y0 && v < y1) {
+        a = pa
+        c = pc
+      }
+    }
+    return [c[0], c[1], c[2], a]
+  },
+  // Voronoi with per-cell alpha flats and opaque borders.
+  (u, v) => {
+    let d1 = Infinity
+    let d2 = Infinity
+    let cell = 0
+    for (let i = 0; i < 20; i++) {
+      const px = hash(i * 7 + 3, 53)
+      const py = hash(71, i * 3 + 11)
+      const d = Math.hypot(u - px, v - py)
+      if (d < d1) {
+        d2 = d1
+        d1 = d
+        cell = i
+      } else if (d < d2) {
+        d2 = d
+      }
+    }
+    const base = hsv2rgb(hash(cell, 177), 0.5, 0.75)
+    const border = clamp01((d2 - d1) * 22)
+    return [base[0], base[1], base[2], border < 0.5 ? 1 : hash(cell, 191)]
+  },
+
+  // ---- Row 4: natural-ish alpha + block-class boundaries. ----
+  // Smoke: fBm wisps, alpha 0..0.8 over a cool gray.
+  (u, v, x, y) => {
+    const t = fbm(x / 56, y / 56 + 90)
+    const a = clamp01((t - 0.35) * 2.2) * 0.8 * (1 - v * 0.6)
+    const g = 0.55 + 0.25 * fbm(x / 22 + 7, y / 22)
+    return [g, g, g * 1.05, a]
+  },
+  // Low-alpha glass: colour gradient at a = 0.2..0.4 — precision where a
+  // handful of alpha codes must carry a smooth ramp.
+  (u, v) => {
+    const [r, g, b] = mix3([0.3, 0.75, 0.85], [0.7, 0.3, 0.8], u)
+    return [r, g, b, 0.2 + 0.2 * v]
+  },
+  // Fully opaque plasma — inside an alpha card, so class transitions at the
+  // tile borders are part of the test.
+  (u, v) => {
+    const a = Math.sin(u * 5.1 + Math.sin(v * 3.7)) + Math.sin(Math.hypot(u - 0.7, v - 0.3) * 9)
+    const b = Math.sin(v * 4.3 + Math.sin(u * 2.9)) + Math.sin(Math.hypot(u - 0.2, v - 0.8) * 7)
+    return [
+      0.5 + 0.4 * Math.sin(a * 1.7),
+      0.5 + 0.4 * Math.sin(b * 1.9 + 2.1),
+      0.5 + 0.4 * Math.sin((a + b) * 1.3 + 4.2),
+      1,
+    ]
+  },
+  // Exactly-gray opaque dome — the grayscale block class, adjacent to
+  // translucent tiles.
+  (u, v) => {
+    const d = Math.hypot(u - 0.5, v - 0.5) / 0.7071
+    const g = 0.3 + 0.4 * (1 - clamp01(d))
+    return [g, g, g, 1]
+  },
+]
+
+const genAlpha = () => {
+  const px = new Uint8Array(SIZE * SIZE * 4)
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const tx = Math.floor(x / TILE)
+      const ty = Math.floor(y / TILE)
+      const lx = x - tx * TILE
+      const ly = y - ty * TILE
+      // 2px separator rules between tiles (opaque, like the colour card).
+      const onRule = (lx < 2 && tx > 0) || (ly < 2 && ty > 0)
+      const [r, g, b, a] = onRule ? [0.04, 0.04, 0.05, 1] : ALPHA_TILES[ty * 4 + tx](lx / TILE, ly / TILE, x, y)
+      const o = (y * SIZE + x) * 4
+      px[o] = to255(clamp01(r))
+      px[o + 1] = to255(clamp01(g))
+      px[o + 2] = to255(clamp01(b))
+      px[o + 3] = to255(clamp01(a))
+    }
+  }
+  return px
+}
+
 // ---------------------------------------------------------------- normal map
 //
 // Height field in pixel units → tangent-space normals via central
@@ -424,4 +600,5 @@ const genNormal = () => {
 mkdirSync(OUT_DIR, { recursive: true })
 writeFileSync(join(OUT_DIR, 'color.png'), encodePNG(SIZE, SIZE, genColor()))
 writeFileSync(join(OUT_DIR, 'normal.png'), encodePNG(SIZE, SIZE, genNormal()))
-console.log(`Wrote ${SIZE}×${SIZE} color.png and normal.png to ${OUT_DIR}`)
+writeFileSync(join(OUT_DIR, 'alpha.png'), encodePNG(SIZE, SIZE, genAlpha()))
+console.log(`Wrote ${SIZE}×${SIZE} color.png, normal.png and alpha.png to ${OUT_DIR}`)
