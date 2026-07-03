@@ -12,6 +12,9 @@
 //   • 'colorWithAlpha' never falls back to BC1 — DXT1 has only 1-bit alpha, so
 //     we keep the uncompressed RGBA8 path (which preserves alpha) instead.
 //   • 'normal' compresses only via BC5 or ASTC; otherwise uncompressed.
+//   • `quality: 'low'` can only deliver BC1 — there is no ETC2 encoder on
+//     the WebGL tier (the WGSL ETC2 encoder is WebGPU-only), so ETC2-class
+//     mobile GPUs stuck on WebGL2 keep the normal selection.
 
 import { TextureFormat } from '../TextureFormat.js'
 import { ASTC4x4WebGLEncoder } from './ASTC4x4WebGLEncoder.js'
@@ -39,12 +42,17 @@ export function selectWebGLFormat(
   hint: TextureHint,
   options: SelectFormatOptions = {},
 ): WebGLFormatSelection {
-  const { colorSpace = 'srgb', preferredFormat } = options
+  const { colorSpace = 'srgb', preferredFormat, quality = 'high' } = options
   const srgb = colorSpace === 'srgb'
   const astc = (astcNormalRemap: boolean): WebGLFormatSelection => ({
     format: srgb ? TextureFormat.ASTC_4x4_SRGB : TextureFormat.ASTC_4x4,
     encoderClass: ASTC4x4WebGLEncoder,
     astcNormalRemap,
+  })
+  const bc1 = (): WebGLFormatSelection => ({
+    format: srgb ? TextureFormat.BC1_SRGB : TextureFormat.BC1,
+    encoderClass: BC1WebGLEncoder,
+    astcNormalRemap: false,
   })
 
   // Explicit BC1 preference — same contract as the WebGPU side: honoured
@@ -57,12 +65,14 @@ export function selectWebGLFormat(
         `[gputex] preferredFormat 'bc1' ignored for hint '${hint}' — BC1 has no real alpha channel and is unsuitable for normal maps.`,
       )
     } else if (srgb ? caps.s3tcSrgb : caps.s3tc) {
-      return {
-        format: srgb ? TextureFormat.BC1_SRGB : TextureFormat.BC1,
-        encoderClass: BC1WebGLEncoder,
-        astcNormalRemap: false,
-      }
+      return bc1()
     }
+  }
+
+  // 'low' quality: BC1 for opaque colour — same contract as the WebGPU
+  // side, minus the ETC2 arm (no WebGL ETC2 encoder; see the header).
+  if (quality === 'low' && hint === 'color' && (srgb ? caps.s3tcSrgb : caps.s3tc)) {
+    return bc1()
   }
 
   if (hint === 'normal') {
@@ -84,13 +94,8 @@ export function selectWebGLFormat(
 
   // Last resort: BC1 for opaque colour only (DXT1's 1-bit alpha can't carry a
   // real alpha channel). Requires the s3tc variant matching the colour space.
-  if (hint === 'color') {
-    if (srgb && caps.s3tcSrgb) {
-      return { format: TextureFormat.BC1_SRGB, encoderClass: BC1WebGLEncoder, astcNormalRemap: false }
-    }
-    if (!srgb && caps.s3tc) {
-      return { format: TextureFormat.BC1, encoderClass: BC1WebGLEncoder, astcNormalRemap: false }
-    }
+  if (hint === 'color' && (srgb ? caps.s3tcSrgb : caps.s3tc)) {
+    return bc1()
   }
   return NONE
 }

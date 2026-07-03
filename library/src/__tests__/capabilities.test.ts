@@ -17,6 +17,8 @@ describe('TextureFormat', () => {
       'BC5',
       'BC7',
       'BC7_SRGB',
+      'ETC2_RGB8',
+      'ETC2_RGB8_SRGB',
     ])
   })
 
@@ -64,10 +66,16 @@ describe('detectCapabilities', () => {
     expect(caps.supportedFormats.length).toBe(7)
   })
 
-  it('ignores ETC2 presence for supportedFormats (no encoder yet)', () => {
+  it('exposes ETC2 formats when texture-compression-etc2 is present', () => {
     const caps = detectCapabilities(fakeAdapter(WebGPUFeature.ETC2))
     expect(caps.etc2).toBe(true)
-    expect(caps.supportedFormats).toEqual([])
+    expect(caps.supportedFormats).toEqual([TextureFormat.ETC2_RGB8, TextureFormat.ETC2_RGB8_SRGB])
+  })
+
+  it('unions all three families when every feature is present (e.g. Apple GPUs)', () => {
+    const caps = detectCapabilities(fakeAdapter(WebGPUFeature.BC, WebGPUFeature.ASTC, WebGPUFeature.ETC2))
+    expect(caps.supportedFormats.length).toBe(9)
+    expect(caps.supportedFormats).toContain(TextureFormat.ETC2_RGB8)
   })
 
   it('throws on an adapter missing a features Set', () => {

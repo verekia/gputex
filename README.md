@@ -1,6 +1,6 @@
 # GPUtex | On-the-fly GPU texture encoding
 
-Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF — or an SVG, rasterised on the fly — and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, or BC1) ready for Three.js or React Three Fiber.
+Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF — or an SVG, rasterised on the fly — and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, BC1, or ETC2) ready for Three.js or React Three Fiber.
 
 ⚠️ 100% vibe-coded. The code is completely unreviewed and under-tested. Do not use for anything important.
 
@@ -28,21 +28,26 @@ bun add gputex
 
 ## Formats
 
-| Format       | Bytes / 4x4 block | Use case                                                  |
-| ------------ | ----------------- | --------------------------------------------------------- |
-| **BC7**      | 16 (8 bpp)        | Color / RGBA on desktop (`texture-compression-bc`)        |
-| **BC5**      | 16 (8 bpp)        | Normal maps — RG only (`texture-compression-bc`)          |
-| **ASTC 4x4** | 16 (8 bpp)        | Color / RGBA on mobile / iOS (`texture-compression-astc`) |
-| **BC1**      | 8 (4 bpp)         | Opaque color at half BC7's size (opt-in)                  |
+| Format        | Bytes / 4x4 block | Use case                                                                        |
+| ------------- | ----------------- | ------------------------------------------------------------------------------- |
+| **BC7**       | 16 (8 bpp)        | Color / RGBA on desktop (`texture-compression-bc`)                              |
+| **BC5**       | 16 (8 bpp)        | Normal maps — RG only (`texture-compression-bc`)                                |
+| **ASTC 4x4**  | 16 (8 bpp)        | Color / RGBA on mobile / iOS (`texture-compression-astc`)                       |
+| **BC1**       | 8 (4 bpp)         | Opaque color at half BC7's size (`quality: 'low'`)                              |
+| **ETC2 RGB8** | 8 (4 bpp)         | Opaque color at half ASTC's size (`texture-compression-etc2`, `quality: 'low'`) |
 
-Format selection is automatic: BC7/BC5 on desktop, ASTC on mobile, uncompressed RGBA8 fallback otherwise.
+Format selection is automatic: BC7/BC5 on desktop, ASTC on mobile, ETC2 as the
+last-resort compressed format for opaque colour, uncompressed RGBA8 fallback
+otherwise.
 
-BC1 is never picked by default — it's half the memory of BC7 but visibly lower
-quality, a trade-off only the application can make. Opt in per-texture with
-`preferredFormat: 'bc1'`: on BC-capable devices the texture encodes as BC1;
-everywhere else (e.g. ASTC-only mobile) selection proceeds as normal. The
-preference is only honoured with `hint: 'color'`, since BC1 can't carry real
-alpha or a normal map.
+The 4-bpp formats are never picked by default — half the memory of BC7/ASTC
+but visibly lower quality, a trade-off only the application can make. Opt in
+with `quality: 'low'`: opaque colour textures then encode as BC1 on BC-capable
+devices and as ETC2 RGB8 on ETC2-capable ones (most mobile GPUs), while
+`'colorWithAlpha'` and `'normal'` hints keep the high-quality formats (the
+4-bpp formats can't carry them). Per-texture, `preferredFormat: 'bc1'` forces
+BC1 on BC hardware the same way; both knobs fall back to the normal selection
+when unsupported, and both apply to `hint: 'color'` only.
 
 ## WebGL fallback
 
@@ -52,7 +57,7 @@ The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend
 
 Notes on the WebGL path:
 
-- It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present.
+- It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present. ETC2 is WebGPU-only (no WebGL fragment encoder), so `quality: 'low'` on the WebGL tier can only deliver BC1.
 - The `device` / `adapter` options apply to the WebGPU path only.
 - All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas.
 
@@ -87,6 +92,19 @@ palette makes the refit redundant on a principal-axis seed (≤0.05 dB), so
 it skips it and stays the cheapest per pixel. On GPUs that report the
 `shader-f16` feature everything runs in f16 — the f32 shaders are the
 automatic fallback.
+
+ETC2 is the exception to the endpoint-line story: its blocks are per-subblock
+base colours shifted by scalar modifier tables. The encoder exploits the
+algebra of that scalar shift — table and index selection depend only on each
+texel's luma-sum difference from the base, exactly (modulo decode clamping) —
+so the whole 8-table × 4-modifier search collapses to a handful of scalar
+threshold tests against a two-candidate table shortlist, with subblock error
+constants and the flip preselect computed O(1) from quadrant sums. A gated
+base-colour refit and a closed-form least-squares fit of ETC2's planar mode
+(which rescues the smooth gradients ETC1-style blocks band on) complete the
+block, all driven by the same estimates. The rewrite took the GPU pass from
+6.0 ms to 0.28 ms at 2048² (21×, within ~0.2 dB of the exhaustive search).
+It ships as f32 only: the estimates are integer-exact sums that overflow f16.
 
 On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
 per-block reference encoders (BC5 matches the reference exactly; ASTC and
@@ -271,17 +289,18 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 
 ### `compressTexture` options
 
-| Option            | Type                          | Default   | Description                                                                                      |
-| ----------------- | ----------------------------- | --------- | ------------------------------------------------------------------------------------------------ |
-| `hint`            | `TextureHint`                 | `'color'` | `'color'`, `'colorWithAlpha'`, or `'normal'`                                                     |
-| `preferredFormat` | `'bc1'`                       | —         | Prefer BC1 (half of BC7's size) when supported; normal selection otherwise. `hint: 'color'` only |
-| `colorSpace`      | `'srgb' \| 'linear'`          | `'srgb'`  | Use the sRGB or linear variant of the chosen format                                              |
-| `svgSize`         | `number \| { width, height }` | intrinsic | Raster size for SVG sources: longest side (aspect preserved) or exact size                       |
-| `flipY`           | `boolean`                     | `true`    | Flip vertically (matches Three.js convention)                                                    |
-| `mipmaps`         | `boolean`                     | `false`   | Generate full mip chain down to 1x1                                                              |
-| `cache`           | `boolean`                     | `false`   | Session-scoped in-memory cache; repeat calls skip decode + encode (see below)                    |
-| `cacheKey`        | `string`                      | derived   | Explicit cache identity (skips content hashing; makes pixel sources cacheable)                   |
-| `device`          | `GPUDevice`                   | —         | Reuse an existing WebGPU device instead of creating one                                          |
+| Option            | Type                          | Default   | Description                                                                                                              |
+| ----------------- | ----------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `hint`            | `TextureHint`                 | `'color'` | `'color'`, `'colorWithAlpha'`, or `'normal'`                                                                             |
+| `quality`         | `'high' \| 'low'`             | `'high'`  | `'low'` picks the 4-bpp formats (BC1 on desktop, ETC2 RGB8 on mobile) for opaque colour — half the memory, lower quality |
+| `preferredFormat` | `'bc1'`                       | —         | Prefer BC1 (half of BC7's size) when supported; normal selection otherwise. `hint: 'color'` only                         |
+| `colorSpace`      | `'srgb' \| 'linear'`          | `'srgb'`  | Use the sRGB or linear variant of the chosen format                                                                      |
+| `svgSize`         | `number \| { width, height }` | intrinsic | Raster size for SVG sources: longest side (aspect preserved) or exact size                                               |
+| `flipY`           | `boolean`                     | `true`    | Flip vertically (matches Three.js convention)                                                                            |
+| `mipmaps`         | `boolean`                     | `false`   | Generate full mip chain down to 1x1                                                                                      |
+| `cache`           | `boolean`                     | `false`   | Session-scoped in-memory cache; repeat calls skip decode + encode (see below)                                            |
+| `cacheKey`        | `string`                      | derived   | Explicit cache identity (skips content hashing; makes pixel sources cacheable)                                           |
+| `device`          | `GPUDevice`                   | —         | Reuse an existing WebGPU device instead of creating one                                                                  |
 
 #### In-memory transcode cache
 
@@ -328,6 +347,12 @@ end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 | BC7      | f32           | 0.59 ms     |
 | ASTC 4×4 | f16 (default) | **0.26 ms** |
 | ASTC 4×4 | f32           | 0.56 ms     |
+| ETC2     | f32 (only)    | 0.28 ms     |
+
+The ETC2 figure is the interleaved `/ab` harness measurement (batched
+dispatches, clock-stable): the scalar-luma selection rewrite took it from
+6.0 ms to 0.28 ms in-session — for reference, a 16-loads-only null shader
+measures 0.14 ms, so the encode logic itself costs about one load-pass.
 
 Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
 timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare
@@ -377,7 +402,7 @@ consumer can run the same validation.
 
 - WebGPU (primary) **or** WebGL2 (fallback) — almost every current browser has at least one
 - A compressed-texture capability for compressed output:
-  - WebGPU: `texture-compression-bc` (desktop) or `texture-compression-astc` (mobile)
+  - WebGPU: `texture-compression-bc` (desktop), `texture-compression-astc` (mobile), or `texture-compression-etc2` (mobile)
   - WebGL2: `EXT_texture_compression_bptc` / `_rgtc`, `WEBGL_compressed_texture_astc`, or `WEBGL_compressed_texture_s3tc`
 - Falls back to uncompressed RGBA8 when no compressed format is available on either backend
 

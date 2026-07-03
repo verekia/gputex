@@ -8,6 +8,7 @@ const LINKS: { href: string; label: string }[] = [
   { href: '/bc7', label: 'BC7' },
   { href: '/bc5', label: 'BC5' },
   { href: '/astc', label: 'ASTC' },
+  { href: '/etc2', label: 'ETC2' },
   { href: '/', label: 'Demo' },
 ]
 

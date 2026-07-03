@@ -18,6 +18,7 @@ import {
   BC5WebGLEncoder,
   BC7Encoder,
   BC7WebGLEncoder,
+  ETC2Encoder,
   generateGpuMipChain,
   generateMipChain,
   padToBlockMultiple,
@@ -29,10 +30,12 @@ import {
   decodeBC1Block,
   decodeBC5Block,
   decodeBC7Block,
+  decodeETC2Block,
   encodeASTC4x4Block,
   encodeBC1Block,
   encodeBC5Block,
   encodeBC7Mode6Block,
+  encodeETC2Block,
 } from 'gputex/testing'
 import { clearTranscodeCache, compressTexture, releaseSharedGpuResources, setTranscodeCacheLimit } from 'gputex/three'
 
@@ -59,6 +62,7 @@ if (typeof window !== 'undefined') {
     BC5Encoder,
     BC7Encoder,
     ASTC4x4Encoder,
+    ETC2Encoder,
     BC1WebGLEncoder,
     BC5WebGLEncoder,
     BC7WebGLEncoder,
@@ -67,10 +71,12 @@ if (typeof window !== 'undefined') {
     decodeBC5Block,
     decodeBC7Block,
     decodeASTC4x4Block,
+    decodeETC2Block,
     encodeBC1Block,
     encodeBC5Block,
     encodeBC7Mode6Block,
     encodeASTC4x4Block,
+    encodeETC2Block,
     compressTexture,
     releaseSharedGpuResources,
     clearTranscodeCache,
@@ -118,7 +124,12 @@ async function runBench(onProgress: (msg: string) => void): Promise<BenchResult[
   if (!('gpu' in navigator)) throw new Error('WebGPU not available in this browser')
   const adapter = await navigator.gpu.requestAdapter()
   if (!adapter) throw new Error('No WebGPU adapter')
-  const requestable: GPUFeatureName[] = ['texture-compression-bc', 'texture-compression-astc', 'shader-f16']
+  const requestable: GPUFeatureName[] = [
+    'texture-compression-bc',
+    'texture-compression-astc',
+    'texture-compression-etc2',
+    'shader-f16',
+  ]
   const device = await adapter.requestDevice({
     requiredFeatures: requestable.filter(f => adapter.features.has(f)),
   })
@@ -128,6 +139,7 @@ async function runBench(onProgress: (msg: string) => void): Promise<BenchResult[
     ['bc5', new BC5Encoder({ device, adapter })],
     ['bc7', new BC7Encoder({ device, adapter })],
     ['astc', new ASTC4x4Encoder({ device, adapter })],
+    ['etc2', new ETC2Encoder({ device, adapter })],
   ]
 
   onProgress('Preparing images…')

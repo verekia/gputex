@@ -143,7 +143,7 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const code = await res.text()
     const wg = /@workgroup_size\((\d+)\s*,\s*(\d+)/.exec(code)
     if (!wg) throw new Error(`${name}: no @workgroup_size`)
-    const bpb = name.includes('bc1') ? 8 : 16
+    const bpb = name.includes('bc1') || name.includes('etc2') ? 8 : 16
     const dst = device.createBuffer({ size: blocksX * blocksY * bpb, usage: GPUBufferUsage.STORAGE })
     const module = device.createShaderModule({ code })
     const info = await module.getCompilationInfo()

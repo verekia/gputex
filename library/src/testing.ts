@@ -27,3 +27,12 @@ export {
   type BC7Block,
 } from './bc7_ref.js'
 export { encodeASTC4x4Block, decodeASTC4x4Block, type ASTC4x4Pixels, type ASTC4x4Block } from './astc4x4_ref.js'
+export {
+  encodeETC2Block,
+  decodeETC2Block,
+  readETC2Mode,
+  type ETC2Pixels,
+  type ETC2Block,
+  type ETC2Quality,
+  type ETC2Mode,
+} from './etc2_ref.js'

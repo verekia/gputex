@@ -21,7 +21,7 @@ import { compressTexture, type CompressResult } from './compressTexture.js'
 
 import type { Texture } from 'three'
 
-import type { PreferredFormat, TextureHint } from '../selectFormat.js'
+import type { FormatQuality, PreferredFormat, TextureHint } from '../selectFormat.js'
 import type { SvgRasterSize } from '../svg.js'
 
 export class GputexLoader extends Loader<Texture> {
@@ -33,6 +33,12 @@ export class GputexLoader extends Loader<Texture> {
    * `CompressOptions.preferredFormat`.
    */
   preferredFormat?: PreferredFormat
+  /**
+   * Memory/fidelity trade-off: 'high' (default, BC7 / ASTC) or 'low'
+   * (BC1 / ETC2 RGB8 at half the memory, opaque colour only). See
+   * `CompressOptions.quality`.
+   */
+  quality: FormatQuality = 'high'
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
   colorSpace: 'srgb' | 'linear' = 'srgb'
   /**
@@ -80,6 +86,7 @@ export class GputexLoader extends Loader<Texture> {
     compressTexture(url, {
       hint: this.hint,
       preferredFormat: this.preferredFormat,
+      quality: this.quality,
       colorSpace: this.colorSpace,
       svgSize: this.svgSize,
       flipY: this.flipY,

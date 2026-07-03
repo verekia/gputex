@@ -33,6 +33,7 @@ export { BC1Encoder } from './BC1Encoder.js'
 export { BC5Encoder } from './BC5Encoder.js'
 export { BC7Encoder, type BC7EncoderOptions } from './BC7Encoder.js'
 export { ASTC4x4Encoder } from './ASTC4x4Encoder.js'
+export { ETC2Encoder } from './ETC2Encoder.js'
 
 // WebGL2 fallback encoders + capability / selection utilities. Used
 // automatically by `compressTexture()` when WebGPU is unavailable; exported
@@ -63,6 +64,7 @@ export {
   selectFormat,
   type TextureHint,
   type PreferredFormat,
+  type FormatQuality,
   type SelectFormatOptions,
   type FormatSelection,
 } from './selectFormat.js'

@@ -2,6 +2,7 @@ import { ASTC4x4Encoder } from '../ASTC4x4Encoder.js'
 import { BC1Encoder } from '../BC1Encoder.js'
 import { BC5Encoder } from '../BC5Encoder.js'
 import { BC7Encoder } from '../BC7Encoder.js'
+import { ETC2Encoder } from '../ETC2Encoder.js'
 import { TextureFormat, WebGPUFeature } from '../TextureFormat.js'
 
 // Meta-inspect an encoder class without instantiating it (instantiation
@@ -38,7 +39,7 @@ describe('BC1Encoder metadata', () => {
 })
 
 describe('f16 fast shader variants', () => {
-  it('every encoder ships an f16 fast module (BC1 included)', () => {
+  it('every BC/ASTC encoder ships an f16 fast module (BC1 included)', () => {
     for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ASTC4x4Encoder]) {
       const view: AnyProto = Object.create(cls.prototype)
       const src: string | null = view.wgslSourceFastF16()
@@ -46,6 +47,11 @@ describe('f16 fast shader variants', () => {
       expect(src).toContain('enable f16')
       expect(src).toContain('@compute')
     }
+  })
+
+  it('ETC2 has no f16 variant (integer-exact f32 algorithm)', () => {
+    const view: AnyProto = Object.create(ETC2Encoder.prototype)
+    expect(view.wgslSourceFastF16()).toBe(null)
   })
 })
 
@@ -94,6 +100,31 @@ describe('BC7Encoder', () => {
     expect(src).toContain('principal_axis4')
     expect(src).toContain('pick_ep')
     expect(src).toMatch(/Mode 6/i)
+  })
+})
+
+describe('ETC2Encoder', () => {
+  it('declares its metadata', () => {
+    expect(ETC2Encoder.requiredFeature).toBe(WebGPUFeature.ETC2)
+    expect(ETC2Encoder.textureFormats).toEqual([TextureFormat.ETC2_RGB8, TextureFormat.ETC2_RGB8_SRGB])
+    const view: AnyProto = Object.create(ETC2Encoder.prototype)
+    expect(view.label).toBe('etc2')
+    expect(view.bytesPerBlock).toBe(8)
+    expect(view.supportsSrgb).toBe(true)
+    expect(view.gpuTextureFormat({ colorSpace: 'srgb' })).toBe('etc2-rgb8unorm-srgb')
+    expect(view.gpuTextureFormat({ colorSpace: 'linear' })).toBe('etc2-rgb8unorm')
+  })
+
+  it('loads its WGSL shader source (etc2.wgsl imported via ?raw)', () => {
+    const view: AnyProto = Object.create(ETC2Encoder.prototype)
+    const src: string = view.wgslSource()
+    expect(typeof src).toBe('string')
+    expect(src).toContain('@compute')
+    expect(src).toContain('@workgroup_size')
+    // Sanity: the shader exposes the ETC2-specific helpers by name.
+    expect(src).toContain('fn sb_search')
+    expect(src).toContain('fn quantise_bases')
+    expect(src).toMatch(/planar/i)
   })
 })
 

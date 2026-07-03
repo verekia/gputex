@@ -13,4 +13,7 @@ for f in bc1 bc5 bc7 astc4x4; do
     git show "HEAD:$src" > "example/public/ab/${short}_head.wgsl" 2>/dev/null || true
   done
 done
+# etc2 has no f16 variant.
+cp library/src/etc2.wgsl example/public/ab/etc2_work.wgsl
+git show "HEAD:library/src/etc2.wgsl" > example/public/ab/etc2_head.wgsl 2>/dev/null || true
 echo "synced $(ls example/public/ab | wc -l | tr -d ' ') files into example/public/ab/"

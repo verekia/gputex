@@ -4,6 +4,7 @@ import { ASTC4x4Encoder } from '../ASTC4x4Encoder.js'
 import { BC1Encoder } from '../BC1Encoder.js'
 import { BC5Encoder } from '../BC5Encoder.js'
 import { BC7Encoder } from '../BC7Encoder.js'
+import { ETC2Encoder } from '../ETC2Encoder.js'
 import { selectFormat } from '../selectFormat.js'
 import { TextureFormat, WebGPUFeature } from '../TextureFormat.js'
 
@@ -136,18 +137,87 @@ describe('selectFormat: BC takes precedence over ASTC', () => {
   })
 })
 
+describe('selectFormat: ETC2 last resort', () => {
+  it('returns ETC2_RGB8_SRGB for color on an ETC2-only adapter', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ETC2]), 'color')
+    expect(sel.format).toBe(TextureFormat.ETC2_RGB8_SRGB)
+    expect(sel.encoderClass).toBe(ETC2Encoder)
+    expect(sel.astcNormalRemap).toBe(false)
+  })
+
+  it('returns ETC2_RGB8 (linear) when colorSpace=linear', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ETC2]), 'color', { colorSpace: 'linear' })
+    expect(sel.format).toBe(TextureFormat.ETC2_RGB8)
+  })
+
+  it('is NOT used for colorWithAlpha or normal (RGB8 carries neither)', () => {
+    for (const hint of ['colorWithAlpha', 'normal'] as const) {
+      const sel = selectFormat(stubAdapter([WebGPUFeature.ETC2]), hint)
+      expect(sel.format).toBe(null)
+      expect(sel.encoderClass).toBe(null)
+    }
+  })
+
+  it('loses to ASTC when both are present (at default quality)', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC, WebGPUFeature.ETC2]), 'color')
+    expect(sel.encoderClass).toBe(ASTC4x4Encoder)
+  })
+})
+
+describe('selectFormat: quality low', () => {
+  it('returns BC1_SRGB for color on a BC adapter', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'color', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.BC1_SRGB)
+    expect(sel.encoderClass).toBe(BC1Encoder)
+  })
+
+  it('prefers BC1 over ETC2 when the adapter has both (desktop-class)', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.BC, WebGPUFeature.ETC2]), 'color', { quality: 'low' })
+    expect(sel.encoderClass).toBe(BC1Encoder)
+  })
+
+  it('returns ETC2_RGB8_SRGB for color on a BC-less adapter, beating ASTC', () => {
+    // The point of 'low' on mobile: 4-bpp ETC2 over 8-bpp ASTC.
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC, WebGPUFeature.ETC2]), 'color', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.ETC2_RGB8_SRGB)
+    expect(sel.encoderClass).toBe(ETC2Encoder)
+  })
+
+  it('returns linear ETC2_RGB8 when colorSpace=linear', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ETC2]), 'color', { quality: 'low', colorSpace: 'linear' })
+    expect(sel.format).toBe(TextureFormat.ETC2_RGB8)
+  })
+
+  it('keeps the high-quality selection for colorWithAlpha (no warning — documented)', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'colorWithAlpha', { quality: 'low' })
+      expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+      expect(sel.encoderClass).toBe(BC7Encoder)
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('keeps BC5 for normal maps', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'normal', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.BC5)
+    expect(sel.encoderClass).toBe(BC5Encoder)
+  })
+
+  it('falls back to ASTC when no 4-bpp format is available', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC]), 'color', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.ASTC_4x4_SRGB)
+    expect(sel.encoderClass).toBe(ASTC4x4Encoder)
+  })
+})
+
 describe('selectFormat: fallback', () => {
-  it('returns null format + null encoder when neither feature is present', () => {
+  it('returns null format + null encoder when no feature is present', () => {
     const sel = selectFormat(stubAdapter([]), 'color')
     expect(sel.format).toBe(null)
     expect(sel.encoderClass).toBe(null)
     expect(sel.astcNormalRemap).toBe(false)
-  })
-
-  it('ignores unrelated features like ETC2', () => {
-    // ETC2 is a real `GPUFeatureName` but we have no ETC2 encoder.
-    const sel = selectFormat(stubAdapter([WebGPUFeature.ETC2]), 'color')
-    expect(sel.format).toBe(null)
-    expect(sel.encoderClass).toBe(null)
   })
 })

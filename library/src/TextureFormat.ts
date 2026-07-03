@@ -7,7 +7,7 @@
 // the core so it carries no `three` import).
 //
 // BC5 has no sRGB variant because it is a 2-channel linear format (tangent-
-// space normals). The other three families have matched UNORM + sRGB pairs.
+// space normals). The other families have matched UNORM + sRGB pairs.
 //
 // Shape note: `as const` + derived type union keeps the identifiers usable
 // both as runtime strings and as TypeScript literal types (`TextureFormat`
@@ -23,6 +23,8 @@ export const TextureFormat = {
   BC7_SRGB: 'BC7_SRGB',
   ASTC_4x4: 'ASTC_4x4',
   ASTC_4x4_SRGB: 'ASTC_4x4_SRGB',
+  ETC2_RGB8: 'ETC2_RGB8',
+  ETC2_RGB8_SRGB: 'ETC2_RGB8_SRGB',
 } as const
 
 export type TextureFormat = (typeof TextureFormat)[keyof typeof TextureFormat]

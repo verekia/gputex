@@ -28,7 +28,13 @@ import { ClampToEdgeWrapping, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace
 import { Encoder, type EncoderConstructor } from '../Encoder.js'
 import { generateGpuMipChain } from '../gpuMipgen.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
-import { selectFormat, type FormatSelection, type PreferredFormat, type TextureHint } from '../selectFormat.js'
+import {
+  selectFormat,
+  type FormatQuality,
+  type FormatSelection,
+  type PreferredFormat,
+  type TextureHint,
+} from '../selectFormat.js'
 import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from '../svg.js'
 import { selectWebGLFormat, type WebGLFormatSelection } from '../webgl/selectWebGLFormat.js'
 import { detectWebGLCapabilities } from '../webgl/webglCapabilities.js'
@@ -66,12 +72,22 @@ export interface CompressOptions {
   hint?: TextureHint
   /**
    * Prefer a specific format over the default choice when the device
-   * supports it; falls back to the normal selection (BC7 → ASTC → RGBA8)
-   * when it doesn't. Currently only 'bc1': half the memory of BC7 for
-   * opaque colour textures, at lower quality. Only honoured with
+   * supports it; falls back to the normal selection (BC7 → ASTC → ETC2 →
+   * RGBA8) when it doesn't. Currently only 'bc1': half the memory of BC7
+   * for opaque colour textures, at lower quality. Only honoured with
    * `hint: 'color'` — BC1 can't carry real alpha or normal maps.
    */
   preferredFormat?: PreferredFormat
+  /**
+   * Memory/fidelity trade-off for opaque colour textures. Default 'high'
+   * (BC7 / ASTC 4×4, 1 byte/pixel). 'low' picks the 4-bpp formats when the
+   * device has one — BC1 on desktop-class GPUs, ETC2 RGB8 on mobile-class
+   * ones — halving GPU memory at visibly lower quality on smooth content.
+   * Ignored for `hint: 'colorWithAlpha'` and `hint: 'normal'` (the 4-bpp
+   * formats can't carry them). On the WebGL fallback tier only BC1 is
+   * available at 'low'.
+   */
+  quality?: FormatQuality
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
   colorSpace?: 'srgb' | 'linear'
   /**
@@ -200,6 +216,7 @@ let sharedGpuPromise: Promise<SharedGpu | null> | null = null
 const SHARED_DEVICE_FEATURES: readonly GPUFeatureName[] = [
   'texture-compression-bc',
   'texture-compression-astc',
+  'texture-compression-etc2',
   'shader-f16',
   'timestamp-query',
 ]
@@ -446,6 +463,7 @@ export async function compressTexture(
   const {
     hint = 'color',
     preferredFormat,
+    quality = 'high',
     colorSpace = 'srgb',
     svgSize,
     flipY = true,
@@ -556,7 +574,7 @@ export async function compressTexture(
     }
     if (!adapter) return null
 
-    const selection = selectFormat(adapter, hint, { colorSpace, preferredFormat })
+    const selection = selectFormat(adapter, hint, { colorSpace, preferredFormat, quality })
     if (!selection.format || !selection.encoderClass) return null
     return {
       adapter,
@@ -699,7 +717,7 @@ export async function compressTexture(
     if (!gl) return null
 
     const caps = detectWebGLCapabilities(gl)
-    const selection = selectWebGLFormat(caps, hint, { colorSpace, preferredFormat })
+    const selection = selectWebGLFormat(caps, hint, { colorSpace, preferredFormat, quality })
     if (!selection.format || !selection.encoderClass) return null
     return { gl, selection: { ...selection, format: selection.format, encoderClass: selection.encoderClass } }
   }

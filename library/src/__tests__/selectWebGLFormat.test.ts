@@ -152,6 +152,34 @@ describe('selectWebGLFormat: preferredFormat bc1', () => {
   })
 })
 
+describe('selectWebGLFormat: quality low', () => {
+  it('picks BC1 over BC7 for opaque color when s3tc is present', () => {
+    const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true, s3tcSrgb: true }), 'color', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.BC1_SRGB)
+    expect(sel.encoderClass).toBe(BC1WebGLEncoder)
+  })
+
+  it('keeps BC7 when the matching s3tc extension is missing', () => {
+    // There is no ETC2 encoder on the WebGL tier, so 'low' has only BC1.
+    const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true }), 'color', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+  })
+
+  it('keeps the high-quality selection for colorWithAlpha', () => {
+    const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true, s3tcSrgb: true }), 'colorWithAlpha', {
+      quality: 'low',
+    })
+    expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+    expect(sel.encoderClass).toBe(BC7WebGLEncoder)
+  })
+
+  it('keeps BC5 for normal maps', () => {
+    const sel = selectWebGLFormat(caps({ rgtc: true, s3tc: true, s3tcSrgb: true }), 'normal', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.BC5)
+    expect(sel.encoderClass).toBe(BC5WebGLEncoder)
+  })
+})
+
 describe('selectWebGLFormat: no compressed path', () => {
   it('returns null format + null encoder when nothing is supported', () => {
     const sel = selectWebGLFormat(caps({}), 'color')

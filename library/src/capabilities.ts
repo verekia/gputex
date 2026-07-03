@@ -35,8 +35,7 @@ const FORMATS_BY_FEATURE: Record<WebGPUFeature, readonly TextureFormat[]> = {
     TextureFormat.BC7_SRGB,
   ],
   [WebGPUFeature.ASTC]: [TextureFormat.ASTC_4x4, TextureFormat.ASTC_4x4_SRGB],
-  // ETC2 has no encoder yet — explicit empty keeps exhaustiveness check.
-  [WebGPUFeature.ETC2]: [],
+  [WebGPUFeature.ETC2]: [TextureFormat.ETC2_RGB8, TextureFormat.ETC2_RGB8_SRGB],
 }
 
 export function detectCapabilities(adapter: FeatureProvider): Capabilities {
@@ -51,6 +50,7 @@ export function detectCapabilities(adapter: FeatureProvider): Capabilities {
   const supportedFormats: TextureFormat[] = []
   if (bc) supportedFormats.push(...FORMATS_BY_FEATURE[WebGPUFeature.BC])
   if (astc) supportedFormats.push(...FORMATS_BY_FEATURE[WebGPUFeature.ASTC])
+  if (etc2) supportedFormats.push(...FORMATS_BY_FEATURE[WebGPUFeature.ETC2])
 
   return { bc, astc, etc2, supportedFormats }
 }

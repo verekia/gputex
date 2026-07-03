@@ -19,7 +19,7 @@
 //      queries) GPU compute-pass time per format on a 2048×2048 image, for
 //      both shader variants.
 
-import { ASTC4x4Encoder, BC1Encoder, BC5Encoder, BC7Encoder } from 'gputex'
+import { ASTC4x4Encoder, BC1Encoder, BC5Encoder, BC7Encoder, ETC2Encoder } from 'gputex'
 import type { Encoder } from 'gputex'
 
 import {
@@ -27,13 +27,15 @@ import {
   decodeBC1Block,
   decodeBC5Block,
   decodeBC7Block,
+  decodeETC2Block,
   encodeASTC4x4Block,
   encodeBC1Block,
   encodeBC5Block,
   encodeBC7Mode6Block,
+  encodeETC2Block,
 } from 'gputex/testing'
 
-export type FormatKey = 'bc1' | 'bc5' | 'bc7' | 'astc'
+export type FormatKey = 'bc1' | 'bc5' | 'bc7' | 'astc' | 'etc2'
 
 export interface CorrectnessResult {
   name: string
@@ -156,6 +158,18 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 49.45,
+  // ETC2 (2026-07, f32-only, minus ~0.15 dB; re-pinned for the scalar-luma
+  // fast shader — 21× the brute-force encoder at −0.06..−0.21 dB). Matches
+  // or beats BC1 on photographic/grayscale content; the low 'color'-card
+  // number is the format, not the encoder (the reference measures
+  // 20.02 dB): ETC1-family blocks modulate only luma per pixel, so the
+  // card's per-pixel chroma checkers crater without the unimplemented T/H
+  // modes.
+  'etc2:color': 19.83,
+  'etc2:packed-1024': 31.88,
+  'etc2:rock-color-1k': 33.85,
+  'etc2:rock-roughness-1k': 40.0,
+  'etc2:wood-color-1k': 39.15,
   'bc5:wood-normal-1k': 47.8,
   'bc1:wood-roughness-1k': 40.4,
   'bc1:wood-displacement-1k': 43.1,
@@ -213,6 +227,14 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc1:wood-color-1k': 0.05,
   'bc7:wood-color-1k': 0.05,
   'astc:wood-color-1k': 0.05,
+  // ETC2 (2026-07 scalar-luma shader, observed 0.199 / 0.019 / 0.077 /
+  // 0.023 / 0.038 — estimate-based selection trails the exact reference a
+  // little more per block than the other formats' exact searches do).
+  'etc2:color': 0.3,
+  'etc2:packed-1024': 0.05,
+  'etc2:rock-color-1k': 0.15,
+  'etc2:rock-roughness-1k': 0.05,
+  'etc2:wood-color-1k': 0.08,
   'bc5:wood-normal-1k': 0.05,
   'bc1:wood-roughness-1k': 0.1,
   'bc1:wood-displacement-1k': 0.05,
@@ -316,6 +338,10 @@ const DECODERS: Record<FormatKey, { bytesPerBlock: number; decode: BlockDecoder 
     bytesPerBlock: 16,
     decode: block => ({ values: Float64Array.from(decodeASTC4x4Block(block)), channels: 4 }),
   },
+  etc2: {
+    bytesPerBlock: 8,
+    decode: block => ({ values: Float64Array.from(decodeETC2Block(block)), channels: 3 }),
+  },
 }
 
 /**
@@ -332,6 +358,8 @@ function referenceEncode(format: FormatKey, img: ImageData): Uint8Array {
       let block: Uint8Array
       if (format === 'bc1') {
         block = encodeBC1Block(extractBlock(img, bx, by, 3), { quality: 'high' })
+      } else if (format === 'etc2') {
+        block = encodeETC2Block(extractBlock(img, bx, by, 3), { quality: 'high' })
       } else if (format === 'bc5') {
         const rgba = extractBlock(img, bx, by, 4)
         const r = new Float64Array(16)
@@ -437,6 +465,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   const requestable: GPUFeatureName[] = [
     'texture-compression-bc',
     'texture-compression-astc',
+    'texture-compression-etc2',
     'shader-f16',
     'timestamp-query',
   ]
@@ -458,6 +487,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     bc5: new BC5Encoder({ device, adapter }),
     bc7: new BC7Encoder({ device, adapter }),
     astc: new ASTC4x4Encoder({ device, adapter }),
+    etc2: new ETC2Encoder({ device, adapter }),
   }
   // f32-forced twins, for validating/benchmarking the fallback shader on
   // f16 hardware. Identical to `encoders` when the device lacks f16.
@@ -466,7 +496,11 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     bc5: new BC5Encoder({ device, adapter, disableF16: true }),
     bc7: new BC7Encoder({ device, adapter, disableF16: true }),
     astc: new ASTC4x4Encoder({ device, adapter, disableF16: true }),
+    etc2: new ETC2Encoder({ device, adapter, disableF16: true }),
   }
+  // ETC2 (and any future integer-domain encoder) ships no f16 module — its
+  // only variant is f32, so the f16/f32 twin logic below collapses for it.
+  const hasF16Variant = (format: FormatKey): boolean => hasF16 && encoders[format].wgslSourceFastF16() !== null
 
   onProgress('Loading test images…')
   const colorFull = await loadImageData('/textures/color.png')
@@ -481,7 +515,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   const perf: PerfResult[] = []
 
   // ---------------------------------------------------------- correctness
-  const FORMATS: FormatKey[] = ['bc1', 'bc5', 'bc7', 'astc']
+  const FORMATS: FormatKey[] = ['bc1', 'bc5', 'bc7', 'astc', 'etc2']
   for (const format of FORMATS) {
     const enc = encoders[format]
 
@@ -565,7 +599,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   })
   const qualitySpecs: QualitySpec[] = [
     // Synthetic cards.
-    gated('color', ['bc1', 'bc7', 'astc'], colorFull),
+    gated('color', ['bc1', 'bc7', 'astc', 'etc2'], colorFull),
     gated('normal', ['bc5', 'bc1', 'bc7', 'astc'], normalFull),
     // Committed 1024² alpha card (gen-test-textures.mjs): smooth alpha
     // ramps, cutout edges, Nyquist/noise alpha, low-alpha precision, plus
@@ -575,13 +609,13 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     // Packed-materials game atlas (channel-packed, has alpha at 1024).
     gated('packed-256', ['bc7'], packed(256)),
     gated('packed-512', ['bc7'], packed(512)),
-    gated('packed-1024', ['bc1', 'bc7', 'astc'], packed(1024)),
+    gated('packed-1024', ['bc1', 'bc7', 'astc', 'etc2'], packed(1024)),
     floorOnly('packed-2048', ['bc7'], packed(2048)),
     floorOnly('packed-4096', ['bc7'], packed(4096)),
     // Rock064 PBR set (photographic).
-    gated('rock-color-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Color')),
+    gated('rock-color-1k', ['bc1', 'bc7', 'astc', 'etc2'], rock('1K', 'Color')),
     gated('rock-normal-1k', ['bc5'], rock('1K', 'NormalGL')),
-    gated('rock-roughness-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Roughness')),
+    gated('rock-roughness-1k', ['bc1', 'bc7', 'astc', 'etc2'], rock('1K', 'Roughness')),
     gated('rock-ao-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'AmbientOcclusion')),
     gated('rock-displacement-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Displacement')),
     floorOnly('rock-color-2k', ['bc7'], rock('2K', 'Color')),
@@ -589,7 +623,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     floorOnly('rock-color-4k', ['bc7'], rock('4K', 'Color')),
     floorOnly('rock-normal-4k', ['bc5'], rock('4K', 'NormalGL')),
     // WoodFloor004 PBR set (photographic, strong plank seams).
-    gated('wood-color-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Color')),
+    gated('wood-color-1k', ['bc1', 'bc7', 'astc', 'etc2'], wood('1K', 'Color')),
     gated('wood-normal-1k', ['bc5'], wood('1K', 'NormalGL')),
     gated('wood-roughness-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Roughness')),
     gated('wood-displacement-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Displacement')),
@@ -618,12 +652,12 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
       }
 
       const variants: Array<['f16' | 'f32', Encoder]> =
-        hasF16 && spec.bothVariants
+        hasF16Variant(format) && spec.bothVariants
           ? [
               ['f16', encoders[format]],
               ['f32', encodersF32[format]],
             ]
-          : [[hasF16 ? 'f16' : 'f32', encoders[format]]]
+          : [[hasF16Variant(format) ? 'f16' : 'f32', encoders[format]]]
       for (const [variant, enc] of variants) {
         onProgress(`Quality: ${format} (${variant}) PSNR on ${image}`)
         const { data } = await enc.encodeToBytes(img)
@@ -683,8 +717,8 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
 
   const perfCases: Array<{ format: FormatKey; variant: 'f16' | 'f32'; enc: Encoder }> = []
   for (const format of FORMATS) {
-    perfCases.push({ format, variant: hasF16 ? 'f16' : 'f32', enc: encoders[format] })
-    if (hasF16) perfCases.push({ format, variant: 'f32', enc: encodersF32[format] })
+    perfCases.push({ format, variant: hasF16Variant(format) ? 'f16' : 'f32', enc: encoders[format] })
+    if (hasF16Variant(format)) perfCases.push({ format, variant: 'f32', enc: encodersF32[format] })
   }
 
   for (const { format, variant, enc } of perfCases) {

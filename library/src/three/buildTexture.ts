@@ -8,7 +8,13 @@
 // root entry) be imported with no `three` install; the helpers here live behind
 // the `gputex/three` entry instead.
 
-import { RED_GREEN_RGTC2_Format, RGBA_ASTC_4x4_Format, RGBA_BPTC_Format, RGBA_S3TC_DXT1_Format } from 'three'
+import {
+  RED_GREEN_RGTC2_Format,
+  RGB_ETC2_Format,
+  RGBA_ASTC_4x4_Format,
+  RGBA_BPTC_Format,
+  RGBA_S3TC_DXT1_Format,
+} from 'three'
 
 import { TextureFormat } from '../TextureFormat.js'
 import { assembleCompressedTexture, type EncodedLevel } from './textureAssembly.js'
@@ -30,12 +36,15 @@ const THREE_FORMAT: Record<TextureFormat, CompressedPixelFormat> = {
   [TextureFormat.BC7_SRGB]: RGBA_BPTC_Format,
   [TextureFormat.ASTC_4x4]: RGBA_ASTC_4x4_Format,
   [TextureFormat.ASTC_4x4_SRGB]: RGBA_ASTC_4x4_Format,
+  [TextureFormat.ETC2_RGB8]: RGB_ETC2_Format,
+  [TextureFormat.ETC2_RGB8_SRGB]: RGB_ETC2_Format,
 }
 
 const SRGB_FORMATS: ReadonlySet<TextureFormat> = new Set([
   TextureFormat.BC1_SRGB,
   TextureFormat.BC7_SRGB,
   TextureFormat.ASTC_4x4_SRGB,
+  TextureFormat.ETC2_RGB8_SRGB,
 ])
 
 /** Whether a logical format is the sRGB variant of its family. */
