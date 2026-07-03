@@ -1,0 +1,6 @@
+# Test-suite textures are dev-only (~190 MB: the packed-materials atlas and
+# the Rock064/WoodFloor004 PBR sets, used by the /test quality rows). The
+# deployed demo pages only sample color.png and normal.png — keep just those.
+example/public/textures/*
+!example/public/textures/color.png
+!example/public/textures/normal.png
