@@ -79,6 +79,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var pix: array<h4, 16>;
   var lo = h4(1.0);
   var hi = h4(0.0);
+  var gd = h(0.0);
   var p0v = h4(0.0);
   var sd = h4(0.0);
   var c0v = h4(0.0);
@@ -89,6 +90,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
     let px = h4(textureLoad(src_tex, p, 0));
     pix[i] = px; lo = min(lo, px); hi = max(hi, px);
+    gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
     if (i == 0u) { p0v = px; }
     let d = (px - p0v) * h(16.0);
     sd = sd + d;
@@ -116,35 +118,46 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   // f16), so only the direction survives.
   var seed_lo = lo;
   var seed_hi = hi;
-  var axis = hi - lo;
-  var axis_ok = true;
-  // 8 iterations: 4 was under-converged on noisy 4-D blocks (heavily
-  // downscaled photographic/channel-packed content) — going to 8 measured
-  // +0.75 dB on the normal card, +0.12 colour, +0.08 packed-materials, and
-  // matches the f32 fallback's iteration count. Four extra 4-dot matvecs
-  // per block are noise next to the index pass.
-  for (var it: u32 = 0u; it < 8u; it = it + 1u) {
-    let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
-    let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
-    if (m < h(1e-4)) { axis_ok = false; break; }
-    axis = nv / m;
-  }
-  if (axis_ok) {
-    axis = axis / length(axis);
-    // Exact projection extents along the axis. (A Rayleigh-quotient span
-    // estimate was tried in place of this pass — it saves 16 dots but costs
-    // 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ misjudges
-    // two-cluster and outlier blocks and the quantised weight grid can't
-    // recover. The pass stays.)
-    var t_min = h(4.0);
-    var t_max = h(-4.0);
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      let t = dot(pix[k] - mean, axis);
-      t_min = min(t_min, t);
-      t_max = max(t_max, t);
+  // GRAY + opaque blocks (every texel R == G == B, A == 1 — exact in f16
+  // for 8-bit sources) have their principal axis analytically: (1,1,1,0)/√3,
+  // with projection extents at the luma min/max. Skip the power iteration
+  // AND the 16-dot extents pass — the seed is exact, so quality is
+  // identical, and the grayscale-heavy formats (roughness/AO/displacement)
+  // drop a third of their per-block work.
+  if (lo.w == h(1.0) && gd == h(0.0)) {
+    seed_lo = h4(lo.x, lo.x, lo.x, h(1.0));
+    seed_hi = h4(hi.x, hi.x, hi.x, h(1.0));
+  } else {
+    var axis = hi - lo;
+    var axis_ok = true;
+    // 8 iterations: 4 was under-converged on noisy 4-D blocks (heavily
+    // downscaled photographic/channel-packed content) — going to 8 measured
+    // +0.75 dB on the normal card, +0.12 colour, +0.08 packed-materials, and
+    // matches the f32 fallback's iteration count. Four extra 4-dot matvecs
+    // per block are noise next to the index pass.
+    for (var it: u32 = 0u; it < 8u; it = it + 1u) {
+      let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
+      let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
+      if (m < h(1e-4)) { axis_ok = false; break; }
+      axis = nv / m;
     }
-    seed_lo = clamp(mean + t_min * axis, h4(0.0), h4(1.0));
-    seed_hi = clamp(mean + t_max * axis, h4(0.0), h4(1.0));
+    if (axis_ok) {
+      axis = axis / length(axis);
+      // Exact projection extents along the axis. (A Rayleigh-quotient span
+      // estimate was tried in place of this pass — it saves 16 dots but costs
+      // 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ misjudges
+      // two-cluster and outlier blocks and the quantised weight grid can't
+      // recover. The pass stays.)
+      var t_min = h(4.0);
+      var t_max = h(-4.0);
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let t = dot(pix[k] - mean, axis);
+        t_min = min(t_min, t);
+        t_max = max(t_max, t);
+      }
+      seed_lo = clamp(mean + t_min * axis, h4(0.0), h4(1.0));
+      seed_hi = clamp(mean + t_max * axis, h4(0.0), h4(1.0));
+    }
   }
 
   // Fit from the principal-axis seed (bbox on degenerate blocks), then

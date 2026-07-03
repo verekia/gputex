@@ -131,8 +131,15 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'astc:rock-color-1k': 37.35,
   'bc5:rock-normal-1k': 46.2,
   'bc1:rock-roughness-1k': 39.1,
-  'bc1:rock-ao-1k': 41.25,
-  'bc1:rock-displacement-1k': 44.7,
+  'bc1:rock-ao-1k': 41.35,
+  'bc1:rock-displacement-1k': 45.05,
+  // BC7 on exact-grayscale maps (analytic luma axis) — measured
+  // 51.62 / 53.63 / 56.68 / 52.10 / 55.09 (2026-07, min f16/f32).
+  'bc7:rock-roughness-1k': 51.45,
+  'bc7:rock-ao-1k': 53.45,
+  'bc7:rock-displacement-1k': 56.5,
+  'bc7:wood-roughness-1k': 51.95,
+  'bc7:wood-displacement-1k': 54.9,
   // ASTC luminance path (CEM 0, 5-bit weights) on exact-grayscale maps —
   // measured 59.73 / 62.45 / 70.59 / 60.04 / 65.27 (2026-07, f16 ≡ f32).
   'astc:rock-roughness-1k': 59.55,
@@ -149,7 +156,7 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'astc:wood-color-1k': 49.45,
   'bc5:wood-normal-1k': 47.8,
   'bc1:wood-roughness-1k': 40.4,
-  'bc1:wood-displacement-1k': 42.95,
+  'bc1:wood-displacement-1k': 43.1,
   'bc7:wood-color-2k': 50.65,
   'bc5:wood-normal-2k': 48.75,
   'bc7:wood-color-4k': 51.7,
@@ -187,6 +194,12 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc1:rock-roughness-1k': 0.05,
   'bc1:rock-ao-1k': 0.1,
   'bc1:rock-displacement-1k': 0.05,
+  // BC7 gray rows: observed ≤ 0.005.
+  'bc7:rock-roughness-1k': 0.05,
+  'bc7:rock-ao-1k': 0.05,
+  'bc7:rock-displacement-1k': 0.05,
+  'bc7:wood-roughness-1k': 0.05,
+  'bc7:wood-displacement-1k': 0.05,
   // ASTC luminance rows: observed ≤ 0.001 — the scalar path tracks the
   // exhaustive reference almost block-for-block.
   'astc:rock-roughness-1k': 0.05,
@@ -562,9 +575,9 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     // Rock064 PBR set (photographic).
     gated('rock-color-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Color')),
     gated('rock-normal-1k', ['bc5'], rock('1K', 'NormalGL')),
-    gated('rock-roughness-1k', ['bc1', 'astc'], rock('1K', 'Roughness')),
-    gated('rock-ao-1k', ['bc1', 'astc'], rock('1K', 'AmbientOcclusion')),
-    gated('rock-displacement-1k', ['bc1', 'astc'], rock('1K', 'Displacement')),
+    gated('rock-roughness-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Roughness')),
+    gated('rock-ao-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'AmbientOcclusion')),
+    gated('rock-displacement-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Displacement')),
     floorOnly('rock-color-2k', ['bc7'], rock('2K', 'Color')),
     floorOnly('rock-normal-2k', ['bc5'], rock('2K', 'NormalGL')),
     floorOnly('rock-color-4k', ['bc7'], rock('4K', 'Color')),
@@ -572,8 +585,8 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     // WoodFloor004 PBR set (photographic, strong plank seams).
     gated('wood-color-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Color')),
     gated('wood-normal-1k', ['bc5'], wood('1K', 'NormalGL')),
-    gated('wood-roughness-1k', ['bc1', 'astc'], wood('1K', 'Roughness')),
-    gated('wood-displacement-1k', ['bc1', 'astc'], wood('1K', 'Displacement')),
+    gated('wood-roughness-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Roughness')),
+    gated('wood-displacement-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Displacement')),
     floorOnly('wood-color-2k', ['bc7'], wood('2K', 'Color')),
     floorOnly('wood-normal-2k', ['bc5'], wood('2K', 'NormalGL')),
     floorOnly('wood-color-4k', ['bc7'], wood('4K', 'Color')),

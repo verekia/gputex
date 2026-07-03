@@ -146,6 +146,7 @@ void main() {
   vec4 c1v = vec4(0.0);
   vec4 c2v = vec4(0.0);
   vec4 c3v = vec4(0.0);
+  int gd = 0;
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
@@ -153,6 +154,7 @@ void main() {
     gPixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
+    gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
     if (i == 0) { p0f = vec4(px); }
     vec4 d = vec4(px) - p0f;
     sd += d;
@@ -171,21 +173,28 @@ void main() {
 
   ivec4 seed0 = lo;
   ivec4 seed1 = hi;
-  vec4 axis = principalAxis(c0v, c1v, c2v, c3v, vec4(hi - lo));
-  if (dot(axis, axis) > 0.0) {
-    // Exact projection extents along the axis. (A Rayleigh-quotient span
-    // estimate was tried in place of this pass — it saves 16 dots but costs
-    // 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ misjudges
-    // two-cluster and outlier blocks. The pass stays.)
-    float tMin = 1e30;
-    float tMax = -1e30;
-    for (int k = 0; k < 16; k++) {
-      float t = dot(vec4(gPixels[k]) - mean, axis);
-      tMin = min(tMin, t);
-      tMax = max(tMax, t);
+  // Gray + opaque blocks: axis is analytically (1,1,1,0)/√3 with extents
+  // at the luma min/max — skip iteration + extents (see bc7_fast_f16.wgsl).
+  if (lo.w == 255 && gd == 0) {
+    seed0 = ivec4(lo.x, lo.x, lo.x, 255);
+    seed1 = ivec4(hi.x, hi.x, hi.x, 255);
+  } else {
+    vec4 axis = principalAxis(c0v, c1v, c2v, c3v, vec4(hi - lo));
+    if (dot(axis, axis) > 0.0) {
+      // Exact projection extents along the axis. (A Rayleigh-quotient span
+      // estimate was tried in place of this pass — it saves 16 dots but costs
+      // 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ misjudges
+      // two-cluster and outlier blocks. The pass stays.)
+      float tMin = 1e30;
+      float tMax = -1e30;
+      for (int k = 0; k < 16; k++) {
+        float t = dot(vec4(gPixels[k]) - mean, axis);
+        tMin = min(tMin, t);
+        tMax = max(tMax, t);
+      }
+      seed0 = ivec4(clamp(floor(mean + tMin * axis + 0.5), vec4(0.0), vec4(255.0)));
+      seed1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
     }
-    seed0 = ivec4(clamp(floor(mean + tMin * axis + 0.5), vec4(0.0), vec4(255.0)));
-    seed1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
   }
 
   // Quantise the PCA-extents seed directly and assign indices in one

@@ -80,6 +80,7 @@ void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
   ivec2 maxXY = uSrcSize - ivec2(1);
 
+  float gd = 0.0;
   vec3 bbMin = vec3(1.0);
   vec3 bbMax = vec3(0.0);
   vec3 mean = vec3(0.0);
@@ -89,6 +90,7 @@ void main() {
     vec3 c = texelFetch(uSrc, ivec2(p.x, sy), 0).rgb;
     gPixels[i] = c;
     bbMin = min(bbMin, c);
+    gd = max(gd, max(abs(c.x - c.y), abs(c.x - c.z)));
     bbMax = max(bbMax, c);
     mean += c;
   }
@@ -155,6 +157,11 @@ void main() {
   // drops — the refit minimises a continuous objective and can lose after
   // 565 quantisation. Every assignment pass re-accumulates the sums, so an
   // accepted round seeds the next.
+  // Exactly-gray blocks free the refit from the bbox clamp (no hue to
+  // protect; smooth gradients want endpoints outside the data range) —
+  // see bc1_fast_f16.wgsl.
+  vec3 limLo = gd == 0.0 ? vec3(0.0) : bbMin;
+  vec3 limHi = gd == 0.0 ? vec3(1.0) : bbMax;
   Assign cur = assignStats(c0, c1, gIdx);
   for (int it = 0; it < 2; it++) {
     float det = cur.sAA * cur.sBB - cur.sAB * cur.sAB;
@@ -165,8 +172,8 @@ void main() {
     // decode to colours that exist nowhere in the block. Constraining to the
     // bbox also measures better in plain SSE (+1.6 dB on the colour test
     // card), so the accept-if-better guard below keeps more refits.
-    vec3 e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, bbMin, bbMax);
-    vec3 e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, bbMin, bbMax);
+    vec3 e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, limLo, limHi);
+    vec3 e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, limLo, limHi);
     uint nc0 = to565(e0);
     uint nc1 = to565(e1);
     if (nc0 < nc1) { uint t = nc0; nc0 = nc1; nc1 = t; }

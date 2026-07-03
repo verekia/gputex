@@ -126,13 +126,23 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var mn = h3(1.0);
   var mxv = h3(0.0);
   var mean = h3(0.0);
+  var gd = h(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
     let px = h3(textureLoad(src_tex, p, 0).rgb);
     pix[i] = px; mn = min(mn, px); mxv = max(mxv, px);
     mean = mean + px;
+    gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
   }
   mean = mean * h(1.0 / 16.0);
+  // Exactly-gray blocks free the refit from the bbox clamp below: a gray
+  // block has no hue to bend (the clamp's whole purpose), and on smooth
+  // gradients the LSQ optimum often lies OUTSIDE the data range — endpoints
+  // spread wider than the block so the 1/3-2/3 interpolants land on the
+  // values. Same rationale as the BC5 scalar channels (+0.32 dB there).
+  let gray = gd == h(0.0);
+  let lim_lo = select(mn, h3(0.0), gray);
+  let lim_hi = select(mxv, h3(1.0), gray);
 
   // Seed endpoints from the block's principal colour axis (covariance
   // power-iteration, seeded with the bbox diagonal — same family as the
@@ -206,14 +216,15 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (cur.s_min >= cur.s_max) { break; }
     let det = cur.sAA * cur.sBB - cur.sAB * cur.sAB;
     if (abs(det) <= h(0.5)) { break; }
-    // Clamp the refit to the block bbox (not [0,1]): on multi-cluster blocks
-    // the unconstrained solve extrapolates far outside the block's colours
+    // Clamp the refit to the block bbox (not [0,1]) — except for exactly
+    // gray blocks, see the load pass: on multi-cluster blocks the
+    // unconstrained solve extrapolates far outside the block's colours
     // and the per-channel clamp then bends the hue — fringe pixels decode to
     // colours that exist nowhere in the block. Constraining to the bbox also
     // measures better in plain SSE (+1.6 dB on the colour test card), so the
     // accept-if-better guard below keeps more refits.
-    let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, mn, mxv);
-    let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, mn, mxv);
+    let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, lim_lo, lim_hi);
+    let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, lim_lo, lim_hi);
     let rq = order565(to565(e0), to565(e1));
     if (rq.x == c0 && rq.y == c1) { break; }
     let nxt = project_stats(&pix, rq.x, rq.y);

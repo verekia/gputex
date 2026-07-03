@@ -124,6 +124,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var pixels: array<vec4<i32>, 16>;
   var lo = vec4<i32>(255);
   var hi = vec4<i32>(0);
+  var gd = 0;
   var p0f = vec4<f32>(0.0);
   var sd = vec4<f32>(0.0);
   var c0v = vec4<f32>(0.0);
@@ -138,6 +139,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     pixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
+    gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
     if (i == 0u) { p0f = vec4<f32>(px); }
     let d = vec4<f32>(px) - p0f;
     sd = sd + d;
@@ -159,21 +161,30 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let r3v = c3v - sd.w * sd16;
   var seed0 = lo;
   var seed1 = hi;
-  let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
-  if (dot(axis, axis) > 0.0) {
-    // Exact projection extents along the axis. (A Rayleigh-quotient span
-    // estimate was tried in place of this pass — it saves 16 dots but
-    // costs 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ
-    // misjudges two-cluster and outlier blocks. The pass stays.)
-    var t_min: f32 = 1e30;
-    var t_max: f32 = -1e30;
-    for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-      let t = dot(vec4<f32>(pixels[k]) - mean, axis);
-      t_min = min(t_min, t);
-      t_max = max(t_max, t);
+  // Gray + opaque blocks: the axis is analytically (1,1,1,0)/√3 with
+  // extents at the luma min/max — skip iteration + extents pass entirely
+  // (see bc7_fast_f16.wgsl).
+  let gray = lo.w == 255 && gd == 0;
+  if (gray) {
+    seed0 = vec4<i32>(lo.x, lo.x, lo.x, 255);
+    seed1 = vec4<i32>(hi.x, hi.x, hi.x, 255);
+  } else {
+    let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
+    if (dot(axis, axis) > 0.0) {
+      // Exact projection extents along the axis. (A Rayleigh-quotient span
+      // estimate was tried in place of this pass — it saves 16 dots but
+      // costs 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ
+      // misjudges two-cluster and outlier blocks. The pass stays.)
+      var t_min: f32 = 1e30;
+      var t_max: f32 = -1e30;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let t = dot(vec4<f32>(pixels[k]) - mean, axis);
+        t_min = min(t_min, t);
+        t_max = max(t_max, t);
+      }
+      seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
+      seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
     }
-    seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
-    seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
   }
 
   // The 16 4-bit indices, packed LSB-first into two nibble words

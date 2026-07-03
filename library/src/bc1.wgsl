@@ -158,6 +158,7 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var bb_min = vec3<f32>(1.0, 1.0, 1.0);
   var bb_max = vec3<f32>(0.0, 0.0, 0.0);
   var mean = vec3<f32>(0.0);
+  var gd = 0.0;
 
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
@@ -169,8 +170,15 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     bb_min = min(bb_min, c);
     bb_max = max(bb_max, c);
     mean = mean + c;
+    gd = max(gd, max(abs(c.x - c.y), abs(c.x - c.z)));
   }
   mean = mean * (1.0 / 16.0);
+  // Exactly-gray blocks free the refit from the bbox clamp (no hue to
+  // protect; smooth gradients want endpoints outside the data range) —
+  // see bc1_fast_f16.wgsl.
+  let gray = gd == 0.0;
+  let lim_lo = select(bb_min, vec3<f32>(0.0), gray);
+  let lim_hi = select(bb_max, vec3<f32>(1.0), gray);
 
   // Seed endpoints from the block's principal colour axis at the exact
   // projection extents, inset by ~half a 565 cell along the axis (stb_dxt
@@ -223,8 +231,8 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // decode to colours that exist nowhere in the block. Constraining to
     // the bbox also measures better in plain SSE (+1.6 dB on the colour
     // test card), so the accept-if-better guard below keeps more refits.
-    let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, bb_min, bb_max);
-    let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, bb_min, bb_max);
+    let e0 = clamp((cur.sBB * cur.sAV - cur.sAB * cur.sBV) / det, lim_lo, lim_hi);
+    let e1 = clamp((cur.sAA * cur.sBV - cur.sAB * cur.sAV) / det, lim_lo, lim_hi);
     var nc0 = to565(e0);
     var nc1 = to565(e1);
     if (nc0 == nc1) {
