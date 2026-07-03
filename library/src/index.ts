@@ -70,7 +70,10 @@ export {
 // Mip-chain helpers (exported so callers can pre-generate a chain once
 // and feed it into `Encoder.encodeMipChainToBytes` / `encodeToBytes`
 // themselves if they want finer control than `compressTexture` provides).
+// `generateGpuMipChain` is the zero-CPU-pixels variant: upload once,
+// box-filter on the GPU, encode via `Encoder.encodeMipChainFromTexture`.
 export { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
+export { generateGpuMipChain, gpuMipLevelCount } from './gpuMipgen.js'
 
 // SVG rasterisation. Used automatically by `compressTexture()` for SVG
 // sources; exported for callers driving the core encoders directly — the

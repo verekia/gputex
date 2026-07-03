@@ -26,6 +26,7 @@
 import { ClampToEdgeWrapping, LinearFilter, LinearSRGBColorSpace, SRGBColorSpace, Texture } from 'three'
 
 import { Encoder, type EncoderConstructor } from '../Encoder.js'
+import { generateGpuMipChain } from '../gpuMipgen.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from '../mipgen.js'
 import { selectFormat, type FormatSelection, type PreferredFormat, type TextureHint } from '../selectFormat.js'
 import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from '../svg.js'
@@ -632,19 +633,33 @@ export async function compressTexture(
         }
       }
 
-      // Mipped path. Rasterise once, box-filter the chain on CPU, then
-      // encode every level in a single GPU submission — one compute pass and
-      // one readback for the whole chain instead of a round trip per level.
-      const level0 = bitmapToMipLevel(bitmap, flipY)
-      const chain = generateMipChain(level0).map(padToBlockMultiple)
-      const { levels, encodeMs } = await encoder.encodeMipChainToBytes(chain)
+      // Mipped path. On healthy devices the whole chain stays on the GPU:
+      // upload the bitmap once, box-filter the levels in a compute pass
+      // (gpuMipgen.ts), and encode every level straight from the texture's
+      // mip views — no getImageData readback, no CPU filter, no per-level
+      // re-uploads. Devices with the broken copyExternalImageToTexture
+      // can't take that road and keep the CPU chain; both produce identical
+      // bytes (the GPU box filter is integer-exact vs mipgen.ts).
+      let chainResult
+      if (needsWriteTexture) {
+        const level0 = bitmapToMipLevel(bitmap, flipY)
+        chainResult = await encoder.encodeMipChainToBytes(generateMipChain(level0).map(padToBlockMultiple))
+      } else {
+        const chainTex = await generateGpuMipChain(encoder.device, bitmap, { flipY })
+        try {
+          chainResult = await encoder.encodeMipChainFromTexture(chainTex)
+        } finally {
+          chainTex.destroy()
+        }
+      }
+      const { levels, encodeMs } = chainResult
 
       const tex = buildCompressedTexture(levels, selection.format)
       if (transcodeKey) {
         writeTranscodeCache(transcodeKey, {
           format: selection.format,
-          width: level0.width,
-          height: level0.height,
+          width: bitmap.width,
+          height: bitmap.height,
           levels,
         })
       }
@@ -654,8 +669,8 @@ export async function compressTexture(
         fallbackUncompressed: false,
         backend: 'webgpu',
         astcNormalRemap: selection.astcNormalRemap,
-        width: level0.width,
-        height: level0.height,
+        width: bitmap.width,
+        height: bitmap.height,
         mipLevels: levels.length,
         encodeMs,
         decodeMs,

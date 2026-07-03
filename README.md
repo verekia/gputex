@@ -233,6 +233,24 @@ const { levels, encodeMs } = await encoder.encodeMipChainToBytes(generateMipChai
 // levels[i] = { data, width, height, paddedWidth, paddedHeight }
 ```
 
+When the source is an image (not raw pixels), skip the CPU entirely:
+`generateGpuMipChain()` uploads it once and box-filters the whole chain on
+the GPU in one compute pass, and `encodeMipChainFromTexture()` encodes
+straight from the texture's mip views — no `getImageData` readback, no JS
+filter, no per-level uploads. This is what `compressTexture()` uses for
+`mipmaps: true` (mipped BC7: 28 → 7.5 ms at 2048², 110 → 23 ms at 4096²),
+and its box filter is integer-exact against the CPU one, so both paths emit
+identical bytes:
+
+```ts
+import { BC7Encoder, generateGpuMipChain } from 'gputex'
+
+const encoder = await BC7Encoder.create()
+const chainTex = await generateGpuMipChain(encoder.device, imageBitmap, { flipY: true })
+const { levels, encodeMs } = await encoder.encodeMipChainFromTexture(chainTex)
+chainTex.destroy()
+```
+
 To turn an encoder's output into a Three.js `CompressedTexture` directly, use the helpers in `gputex/three`:
 
 ```ts

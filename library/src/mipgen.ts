@@ -1,17 +1,15 @@
 // Mip-chain generation (CPU, box filter).
 //
-// The plan calls for a compute pass here. We chose CPU because:
-//   • `rgba8unorm-storage` is an optional WebGPU feature and not all
-//     adapters report it, so a compute-based mipgen would need a
-//     render-pass fallback anyway (two code paths to test).
-//   • Mip generation runs once at load time on a bitmap that already
-//     sits in CPU memory after `createImageBitmap`/`getImageData`.
-//     A 1024² texture produces ~1.33× the base pixel count across the
-//     mip chain — a JS box filter handles that in well under 50 ms.
-//   • The encoder then re-uploads each level to the GPU for block
-//     compression. That dominates wall-clock time either way.
-// Upgrading to GPU mip-gen is a drop-in replacement behind this module
-// if profiling ever justifies it.
+// The GPU counterpart lives in gpuMipgen.ts and is what `compressTexture()`
+// uses on healthy WebGPU devices — profiling showed this CPU path costing
+// ~70 ms of main-thread time at 4K (getImageData readback + filter) plus a
+// writeTexture upload per level. This module remains for:
+//   • devices with a broken `copyExternalImageToTexture` (workarounds.ts),
+//     which can't upload the bitmap for GPU filtering in the first place;
+//   • the WebGL2 fallback tier (no compute);
+//   • engine-agnostic callers that already hold CPU pixel chains.
+// The GPU filter is integer-exact against `downsample2x`, so both paths
+// produce byte-identical compressed output.
 //
 // Colour-space caveat: this module box-filters the raw byte values. For
 // sRGB-encoded inputs that's slightly too dark compared to filtering in

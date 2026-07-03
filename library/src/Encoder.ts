@@ -99,6 +99,24 @@ interface GpuTiming {
   staging: GPUBuffer
 }
 
+// Chain-encode buffer slices start at 256-byte offsets: bind-group buffer
+// offsets must honour min*BufferOffsetAlignment, and 256 is the spec ceiling
+// for both the storage and uniform limits.
+const CHAIN_ALIGN = 256
+
+/** Per-level geometry for a chain encode: block grid + the level's slice of
+ *  the shared output buffer. */
+interface ChainGeom {
+  width: number
+  height: number
+  paddedWidth: number
+  paddedHeight: number
+  blocksX: number
+  blocksY: number
+  byteLen: number
+  dstOffset: number
+}
+
 export interface FormatVariant {
   colorSpace: 'srgb' | 'linear'
 }
@@ -595,33 +613,18 @@ export abstract class Encoder {
     const pipeline = await this._pipelineReady
     const t0 = performance.now()
 
-    // Per-level geometry, plus each level's slice of the shared output
-    // buffer. Slices start at 256-byte offsets: bind-group buffer offsets
-    // must honour min*BufferOffsetAlignment, and 256 is the spec ceiling for
-    // both the storage and uniform limits.
-    const ALIGN = 256
-    let dstCursor = 0
-    const geoms = levels.map((level, i) => {
-      const { width, height, data } = level
-      if (!width || !height) {
+    levels.forEach((level, i) => {
+      if (!level.width || !level.height) {
         throw new Error(`${this.label}Encoder: mip level ${i} has no dimensions`)
       }
-      if (data.length < width * height * 4) {
-        throw new Error(`${this.label}Encoder: mip level ${i} has ${data.length} bytes, expected ${width * height * 4}`)
+      if (level.data.length < level.width * level.height * 4) {
+        throw new Error(
+          `${this.label}Encoder: mip level ${i} has ${level.data.length} bytes, ` +
+            `expected ${level.width * level.height * 4}`,
+        )
       }
-      const paddedWidth = (width + 3) & ~3
-      const paddedHeight = (height + 3) & ~3
-      const blocksX = paddedWidth >> 2
-      const blocksY = paddedHeight >> 2
-      const byteLen = blocksX * blocksY * this.bytesPerBlock
-      const dstOffset = dstCursor
-      dstCursor = Math.ceil((dstCursor + byteLen) / ALIGN) * ALIGN
-      return { width, height, paddedWidth, paddedHeight, blocksX, blocksY, byteLen, dstOffset }
     })
-    const lastGeom = geoms[geoms.length - 1]!
-    // Also the copy size: a multiple of 4 as required (byteLen is a multiple
-    // of bytesPerBlock ≥ 8, offsets are ALIGN-ed).
-    const byteSpan = lastGeom.dstOffset + lastGeom.byteLen
+    const { geoms, byteSpan } = this._chainGeometry(levels)
     const sig = geoms.map(g => `${g.width}x${g.height}`).join()
 
     const useCache = !this._chainBusy
@@ -679,12 +682,12 @@ export abstract class Encoder {
         // width, height } header at its ALIGN-ed offset.
         params = device.createBuffer({
           label: `${this.label}-chain-params`,
-          size: geoms.length * ALIGN,
+          size: geoms.length * CHAIN_ALIGN,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         })
-        const paramsData = new Uint32Array((geoms.length * ALIGN) / 4)
+        const paramsData = new Uint32Array((geoms.length * CHAIN_ALIGN) / 4)
         geoms.forEach((g, i) => {
-          paramsData.set([g.blocksX, g.blocksY, g.width, g.height], (i * ALIGN) / 4)
+          paramsData.set([g.blocksX, g.blocksY, g.width, g.height], (i * CHAIN_ALIGN) / 4)
         })
         device.queue.writeBuffer(params, 0, paramsData)
 
@@ -701,7 +704,7 @@ export abstract class Encoder {
           const entries: GPUBindGroupEntry[] = [
             { binding: 0, resource: texs[i]!.createView() },
             { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
-            { binding: 2, resource: { buffer: paramsBuf, offset: i * ALIGN, size: 16 } },
+            { binding: 2, resource: { buffer: paramsBuf, offset: i * CHAIN_ALIGN, size: 16 } },
           ]
           if (this._usesSampler) entries.push({ binding: 3, resource: this._sampler! })
           return device.createBindGroup({
@@ -748,50 +751,8 @@ export abstract class Encoder {
         ])
       }
 
-      // One compute pass, one dispatch per level, one submit.
-      const timing = withGpuTime ? this._createTiming() : null
-      const [wgX, wgY] = this.workgroupSize
-      const enc = device.createCommandEncoder({ label: `${this.label}-encode-chain` })
-      const pass = enc.beginComputePass(
-        timing
-          ? {
-              timestampWrites: {
-                querySet: timing.querySet,
-                beginningOfPassWriteIndex: 0,
-                endOfPassWriteIndex: 1,
-              },
-            }
-          : undefined,
-      )
-      pass.setPipeline(pipeline)
-      for (let i = 0; i < geoms.length; i++) {
-        const g = geoms[i]!
-        pass.setBindGroup(0, bindGroups[i]!)
-        pass.dispatchWorkgroups(Math.ceil(g.blocksX / wgX), Math.ceil(g.blocksY / wgY), 1)
-      }
-      pass.end()
-      enc.copyBufferToBuffer(dst, 0, staging, 0, byteSpan)
-      if (timing) {
-        enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
-        enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
-      }
-      device.queue.submit([enc.finish()])
-
-      // Single readback for the whole chain.
-      await staging.mapAsync(GPUMapMode.READ, 0, byteSpan)
-      const mapped = staging.getMappedRange(0, byteSpan)
-      const out: EncodedLevelBytes[] = geoms.map(g => ({
-        width: g.width,
-        height: g.height,
-        paddedWidth: g.paddedWidth,
-        paddedHeight: g.paddedHeight,
-        data: new Uint8Array(mapped.slice(g.dstOffset, g.dstOffset + g.byteLen)),
-      }))
-      staging.unmap()
-      const encodeMs = performance.now() - t0
-      const gpuMs = timing ? await this._readTimingMs(timing) : undefined
-
-      return { levels: out, encodeMs, gpuMs }
+      // One compute pass, one dispatch per level, one submit, one readback.
+      return await this._submitChainAndRead(pipeline, geoms, byteSpan, bindGroups, dst, staging, withGpuTime, t0)
     } finally {
       if (useCache) {
         this._chainBusy = false
@@ -804,6 +765,202 @@ export abstract class Encoder {
         params?.destroy()
       }
     }
+  }
+
+  /**
+   * Encode every mip level of a GPU-resident texture in one submission —
+   * the zero-CPU-pixels counterpart of `encodeMipChainToBytes()`. Pair it
+   * with `generateGpuMipChain()` (gpuMipgen.ts): upload the image once,
+   * box-filter the chain on the GPU, then encode straight from the
+   * texture's mip views. Pixels never transit the CPU between the source
+   * image and the compressed-bytes readback.
+   *
+   * `srcTex` must be `rgba8unorm` with TEXTURE_BINDING usage; level 0's
+   * dimensions are taken from the texture and lower levels follow the
+   * standard floor-halving chain. Encoded output is identical to feeding
+   * the equivalent CPU chain to `encodeMipChainToBytes()`.
+   */
+  async encodeMipChainFromTexture(
+    srcTex: GPUTexture,
+    { withGpuTime = false }: { withGpuTime?: boolean } = {},
+  ): Promise<EncodeMipChainResult> {
+    const device = this.device
+    const pipeline = await this._pipelineReady
+    const t0 = performance.now()
+
+    const dims: { width: number; height: number }[] = []
+    for (let i = 0; i < srcTex.mipLevelCount; i++) {
+      dims.push({ width: Math.max(1, srcTex.width >> i), height: Math.max(1, srcTex.height >> i) })
+    }
+    const { geoms, byteSpan } = this._chainGeometry(dims)
+
+    const useCache = !this._chainBusy
+    if (useCache) this._chainBusy = true
+
+    let dst: GPUBuffer | undefined
+    let staging: GPUBuffer | undefined
+    let params: GPUBuffer | undefined
+    try {
+      // Grow-only dst/staging, shared with encodeMipChainToBytes()'s cache
+      // slots. Recreating dst invalidates that path's cached bind groups
+      // (they bind slices of the old buffer), so drop its signature too.
+      if (useCache && this._chainDst && this._chainDst.size >= byteSpan) {
+        dst = this._chainDst
+      } else {
+        dst = device.createBuffer({
+          label: `${this.label}-chain-dst`,
+          size: byteSpan,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        })
+        if (useCache) {
+          this._chainDst?.destroy()
+          this._chainDst = dst
+          this._chainSig = null
+        }
+      }
+      if (useCache && this._chainStaging && this._chainStaging.size >= byteSpan) {
+        staging = this._chainStaging
+      } else {
+        staging = device.createBuffer({
+          label: `${this.label}-chain-staging`,
+          size: byteSpan,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        })
+        if (useCache) {
+          this._chainStaging?.destroy()
+          this._chainStaging = staging
+        }
+      }
+
+      // Params + bind groups are transient: the source texture is new each
+      // call, so nothing level-specific is reusable. (~0.1 ms per chain.)
+      params = device.createBuffer({
+        label: `${this.label}-chain-params`,
+        size: geoms.length * CHAIN_ALIGN,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      })
+      const paramsData = new Uint32Array((geoms.length * CHAIN_ALIGN) / 4)
+      geoms.forEach((g, i) => {
+        paramsData.set([g.blocksX, g.blocksY, g.width, g.height], (i * CHAIN_ALIGN) / 4)
+      })
+      device.queue.writeBuffer(params, 0, paramsData)
+
+      if (this._usesSampler) {
+        this._sampler ??= device.createSampler({
+          label: `${this.label}-clamp-sampler`,
+          addressModeU: 'clamp-to-edge',
+          addressModeV: 'clamp-to-edge',
+        })
+      }
+      const dstBuf = dst
+      const paramsBuf = params
+      const bindGroups = geoms.map((g, i) => {
+        const entries: GPUBindGroupEntry[] = [
+          { binding: 0, resource: srcTex.createView({ baseMipLevel: i, mipLevelCount: 1 }) },
+          { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
+          { binding: 2, resource: { buffer: paramsBuf, offset: i * CHAIN_ALIGN, size: 16 } },
+        ]
+        if (this._usesSampler) entries.push({ binding: 3, resource: this._sampler! })
+        return device.createBindGroup({
+          label: `${this.label}-chain-bg-${i}`,
+          layout: pipeline.getBindGroupLayout(0),
+          entries,
+        })
+      })
+
+      return await this._submitChainAndRead(pipeline, geoms, byteSpan, bindGroups, dst, staging, withGpuTime, t0)
+    } finally {
+      if (useCache) {
+        this._chainBusy = false
+      } else {
+        dst?.destroy()
+        staging?.destroy()
+      }
+      // Safe immediately after submit: destruction is deferred until the
+      // GPU is done with the buffer.
+      params?.destroy()
+    }
+  }
+
+  /** Block-grid geometry + packed output offsets for a chain of levels.
+   *  `byteSpan` is both the dst buffer size and the readback copy size (a
+   *  multiple of 4: byteLen is a multiple of bytesPerBlock ≥ 8, offsets are
+   *  CHAIN_ALIGN-ed). */
+  private _chainGeometry(dims: readonly { width: number; height: number }[]): {
+    geoms: ChainGeom[]
+    byteSpan: number
+  } {
+    let dstCursor = 0
+    const geoms = dims.map(({ width, height }) => {
+      const paddedWidth = (width + 3) & ~3
+      const paddedHeight = (height + 3) & ~3
+      const blocksX = paddedWidth >> 2
+      const blocksY = paddedHeight >> 2
+      const byteLen = blocksX * blocksY * this.bytesPerBlock
+      const dstOffset = dstCursor
+      dstCursor = Math.ceil((dstCursor + byteLen) / CHAIN_ALIGN) * CHAIN_ALIGN
+      return { width, height, paddedWidth, paddedHeight, blocksX, blocksY, byteLen, dstOffset }
+    })
+    const last = geoms[geoms.length - 1]!
+    return { geoms, byteSpan: last.dstOffset + last.byteLen }
+  }
+
+  /** Shared chain-encode tail: one compute pass with a dispatch per level,
+   *  one submit, one staging readback sliced into per-level byte arrays. */
+  private async _submitChainAndRead(
+    pipeline: GPUComputePipeline,
+    geoms: readonly ChainGeom[],
+    byteSpan: number,
+    bindGroups: readonly GPUBindGroup[],
+    dst: GPUBuffer,
+    staging: GPUBuffer,
+    withGpuTime: boolean,
+    t0: number,
+  ): Promise<EncodeMipChainResult> {
+    const device = this.device
+    const timing = withGpuTime ? this._createTiming() : null
+    const [wgX, wgY] = this.workgroupSize
+    const enc = device.createCommandEncoder({ label: `${this.label}-encode-chain` })
+    const pass = enc.beginComputePass(
+      timing
+        ? {
+            timestampWrites: {
+              querySet: timing.querySet,
+              beginningOfPassWriteIndex: 0,
+              endOfPassWriteIndex: 1,
+            },
+          }
+        : undefined,
+    )
+    pass.setPipeline(pipeline)
+    for (let i = 0; i < geoms.length; i++) {
+      const g = geoms[i]!
+      pass.setBindGroup(0, bindGroups[i]!)
+      pass.dispatchWorkgroups(Math.ceil(g.blocksX / wgX), Math.ceil(g.blocksY / wgY), 1)
+    }
+    pass.end()
+    enc.copyBufferToBuffer(dst, 0, staging, 0, byteSpan)
+    if (timing) {
+      enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
+      enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
+    }
+    device.queue.submit([enc.finish()])
+
+    // Single readback for the whole chain.
+    await staging.mapAsync(GPUMapMode.READ, 0, byteSpan)
+    const mapped = staging.getMappedRange(0, byteSpan)
+    const out: EncodedLevelBytes[] = geoms.map(g => ({
+      width: g.width,
+      height: g.height,
+      paddedWidth: g.paddedWidth,
+      paddedHeight: g.paddedHeight,
+      data: new Uint8Array(mapped.slice(g.dstOffset, g.dstOffset + g.byteLen)),
+    }))
+    staging.unmap()
+    const encodeMs = performance.now() - t0
+    const gpuMs = timing ? await this._readTimingMs(timing) : undefined
+
+    return { levels: out, encodeMs, gpuMs }
   }
 
   // ------------------------------------------------------------------ //

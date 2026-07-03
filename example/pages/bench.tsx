@@ -18,6 +18,7 @@ import {
   BC5WebGLEncoder,
   BC7Encoder,
   BC7WebGLEncoder,
+  generateGpuMipChain,
   generateMipChain,
   padToBlockMultiple,
 } from 'gputex'
@@ -75,6 +76,7 @@ if (typeof window !== 'undefined') {
     clearTranscodeCache,
     setTranscodeCacheLimit,
     generateMipChain,
+    generateGpuMipChain,
     padToBlockMultiple,
   }
 }
