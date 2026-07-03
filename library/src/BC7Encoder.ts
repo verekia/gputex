@@ -5,9 +5,11 @@
 // 4-bit indices, 7777.1 endpoints). Mode 6 is the strongest BC7 mode
 // on smooth content — endpoints are near-8-bit and the 16-entry palette
 // tracks a single data-line tightly. It degrades on multi-modal blocks
-// (sharp colour seams, 4-D white noise) where mode 1's two-subset
-// partitioning would help; we accept that trade-off rather than carry
-// the 64-entry partition table and mode-selection logic.
+// (sharp colour seams, channel-packed atlases) where mode 1's two-subset
+// partitioning would help; a mode 1 candidate was built and measured
+// (~+1.3 dB there) but its evaluation cost up to ~3× the compute pass on
+// exactly that content, so it was dropped in favour of speed — see the
+// postmortem note in bc7_fast_f16.wgsl.
 //
 // Algorithm lives in `bc7.wgsl`; CPU reference + tests are in
 // `bc7_ref.ts` and its test file.

@@ -15,9 +15,16 @@
 //   • NO least-squares refit, unlike the BC1/BC5/ASTC fast paths: with the
 //     seed already on the principal axis at the exact projection extents,
 //     mode 6's fine 16-level palette leaves the refit ≤0.05 dB on the colour
-//     card and ≤0.15 dB on the normal card — not worth its two extra
-//     16-pixel passes. The coarse 4-level formats DO need it (dropping it
-//     there costs 0.5–1.3 dB).
+//     card, ≤0.15 dB on the normal card and +0.03 dB on the channel-packed
+//     packed-materials atlas — not worth its two extra 16-pixel passes. The
+//     coarse 4-level formats DO need it (dropping it there costs 0.5–1.3 dB).
+//   • A MODE 1 (2-subset) candidate was built and evaluated (2026-07): it
+//     buys ~+1.3 dB on multi-modal content (channel-packed atlases, where
+//     35–45% of blocks take it; normal-map facets) but its candidate
+//     evaluation costs up to ~3× the mode-6 pass on exactly that content,
+//     for a break-even outcome against contemporary encoders — dropped in
+//     favour of speed. The CPU reference decoder keeps mode 1 support
+//     (bc7_ref.ts) should it return as an opt-in.
 //   • Indices are packed into two u32 nibble words ON THE FLY during the
 //     projection pass — no array<u32,16> private array. The BC7 anchor
 //     reflection (i → 15−i) is then just a bitwise NOT of both words.
@@ -111,7 +118,12 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   var seed_hi = hi;
   var axis = hi - lo;
   var axis_ok = true;
-  for (var it: u32 = 0u; it < 4u; it = it + 1u) {
+  // 8 iterations: 4 was under-converged on noisy 4-D blocks (heavily
+  // downscaled photographic/channel-packed content) — going to 8 measured
+  // +0.75 dB on the normal card, +0.12 colour, +0.08 packed-materials, and
+  // matches the f32 fallback's iteration count. Four extra 4-dot matvecs
+  // per block are noise next to the index pass.
+  for (var it: u32 = 0u; it < 8u; it = it + 1u) {
     let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
     let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
     if (m < h(1e-4)) { axis_ok = false; break; }

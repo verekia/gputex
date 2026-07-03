@@ -229,3 +229,75 @@ describe('BC7 input validation', () => {
     expect(() => decodeBC7Block(fake)).toThrow(/mode 0/)
   })
 })
+
+describe('BC7 mode 1 decode', () => {
+  /** Pack a mode 1 block from raw fields, LSB-first like the spec. */
+  function packMode1(
+    part: number,
+    // [s0e0, s0e1, s1e0, s1e1] per channel, 6-bit values
+    r: number[],
+    g: number[],
+    b: number[],
+    p0: number,
+    p1: number,
+    weights: number[], // 16 weights; anchors must be < 4
+    anchor2: number,
+  ): Uint8Array {
+    let bits = 0n
+    let pos = 0
+    const w = (value: number, n: number) => {
+      bits |= (BigInt(value) & ((1n << BigInt(n)) - 1n)) << BigInt(pos)
+      pos += n
+    }
+    w(0b10, 2) // mode 1: one zero bit, then a 1
+    w(part, 6)
+    for (const v of r) w(v, 6)
+    for (const v of g) w(v, 6)
+    for (const v of b) w(v, 6)
+    w(p0, 1)
+    w(p1, 1)
+    for (let k = 0; k < 16; k++) w(weights[k]!, k === 0 || k === anchor2 ? 2 : 3)
+    expect(pos).toBe(128)
+    const out = new Uint8Array(16)
+    for (let i = 0; i < 16; i++) out[i] = Number((bits >> BigInt(i * 8)) & 0xffn)
+    return out
+  }
+
+  it('decodes a hand-packed partition-0 block (anchor2 = 15)', () => {
+    // subset 0: e0 = 0 (p=1 → 2), e1 = 63 (p=1 → 255)
+    // subset 1: e0 = (10,20,30) p=0 → (40,80,120), e1 = (40,50,60) p=0 → (161,201,241)
+    const weights = [0, 1, 7, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]
+    const block = packMode1(0, [0, 63, 10, 40], [0, 63, 20, 50], [0, 63, 30, 60], 1, 0, weights, 15)
+    expect(readBC7Mode(block)).toBe(1)
+    const px = decodeBC7Block(block)
+    const at = (k: number) => [px[k * 4], px[k * 4 + 1], px[k * 4 + 2], px[k * 4 + 3]].map(v => Math.round(v! * 255))
+    // partition 0 mask 0xcccc: pixels 0,1 subset 0; pixels 2,3 subset 1.
+    expect(at(0)).toEqual([2, 2, 2, 255]) // s0 e0 exactly (w=0)
+    expect(at(1)).toEqual([38, 38, 38, 255]) // w=1: ((64−9)·2 + 9·255 + 32) >> 6
+    expect(at(2)).toEqual([161, 201, 241, 255]) // s1 e1 exactly (w=7)
+    expect(at(3)).toEqual([127, 167, 207, 255]) // w=5 interp
+    expect(at(15)).toEqual([91, 131, 171, 255]) // anchor, 2-bit w=3 interp
+  })
+
+  it('decodes the 2-bit anchor offsets of a mid-block anchor partition', () => {
+    // Partition 17 (mask 0x008e): subset 1 = pixels 1,2,3,7; anchor2 = pixel 2.
+    // All-zero weights: every pixel must decode to its subset's e0 — any
+    // misalignment of the variable-width weight field garbles this.
+    const block = packMode1(
+      17,
+      [5, 63, 50, 0],
+      [6, 63, 51, 0],
+      [7, 63, 52, 0],
+      0,
+      1,
+      Array.from({ length: 16 }, () => 0),
+      2,
+    )
+    const px = decodeBC7Block(block)
+    const at = (k: number) => [px[k * 4], px[k * 4 + 1], px[k * 4 + 2]].map(v => Math.round(v! * 255))
+    const s0e0 = [20, 24, 28] // v7=10→e8=20, 12→24, 14→28 (v7>>6 carry = 0)
+    const s1e0 = [203, 207, 211] // v7=101→e8=202|1=203, 103→207, 105→211
+    for (const k of [0, 4, 5, 6, 8, 15]) expect(at(k)).toEqual(s0e0)
+    for (const k of [1, 2, 3, 7]) expect(at(k)).toEqual(s1e0)
+  })
+})

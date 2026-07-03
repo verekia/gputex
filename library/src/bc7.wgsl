@@ -14,6 +14,11 @@
 // index is the rounded projection — no palette build, no 16-entry search),
 // packed on the fly into two nibble words.
 //
+// A MODE 1 (2-subset) candidate was built and evaluated (2026-07) and
+// dropped: ~+1.3 dB on multi-modal content but up to ~3× the pass cost on
+// exactly that content — see bc7_fast_f16.wgsl. The CPU reference decoder
+// keeps mode 1 support (bc7_ref.ts).
+//
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
 //   bits 0..6    mode field      (0b0000001 — only bit 6 is 1)
 //   bits 7..13   R0 (7-bit)   bits 14..20 R1   bits 21..27 G0   bits 28..34 G1

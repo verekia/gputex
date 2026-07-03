@@ -2,10 +2,11 @@
 //
 // BC7 is a multi-mode 16-byte RGBA block format. The mode is selected by
 // a variable-width unary-coded prefix: mode N is N zero bits followed by
-// a single 1 bit. We implement mode 6 only — the strongest single-subset
-// mode, well-suited to smooth content. Other modes (in particular mode
-// 1, which adds 2-subset partitioning for multi-modal blocks) are left
-// out; see `BC7Encoder.ts` for the rationale.
+// a single 1 bit. The reference ENCODER implements mode 6 only — the
+// strongest single-subset mode, well-suited to smooth content — and is
+// the quality yardstick the GPU encoder is gated against. The DECODER
+// additionally supports mode 1 (2-subset partitioning), which the GPU
+// encoder emits for multi-modal blocks; see `BC7Encoder.ts`.
 //
 // -----------------------------------------------------------------------
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
@@ -522,6 +523,98 @@ export function decodeBC7Mode6Block(block: BC7Block): Float32Array {
   return out
 }
 
+// --- Mode 1 decode ----------------------------------------------------------
+//
+// MODE 1 LAYOUT (LSB-first):
+//   bits 0..1    mode field (0b01 — one zero bit then a 1)
+//   bits 2..7    partition index (6 bits, 64 two-subset patterns)
+//   bits 8..31   R endpoints  (4 × 6 bits: s0.e0, s0.e1, s1.e0, s1.e1)
+//   bits 32..55  G endpoints  (4 × 6 bits)
+//   bits 56..79  B endpoints  (4 × 6 bits)
+//   bit  80      P0 (p-bit shared by BOTH endpoints of subset 0)
+//   bit  81      P1 (shared by subset 1)
+//   bits 82..127 weights: 3-bit per pixel, except the two anchors (pixel 0
+//                and BC7_ANCHOR2[partition]) which store 2 bits (MSB
+//                implicit 0) — 46 bits total
+//
+// Endpoint dequant: v7 = (v6 << 1) | p, then e8 = (v7 << 1) | (v7 >> 6).
+// Alpha decodes to 255. Weights are W3 (× 1/64). Tables cross-checked
+// against bc7enc's bc7decomp.cpp (public domain).
+
+/** Mode 1/3/7 two-subset partition patterns as 16-bit masks (bit k = subset of pixel k). */
+const BC7_PARTITION2: readonly number[] = [
+  0xcccc, 0x8888, 0xeeee, 0xecc8, 0xc880, 0xfeec, 0xfec8, 0xec80, 0xc800, 0xffec, 0xfe80, 0xe800, 0xffe8, 0xff00,
+  0xfff0, 0xf000, 0xf710, 0x008e, 0x7100, 0x08ce, 0x008c, 0x7310, 0x3100, 0x8cce, 0x088c, 0x3110, 0x6666, 0x366c,
+  0x17e8, 0x0ff0, 0x718e, 0x399c, 0xaaaa, 0xf0f0, 0x5a5a, 0x33cc, 0x3c3c, 0x55aa, 0x9696, 0xa55a, 0x73ce, 0x13c8,
+  0x324c, 0x3bdc, 0x6996, 0xc33c, 0x9966, 0x0660, 0x0272, 0x04e4, 0x4e40, 0x2720, 0xc936, 0x936c, 0x39c6, 0x639c,
+  0x9336, 0x9cc6, 0x817e, 0xe718, 0xccf0, 0x0fcc, 0x7744, 0xee22,
+]
+
+/** Anchor pixel of the second subset, per partition. */
+const BC7_ANCHOR2: readonly number[] = [
+  15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 2, 8, 2, 2, 8, 8, 15, 2, 8, 2, 2, 8, 8, 2, 2, 15,
+  15, 6, 8, 2, 8, 15, 15, 2, 8, 2, 2, 2, 15, 15, 6, 6, 2, 6, 8, 15, 15, 2, 2, 15, 15, 15, 15, 15, 2, 2, 15,
+]
+
+/** Mode 1 interpolation weights (× 1/64). Fixed by the spec. */
+const W3: readonly number[] = [0, 9, 18, 27, 37, 46, 55, 64]
+
+/**
+ * Decode a BC7 mode 1 block to 16 normalized [0, 1] RGBA pixels (64 floats).
+ * Throws if the block doesn't start with the mode 1 field.
+ */
+export function decodeBC7Mode1Block(block: BC7Block): Float32Array {
+  if (block.length !== 16) {
+    throw new Error(`decodeBC7Mode1Block: expected 16 bytes, got ${block.length}`)
+  }
+  const mode = readBC7Mode(block)
+  if (mode !== 1) {
+    throw new Error(`decodeBC7Mode1Block: expected mode 1, got mode ${mode}`)
+  }
+
+  const br = new BitReader128(block)
+  br.read(2) // skip mode field
+  const part = br.read(6)
+
+  // 4 endpoints × RGB, channel-major: R×4, G×4, B×4.
+  const ep: number[][] = [[], [], [], []]
+  for (let c = 0; c < 3; c++) {
+    for (let e = 0; e < 4; e++) ep[e]!.push(br.read(6))
+  }
+  const p0 = br.read(1)
+  const p1 = br.read(1)
+  const pbits = [p0, p0, p1, p1]
+
+  // Dequantize 6-bit + shared p-bit to 8 bits.
+  const e8: number[][] = ep.map((rgb, e) =>
+    rgb.map(v6 => {
+      const v7 = (v6 << 1) | pbits[e]!
+      return (v7 << 1) | (v7 >> 6)
+    }),
+  )
+
+  // Two 8-entry RGB palettes.
+  const pal = [0, 1].map(s => {
+    const lo = e8[s * 2]!
+    const hi = e8[s * 2 + 1]!
+    return W3.map(w => [0, 1, 2].map(c => (((64 - w) * lo[c]! + w * hi[c]! + 32) >> 6) / 255))
+  })
+
+  const anchor2 = BC7_ANCHOR2[part]!
+  const mask = BC7_PARTITION2[part]!
+  const out = new Float32Array(64)
+  for (let k = 0; k < 16; k++) {
+    const w = br.read(k === 0 || k === anchor2 ? 2 : 3)
+    const subset = (mask >> k) & 1
+    const rgb = pal[subset]![w]!
+    out[k * 4] = rgb[0]!
+    out[k * 4 + 1] = rgb[1]!
+    out[k * 4 + 2] = rgb[2]!
+    out[k * 4 + 3] = 1
+  }
+  return out
+}
+
 // --- Top-level entry points -------------------------------------------------
 
 /**
@@ -534,13 +627,16 @@ export function encodeBC7Block(pixels: BC7Pixels): BC7Block {
 
 /**
  * Decode a BC7 block, dispatching on the mode field. This reference
- * supports mode 6 only; other modes throw. Encoders outside this
- * project (AMD Compressonator, bc7enc, ...) routinely pick other modes,
- * so this decoder is mainly for round-tripping our own output.
+ * supports modes 1 and 6 — the two modes the GPU encoder emits; other
+ * modes throw. Encoders outside this project (AMD Compressonator,
+ * bc7enc, ...) routinely pick other modes, so this decoder is mainly
+ * for round-tripping our own output.
  */
 export function decodeBC7Block(block: BC7Block): Float32Array {
   const mode = readBC7Mode(block)
   switch (mode) {
+    case 1:
+      return decodeBC7Mode1Block(block)
     case 6:
       return decodeBC7Mode6Block(block)
     default:
