@@ -21,7 +21,16 @@ import {
 } from 'gputex'
 import type { Encoder } from 'gputex'
 
-import { decodeASTC4x4Block, decodeBC1Block, decodeBC5Block, decodeBC7Block } from 'gputex/testing'
+import {
+  decodeASTC4x4Block,
+  decodeBC1Block,
+  decodeBC5Block,
+  decodeBC7Block,
+  encodeASTC4x4Block,
+  encodeBC1Block,
+  encodeBC5Block,
+  encodeBC7Mode6Block,
+} from 'gputex/testing'
 
 type Status = 'running' | 'done' | 'error'
 
@@ -54,6 +63,10 @@ if (typeof window !== 'undefined') {
     decodeBC5Block,
     decodeBC7Block,
     decodeASTC4x4Block,
+    encodeBC1Block,
+    encodeBC5Block,
+    encodeBC7Mode6Block,
+    encodeASTC4x4Block,
   }
 }
 

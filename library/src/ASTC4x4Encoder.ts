@@ -2,8 +2,10 @@
 //
 // Restricted ASTC subset:
 //   • Single partition, no dual-plane
-//   • CEM 12 (LDR RGBA direct)
-//   • 4×4 weight grid, 2-bit weights (QUANT_4)
+//   • Per-block class by content: CEM 0 (luminance, 5-bit weights) for
+//     exactly-grayscale opaque blocks, CEM 8 (RGB, 3-bit weights) for
+//     opaque blocks, CEM 12 (RGBA, 2-bit weights) otherwise
+//   • 4×4 weight grid, plain-bit weight ISE
 //   • 8-bit endpoints (QUANT_256)
 // Produces fully valid ASTC 4×4 blocks any conforming decoder accepts;
 // much narrower than full ASTC. Target: mobile / iOS WebGPU where the

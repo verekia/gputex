@@ -118,6 +118,9 @@ describe('ASTC4x4Encoder', () => {
     // Sanity: the shader exposes the ASTC-specific helpers by name.
     expect(src).toContain('principal_axis4')
     expect(src).toContain('proj_fit')
-    expect(src).toMatch(/CEM 12/i)
+    // All three block classes are packed by the shader.
+    expect(src).toContain('0x253u')
+    expect(src).toContain('0x053u')
+    expect(src).toContain('0x042u')
   })
 })
