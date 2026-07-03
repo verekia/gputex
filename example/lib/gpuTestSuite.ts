@@ -103,13 +103,14 @@ export type ProgressFn = (message: string) => void
 const PSNR_THRESHOLDS: Record<string, number | null> = {
   // `${format}:${image}` — measured on the committed test images (2026-07,
   // Apple/metal-3, mode-6-only BC7 with the 8-step power iteration) minus
-  // ~0.15 dB. BC7 rows on multi-modal content (packed-*, rock-color) sit at
+  // ~0.15 dB. bc5 rows re-pinned 2026-07 for the seed-index refit (the
+  // reprojection pass was dropped for −13% GPU; −0.08..−0.19 dB). BC7 rows on multi-modal content (packed-*, rock-color) sit at
   // the mode-6 exhaustive reference level — the mode 1 candidate that
   // lifted them ~+1.3 dB was dropped for speed (see bc7_fast_f16.wgsl).
   // Unlisted rows and the `:normal` colour-format cross-card entries are
   // record-only.
   'bc1:color': 29.05,
-  'bc5:normal': 53.0,
+  'bc5:normal': 52.95,
   'bc7:color': 31.9,
   'astc:color': 31.75,
   'bc7:alpha': 34.5,
@@ -128,7 +129,7 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:rock-color-1k': 33.9,
   'bc7:rock-color-1k': 38.1,
   'astc:rock-color-1k': 37.45,
-  'bc5:rock-normal-1k': 46.3,
+  'bc5:rock-normal-1k': 46.2,
   'bc1:rock-roughness-1k': 39.1,
   'bc1:rock-ao-1k': 41.25,
   'bc1:rock-displacement-1k': 44.7,
@@ -140,19 +141,19 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'astc:wood-roughness-1k': 59.85,
   'astc:wood-displacement-1k': 65.1,
   'bc7:rock-color-2k': 38.75,
-  'bc5:rock-normal-2k': 44.9,
+  'bc5:rock-normal-2k': 44.75,
   'bc7:rock-color-4k': 39.15,
-  'bc5:rock-normal-4k': 43.75,
+  'bc5:rock-normal-4k': 43.6,
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 49.75,
-  'bc5:wood-normal-1k': 48.0,
+  'bc5:wood-normal-1k': 47.8,
   'bc1:wood-roughness-1k': 40.4,
   'bc1:wood-displacement-1k': 42.95,
   'bc7:wood-color-2k': 50.65,
-  'bc5:wood-normal-2k': 48.9,
+  'bc5:wood-normal-2k': 48.75,
   'bc7:wood-color-4k': 51.7,
-  'bc5:wood-normal-4k': 47.6,
+  'bc5:wood-normal-4k': 47.45,
 }
 
 // Worst-EASY-block gate: over blocks that the CPU reference encodes

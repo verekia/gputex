@@ -4,10 +4,11 @@
 // One fragment per 4×4 block → 16-byte BC5 block as 4 × u32 in outColor.
 // BC5 = two BC4 halves (R then G). This is the *fast* path only: bbox
 // endpoints + a full-L2 index assignment per channel with the least-squares
-// refit sums accumulated in the same pass, then one refit accepted only when
-// it lowers the block's error (mirrors bc5.wgsl's fast branch — worth
-// ~1.3 dB on the normal-map card). Always emits 6-interpolation mode
-// (red0 > red1). See bc5.wgsl for the full derivation.
+// refit sums accumulated in the same pass, then one refit accepted
+// CLOSED-FORM when it lowers the block's error on the seed indices — the
+// accepted endpoints ship with the seed indices, no second assignment pass
+// (mirrors bc5.wgsl; see bc5_fast_f16.wgsl for the measured trade). Always
+// emits 6-interpolation mode (red0 > red1).
 
 precision highp float;
 precision highp int;
@@ -72,8 +73,11 @@ uvec2 encodeBC4(float values[16], float vmin, float vmax) {
   uint indices[16];
   Assign seed = assignAll(values, pal, indices);
 
-  // One least-squares refit, accepted only if the requantised endpoints lower
-  // the block error. Clamp to [0,1], NOT the block's value range: for a
+  // One least-squares refit, accepted CLOSED-FORM: with the seed indices
+  // kept, the block error for endpoints (e0, e1) is
+  //   E(e0, e1) = sAA·e0² + sBB·e1² + 2(sAB·e0·e1 − e0·sAV − e1·sBV) + ΣV²
+  // and ΣV² cancels out of the accept comparison, so no second assignment
+  // pass is needed. Clamp to [0,1], NOT the block's value range: for a
   // scalar channel, endpoints beyond the data range are often genuinely
   // optimal and there is no colour axis to bend — the bbox clamp the colour
   // formats need costs ~0.3 dB here. Keep 6-interp mode (r0 > r1 strictly).
@@ -84,17 +88,14 @@ uvec2 encodeBC4(float values[16], float vmin, float vmax) {
     uint n0 = quantize8(e0);
     uint n1 = quantize8(e1);
     if (n0 > n1 && !(n0 == r0 && n1 == r1)) {
-      float pal2[8];
       float n0f = float(n0) / 255.0;
       float n1f = float(n1) / 255.0;
-      for (int j = 0; j < 8; j++) {
-        pal2[j] = W0_6[j] * n0f + W1_6[j] * n1f;
-      }
-      uint idx2[16];
-      Assign refit = assignAll(values, pal2, idx2);
-      if (refit.err < seed.err) {
+      float quadSeed = seed.sAA * r0f * r0f + seed.sBB * r1f * r1f
+        + 2.0 * (seed.sAB * r0f * r1f - r0f * seed.sAV - r1f * seed.sBV);
+      float quadNew = seed.sAA * n0f * n0f + seed.sBB * n1f * n1f
+        + 2.0 * (seed.sAB * n0f * n1f - n0f * seed.sAV - n1f * seed.sBV);
+      if (quadNew < quadSeed) {
         r0 = n0; r1 = n1;
-        for (int k = 0; k < 16; k++) indices[k] = idx2[k];
       }
     }
   }

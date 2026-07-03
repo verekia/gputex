@@ -175,6 +175,10 @@ export abstract class Encoder {
   private _lastParams: [number, number, number, number] | null = null
   private _cachedBindGroup: GPUBindGroup | null = null
   private _resourcesBusy = false
+  /** Set when the active shader declares a @binding(3) sampler (the BC5
+   * kernels read texels through textureGather + clamp-to-edge). */
+  private _usesSampler = false
+  private _sampler: GPUSampler | null = null
 
   constructor({ device, adapter, ownsDevice = false, disableF16 = false }: EncoderOptions) {
     this.device = device
@@ -188,9 +192,11 @@ export abstract class Encoder {
     const device = this.device
     // subclasses override the wgsl source hooks; stubs throw here
     const useF16 = this._useF16
+    const code = useF16 ? this.wgslSourceFastF16()! : this.wgslSource()
+    this._usesSampler = /@binding\(3\)\s+var\s+\w+\s*:\s*sampler\s*;/.test(code)
     const module = device.createShaderModule({
       label: `${this.label}-encoder${useF16 ? '-f16' : ''}`,
-      code: useF16 ? this.wgslSourceFastF16()! : this.wgslSource(),
+      code,
     })
     this._pipeline = device.createComputePipeline({
       label: `${this.label}-encoder-pipeline${useF16 ? '-f16' : ''}`,
@@ -410,14 +416,23 @@ export abstract class Encoder {
       if (useCache && (srcTexIsNew || dstIsNew)) this._cachedBindGroup = null
       let bindGroup = useCache ? this._cachedBindGroup : null
       if (!bindGroup) {
+        const entries: GPUBindGroupEntry[] = [
+          { binding: 0, resource: srcTex.createView() },
+          { binding: 1, resource: { buffer: dstBuffer } },
+          { binding: 2, resource: { buffer: paramsBuffer } },
+        ]
+        if (this._usesSampler) {
+          this._sampler ??= device.createSampler({
+            label: `${this.label}-clamp-sampler`,
+            addressModeU: 'clamp-to-edge',
+            addressModeV: 'clamp-to-edge',
+          })
+          entries.push({ binding: 3, resource: this._sampler })
+        }
         bindGroup = device.createBindGroup({
           label: `${this.label}-bg`,
           layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: srcTex.createView() },
-            { binding: 1, resource: { buffer: dstBuffer } },
-            { binding: 2, resource: { buffer: paramsBuffer } },
-          ],
+          entries,
         })
         if (useCache) this._cachedBindGroup = bindGroup
       }
