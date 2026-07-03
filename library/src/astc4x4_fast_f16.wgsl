@@ -61,10 +61,11 @@ struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, };
 // palette — only the translucent (CEM 12) path still refits: the 2-bit
 // weight grid is coarse enough to need it, while the opaque paths get
 // more from spending the same time elsewhere (see header).
-struct Fit { e0: h4, e1: h4, valid: bool };
+struct Fit { e0: h4, e1: h4, valid: bool, wstream: u32 };
 fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   var out: Fit;
   out.valid = false;
+  out.wstream = 0u;
   // dir pre-scaled by 32 to keep dd and the projection dots in f16's normal
   // range (see header). Spans below ~0.7 of an 8-bit step (dd₃₂ < 0.008,
   // possible only for non-8-bit sources) are treated as flat.
@@ -82,6 +83,7 @@ fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let vr = (*pix)[k] - e0;
     let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), h(3.0));
+    out.wstream = out.wstream | (u32(s) << (2u * k));
     s_min = min(s_min, s); s_max = max(s_max, s);
     let b = s * h(1.0 / 3.0);
     let a = h(1.0) - b;
@@ -196,14 +198,26 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var axis = hi - lo;
     var axis_ok = true;
-    // 8 iterations, matching the f32 fallback and the BC7 kernel: 4 was
-    // under-converged on noisy 4-D blocks, and with the opaque path now
-    // shipping the PCA extents directly the axis IS the endpoint quality.
-    for (var it: u32 = 0u; it < 8u; it = it + 1u) {
+    // 4 shared iterations, then 4 more for opaque blocks only — two
+    // FIXED-bound loops rather than one divergent trip count, so both
+    // unroll. Opaque blocks need the converged axis (it IS the endpoint
+    // quality there; 4 was under-converged on noisy 4-D content), while
+    // translucent blocks' LSQ refit absorbs residual axis error — their
+    // extra 4 steps measured exactly 0.000 dB on the alpha card for
+    // ~5% GPU.
+    for (var it: u32 = 0u; it < 4u; it = it + 1u) {
       let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
       let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
       if (m < h(1e-4)) { axis_ok = false; break; }
       axis = nv / m;
+    }
+    if (axis_ok && opaque) {
+      for (var it: u32 = 0u; it < 4u; it = it + 1u) {
+        let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
+        let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
+        if (m < h(1e-4)) { axis_ok = false; break; }
+        axis = nv / m;
+      }
     }
     if (axis_ok) {
       axis = axis / length(axis);
@@ -232,6 +246,8 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // SSE, +1.8 dB on the colour test card).
     var e0 = lo;
     var e1 = hi;
+    var fitStream = 0u;
+    var haveFitWeights = false;
     if (opaque) {
       // Bbox-clamped like the fit output: on multi-cluster blocks the axis
       // extents overshoot the data per-channel and decode to colours that
@@ -241,15 +257,22 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       e1 = clamp(seed_hi, lo, hi);
     } else {
       let r = proj_fit(&pix, seed_lo, seed_hi);
-      if (r.valid) { e0 = clamp(r.e0, lo, hi); e1 = clamp(r.e1, lo, hi); }
+      if (r.valid) {
+        e0 = clamp(r.e0, lo, hi);
+        e1 = clamp(r.e1, lo, hi);
+        fitStream = r.wstream;
+        haveFitWeights = true;
+      }
     }
     var E0 = q8(e0);
     var E1 = q8(e1);
 
     // Blue-contraction ordering, applied before the weight pass so weights
     // are already oriented (no reflection needed).
+    var swapped = false;
     if (E0.x + E0.y + E0.z > E1.x + E1.y + E1.z) {
       let t = E0; E0 = E1; E1 = t;
+      swapped = true;
     }
     let d0 = h4(vec4<f32>(E0)) * h(1.0 / 255.0);
     let d1 = h4(vec4<f32>(E1)) * h(1.0 / 255.0);
@@ -279,8 +302,17 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       w3 = reverseBits(s0);
     } else {
       // CEM 12: 2-bit weights, stream bit q = 2k (single stream word).
+      // Valid fits ship the FIT-PASS weights instead of reprojecting —
+      // worth a whole 16-pixel pass for −0.09 dB on the alpha card (/ab +
+      // PSNR A/B, 2026-07; the pre-adaptive-CEM encoder rejected this same
+      // trade when EVERY block was CEM 12 — now only translucent blocks
+      // pay it). The blue-contraction swap is a full reflection w → 3−w,
+      // i.e. bitwise NOT of the packed stream. Invalid fits (rank-1 /
+      // degenerate) fall back to reprojection against the bbox endpoints.
       var s0 = 0u;
-      if (dd >= h(0.008)) {
+      if (haveFitWeights) {
+        s0 = select(fitStream, ~fitStream, swapped);
+      } else if (dd >= h(0.008)) {
         let inv = h(96.0) / dd;
         for (var k: u32 = 0u; k < 16u; k = k + 1u) {
           let w = u32(clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(3.0)));

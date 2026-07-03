@@ -114,7 +114,7 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc7:color': 31.9,
   'astc:color': 31.75,
   'bc7:alpha': 34.5,
-  'astc:alpha': 33.08,
+  'astc:alpha': 33.0,
   'bc1:normal': null,
   'bc7:normal': null,
   'astc:normal': null,

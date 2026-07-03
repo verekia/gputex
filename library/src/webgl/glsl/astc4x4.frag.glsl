@@ -49,7 +49,7 @@ uint rev32(uint x) {
 // with the bbox diagonal. Returns a unit axis, or vec4(0.0) for a degenerate
 // (constant) block. The bbox diagonal alone is sign-blind and points across
 // anti-correlated data (normal maps, hue edges) instead of along it.
-vec4 principalAxis(vec4 mean, vec4 seed) {
+vec4 principalAxis(vec4 mean, vec4 seed, int iters) {
   vec4 c0v = vec4(0.0);
   vec4 c1v = vec4(0.0);
   vec4 c2v = vec4(0.0);
@@ -65,7 +65,7 @@ vec4 principalAxis(vec4 mean, vec4 seed) {
   float len = length(v);
   if (len < 1e-9) { return vec4(0.0); }
   v /= len;
-  for (int it = 0; it < 8; it++) {
+  for (int it = 0; it < iters; it++) {
     vec4 nv = vec4(dot(c0v, v), dot(c1v, v), dot(c2v, v), dot(c3v, v));
     len = length(nv);
     if (len < 1e-12) { return vec4(0.0); }
@@ -174,7 +174,9 @@ void main() {
 
     ivec4 e0 = lo;
     ivec4 e1 = hi;
-    vec4 axis = principalAxis(mean, vec4(hi - lo));
+    // 8 iterations for opaque blocks, 4 for translucent (their refit
+    // absorbs residual axis error — see astc4x4_fast_f16.wgsl).
+    vec4 axis = principalAxis(mean, vec4(hi - lo), opaque ? 8 : 4);
     if (dot(axis, axis) > 0.0) {
       float tMin = 1e30;
       float tMax = -1e30;
@@ -200,9 +202,11 @@ void main() {
         // unconstrained LSQ solve extrapolates far outside the block's
         // colours and the per-channel [0,255] clamp then bends the hue —
         // fringe pixels decode to colours that exist nowhere in the block.
+        // gIdx keeps the fit-pass weights (assigned against the seed line)
+        // rather than reassigning against the refit endpoints — see
+        // astc4x4_fast_f16.wgsl for the measured trade.
         e0 = clamp(r.e0, lo, hi);
         e1 = clamp(r.e1, lo, hi);
-        projAssign(e0, e1, lmax, false);
       }
     }
 

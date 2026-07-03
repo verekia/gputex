@@ -53,10 +53,11 @@ fn to8(v: vec4<f32>) -> vec4<i32> {
 // projection) and accumulate the least-squares normal-equation sums;
 // solve for the refit endpoints. Weights are not produced here — the
 // caller reprojects against the quantised refit endpoints anyway.
-struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool };
+struct Fit { e0: vec4<i32>, e1: vec4<i32>, valid: bool, wstream: u32 };
 fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4<i32>) -> Fit {
   var out: Fit;
   out.valid = false;
+  out.wstream = 0u;
   let dir = vec4<f32>(e1 - e0);
   let dd = dot(dir, dir);
   if (dd == 0.0) { return out; }
@@ -68,6 +69,7 @@ fn proj_fit(pixels: ptr<function, array<vec4<i32>, 16>>, e0: vec4<i32>, e1: vec4
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let v = vec4<f32>((*pixels)[k]);
     let s = clamp(floor(dot(v - e0f, dir) * inv + 0.5), 0.0, 3.0);
+    out.wstream = out.wstream | (u32(s) << (2u * k));
     s_min = min(s_min, s); s_max = max(s_max, s);
     let b = s * (1.0 / 3.0); let a = 1.0 - b;
     sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
@@ -94,6 +96,7 @@ fn principal_axis4(
   pixels: ptr<function, array<vec4<i32>, 16>>,
   mean: vec4<f32>,
   seed: vec4<f32>,
+  iters: u32,
 ) -> vec4<f32> {
   var c0v = vec4<f32>(0.0);
   var c1v = vec4<f32>(0.0);
@@ -110,7 +113,7 @@ fn principal_axis4(
   var len = length(v);
   if (len < 1e-9) { return vec4<f32>(0.0); }
   v = v / len;
-  for (var iter: u32 = 0u; iter < 8u; iter = iter + 1u) {
+  for (var iter: u32 = 0u; iter < iters; iter = iter + 1u) {
     let nv = vec4<f32>(dot(c0v, v), dot(c1v, v), dot(c2v, v), dot(c3v, v));
     len = length(nv);
     if (len < 1e-12) { return vec4<f32>(0.0); }
@@ -200,7 +203,10 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // test card).
     var seed0 = lo;
     var seed1 = hi;
-    let axis = principal_axis4(&pixels, mean, vec4<f32>(hi - lo));
+    // 8 iterations for opaque blocks (the axis is the endpoint quality
+    // there), 4 for translucent ones whose LSQ refit absorbs residual
+    // axis error (see astc4x4_fast_f16.wgsl).
+    let axis = principal_axis4(&pixels, mean, vec4<f32>(hi - lo), select(4u, 8u, opaque));
     if (dot(axis, axis) > 0.0) {
       var t_min: f32 = 1e30;
       var t_max: f32 = -1e30;
@@ -217,16 +223,25 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 4-level grid (see astc4x4_fast_f16.wgsl for the measured trade).
     var e0 = lo;
     var e1 = hi;
+    var fitStream = 0u;
+    var haveFitWeights = false;
     if (opaque) {
       // Bbox-clamped like the fit output (see astc4x4_fast_f16.wgsl).
       e0 = clamp(seed0, lo, hi);
       e1 = clamp(seed1, lo, hi);
     } else {
       let r = proj_fit(&pixels, seed0, seed1);
-      if (r.valid) { e0 = clamp(r.e0, lo, hi); e1 = clamp(r.e1, lo, hi); }
+      if (r.valid) {
+        e0 = clamp(r.e0, lo, hi);
+        e1 = clamp(r.e1, lo, hi);
+        fitStream = r.wstream;
+        haveFitWeights = true;
+      }
     }
+    var swapped = false;
     if (e0.x + e0.y + e0.z > e1.x + e1.y + e1.z) {
       let tmp = e0; e0 = e1; e1 = tmp;
+      swapped = true;
     }
     let E0 = vec4<u32>(e0);
     let E1 = vec4<u32>(e1);
@@ -255,8 +270,13 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       w3 = reverseBits(s0);
     } else {
       // CEM 12: 2-bit weights, stream bit q = 2k (single stream word).
+      // Valid fits ship the fit-pass weights; the blue-contraction swap is
+      // a full reflection w → 3−w = bitwise NOT of the packed stream (see
+      // astc4x4_fast_f16.wgsl for the measured trade).
       var s0 = 0u;
-      if (dd > 0.0) {
+      if (haveFitWeights) {
+        s0 = select(fitStream, ~fitStream, swapped);
+      } else if (dd > 0.0) {
         let inv = 3.0 / dd;
         for (var k: u32 = 0u; k < 16u; k = k + 1u) {
           let w = u32(clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 3.0));
