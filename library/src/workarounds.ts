@@ -35,6 +35,19 @@ export function uploadSourceTexture(
   flipY: boolean,
 ): void {
   if (source instanceof ImageData && !flipY) {
+    if (srcTex.format === 'rg8unorm') {
+      // Two-channel source texture (BC5): writeTexture takes raw bytes, so
+      // extract R/G from the RGBA pixels. copyExternalImageToTexture (the
+      // other branch) converts formats itself.
+      const rgba = source.data
+      const rg = new Uint8Array(width * height * 2)
+      for (let i = 0; i < width * height; i++) {
+        rg[i * 2] = rgba[i * 4]!
+        rg[i * 2 + 1] = rgba[i * 4 + 1]!
+      }
+      device.queue.writeTexture({ texture: srcTex }, rg, { bytesPerRow: width * 2 }, [width, height, 1])
+      return
+    }
     device.queue.writeTexture({ texture: srcTex }, source.data, { bytesPerRow: width * 4 }, [width, height, 1])
   } else {
     device.queue.copyExternalImageToTexture({ source: source as ImageBitmap, flipY }, { texture: srcTex }, [

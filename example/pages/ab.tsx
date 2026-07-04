@@ -177,6 +177,27 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     return tex565
   }
 
+  // rg8unorm experiments ('ab-src-rg8'): the image's R/G channels as a
+  // 2-channel texture — HALF the bytes of rgba8, lossless for encoders
+  // that only read R and G (BC5).
+  let texRG: GPUTexture | null = null
+  const getTexRG = (): GPUTexture => {
+    if (!texRG) {
+      texRG = device.createTexture({
+        size: [w, h],
+        format: 'rg8unorm',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      const packed = new Uint8Array(w * h * 2)
+      for (let i = 0; i < w * h; i++) {
+        packed[i * 2] = img.data[i * 4]!
+        packed[i * 2 + 1] = img.data[i * 4 + 1]!
+      }
+      device.queue.writeTexture({ texture: texRG }, packed, { bytesPerRow: w * 2 }, [w, h])
+    }
+    return texRG
+  }
+
   // rgba8uint experiments ('ab-src-u8'): the same pixel bytes as an
   // integer texture — loads skip the unorm->float conversion.
   let texU8: GPUTexture | null = null
@@ -290,6 +311,7 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const usesYQ32 = code.includes('ab-src-yq32')
     const usesYQ = !usesYQ32 && code.includes('ab-src-yq')
     const usesU8 = code.includes('ab-src-u8')
+    const usesRG = code.includes('ab-src-rg8')
     const usesPacked = !uses565 && !usesU8 && /src_tex\s*:\s*texture_2d<u32>/.test(code)
     const bindGroups = dsts.map(dst => {
       const entries: GPUBindGroupEntry[] = [
@@ -301,11 +323,13 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
               ? { binding: 0, resource: getTexYQ()[0].createView() }
               : uses565
                 ? { binding: 0, resource: getTex565().createView() }
-                : usesU8
-                  ? { binding: 0, resource: getTexU8().createView() }
-                  : usesPacked
-                    ? { binding: 0, resource: getPackedTex().createView() }
-                    : { binding: 0, resource: tex.createView() },
+                : usesRG
+                  ? { binding: 0, resource: getTexRG().createView() }
+                  : usesU8
+                    ? { binding: 0, resource: getTexU8().createView() }
+                    : usesPacked
+                      ? { binding: 0, resource: getPackedTex().createView() }
+                      : { binding: 0, resource: tex.createView() },
         { binding: 1, resource: { buffer: dst } },
         { binding: 2, resource: { buffer: uniform } },
       ]

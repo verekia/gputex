@@ -9,9 +9,9 @@
 //   • Math runs in the exact-integer [0,255] f16 domain: endpoints and pixel
 //     values are whole numbers ≤ 255 (exact in f16), so the only rounding is
 //     the single 1/(r1−r0) division.
-//   • BOTH channels ride the same fused pass as vec2<f16> lanes — one loop
-//     computes projections, packed indices and refit sums for R and G at
-//     once instead of two scalar encode_bc4 calls.
+//   • BOTH channels ride the same fused passes as vec2<f16> lanes — each
+//     loop computes projections and moments for R and G at once instead of
+//     two scalar encode_bc4 calls.
 //   • The 16 texel reads are 8 textureGather fetches (4 quads × R,G) for
 //     interior blocks — byte-identical output to per-texel loads, −3.6%
 //     GPU on 4096² (/ab, 2026-07). Blocks straddling the source edge of a
@@ -19,38 +19,49 @@
 //     upload pads the texture with ZEROS, so a normalised-coordinate
 //     gather there would read padding (or mis-scale against the padded
 //     size) instead of replicating the last real texel.
-//   • The LSQ refit is accepted or rejected CLOSED-FORM, with no trial
-//     projection pass. The normal-equation sums are accumulated in RESIDUAL
-//     coordinates (r = v − seed prediction, all small numbers, so the f16
-//     sums don't cancel): the refit solve is e = seed + M⁻¹(sAR,sBR), and
-//     the error of the re-quantised refit endpoints ON THE SEED'S INDICES is
-//       E(δ) = sErr − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB + δ1²sBB
-//     with δ = quantised endpoint − seed endpoint. E < sErr accepts (the
-//     code compares the delta form E − sErr < 0, so sErr itself is only
-//     accumulated for the derivation's sake — see below). All four
-//     floor/ceil roundings of the fractional solve are priced, since the
-//     integer optimum of a correlated 2-D quadratic isn't always the
-//     component-wise nearest rounding (+0.01 dB, free).
-//   • Accepted refits SHIP THE SEED INDICES — there is no reprojection
-//     pass, so E(δ) is exactly the shipped error and the accept test is
-//     exact. Re-optimising the indices against the refit endpoints was
-//     measured at +14% GPU wall for +0.08 dB (synthetic normal card,
-//     53.10 → 53.18) to +0.19 dB (roughness/normal photo set) — the wrong
-//     side of the trade for a throughput encoder (/ab + PSNR A/B,
-//     2026-07). A margin-gated reprojection was also tried and is a dead
-//     end: gain-vs-margin has no exploitable knee (θ=0.15 recovers 0% of
-//     the cost on noisy content, θ=0.4 costs the same quality as dropping
-//     the pass for half the saving).
+//   • Pass 1 accumulates MOMENTS, not normal-equation sums. With b = L/7
+//     and the level-space residual ρ = t − L (t = 7(v−r0)/(r1−r0), so the
+//     value-space residual is r = ρ·dir/7), every LSQ sum is an O(1)
+//     per-block function of four accumulators:
+//       sBB = ΣL²/49       sAB = ΣL/7 − ΣL²/49    sAA = 16 − 2ΣL/7 + ΣL²/49
+//       sBR = ΣLρ·dir/49   sAR = (Σρ − ΣLρ/7)·dir/7
+//     Per-pixel work drops from 5 product-accumulates + 3 temporaries to 4
+//     cheap accumulates (ΣL, ΣL², Σρ, ΣLρ), and the f16 range analysis
+//     becomes trivial: ΣL ≤ 112 and ΣL² ≤ 784 are exact f16 integers,
+//     |ρ| ≤ ~0.5 keeps Σρ/ΣLρ tiny. The per-BLOCK refit math (including
+//     the solve and E(δ) pricing) runs in f32 — free at block granularity,
+//     and it retires the sum-cancellation worries the old residual-sum
+//     scheme was built around.
+//   • The rank guard is EXACT: all pixels on one level ⟺ 16·ΣL² == (ΣL)²
+//     (integers, so the comparison is precise in f32) — no lmin/lmax
+//     tracking in the loop.
+//   • The refit is accepted or rejected CLOSED-FORM, with no trial
+//     projection pass: the solve is e = seed + M⁻¹(sAR,sBR), and the error
+//     of re-quantised endpoints ON THE CURRENT INDICES is
+//       E(δ) = err − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB + δ1²sBB
+//     with δ = quantised endpoint − base endpoint, compared as the delta
+//     form E − err < 0. Only the NEAREST rounding of the fractional solve
+//     is priced: pricing all four floor/ceil combinations (the correlated
+//     2-D quadratic's integer optimum isn't always the nearest rounding)
+//     measured ≤0.015 dB on every content class but ~8% GPU on smooth
+//     content, where Apple's lossless texture compression collapses the
+//     read cost and leaves the kernel ALU-bound (/ab 2026-07, rock 4K
+//     displacement: floor 0.61× of the rgba8-noise floor).
+//   • Pass 2 packs the indices ONCE, against the FINAL endpoints — full
+//     reprojection quality. The previous single-pass scheme shipped the
+//     SEED indices with accepted refit endpoints, giving up 0.08..0.19 dB
+//     because a third reprojection loop cost +14% GPU; with the moment
+//     form paying for the second loop, reprojection now measures at PARITY
+//     with that scheme (/ab 2026-07, interleaved: proc 2048²/4096² and the
+//     rock 4K normal map, all within ±1%, vs read floor ~2% below).
+//     Measured and NOT taken: a second refit round off pass-2 moments
+//     (+14%, register cliff, ≈0 gain on smooth content — round 2 only pays
+//     on noise); full normal-equation sums in both passes (+49%).
 //   • 3-bit indices are packed BRANCH-FREE: pixels 0..7 accumulate into a
 //     24-bit word, pixels 8..15 into another, recombined with constant
 //     shifts into the 48-bit field (w0 gets field bits 0..15 above the two
 //     endpoint bytes, w1 gets field bits 16..47) — no per-pixel straddle
 //     branches.
-//
-// f16 range notes: residual sums accumulate r/16 (|r| ≤ half a level ≈ 18),
-// and endpoint deltas enter E() as δ/16, so every accumulator and product
-// stays ≲4k — well inside f16's 65504 max — while the quantities being
-// compared (block errors) are small numbers with plenty of mantissa.
 //
 // Level → BC4 index (0→r0 ... 7→r1): 0,2,3,4,5,6,7,1 — packed 3-bit LUT
 // 0x3F58D0 = sum(idx[L] << 3L).
@@ -67,6 +78,39 @@ struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, };
 @group(0) @binding(3) var smp: sampler;
 
 const IDX_LUT: u32 = 0x3F58D0u;
+
+// Closed-form accept-if-better endpoint refinement for one channel (f32:
+// per-block O(1) work, so precision is free here). Takes the LSQ sums for
+// the current indices, the current integer endpoints b0 > b1, and the rank
+// guard; prices the nearest rounding of the fractional solve via E(δ) and
+// returns it when it strictly improves and stays in 6-interp mode
+// (q0 > q1), or (b0,b1) unchanged. Endpoints clamp to [0,255], NOT the
+// block's value range: for a scalar channel, endpoints beyond the data
+// range are often genuinely optimal and there is no colour axis to bend
+// (the bbox clamp the colour formats need costs ~0.3 dB here).
+fn refine(sAA: f32, sBB: f32, sAB: f32, sAR: f32, sBR: f32, b0: u32, b1: u32, spread: bool) -> vec2<u32> {
+  var out = vec2<u32>(b0, b1);
+  let det = sAA * sBB - sAB * sAB;
+  if (!spread || abs(det) <= 1e-3) { return out; }
+  let b0f = f32(b0);
+  let b1f = f32(b1);
+  let e0 = clamp(b0f + (sBB * sAR - sAB * sBR) / det, 0.0, 255.0);
+  let e1 = clamp(b1f + (sAA * sBR - sAB * sAR) / det, 0.0, 255.0);
+  let q0f = floor(e0 + 0.5);
+  let q1f = floor(e1 + 0.5);
+  let q0 = u32(q0f);
+  let q1 = u32(q1f);
+  if (q0 > q1 && !(q0 == b0 && q1 == b1)) {
+    let dd0 = q0f - b0f;
+    let dd1 = q1f - b1f;
+    let eNew = -2.0 * (dd0 * sAR + dd1 * sBR)
+      + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
+    if (eNew < 0.0) {
+      out = vec2<u32>(q0, q1);
+    }
+  }
+  return out;
+}
 
 @compute @workgroup_size(8, 8, 1)
 fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -126,77 +170,49 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir = r1f - r0f;
   let scale = h2(7.0) / dir;
 
-  // ONE fused pass, both channels: level = round(7·(v − r0)/(r1 − r0))
-  // projection, branch-free packed indices, and the least-squares sums in
-  // residual coordinates. iA holds pixels 0..7 (3 bits each), iB pixels
-  // 8..15.
-  var sAA = h2(0.0); var sBB = h2(0.0); var sAB = h2(0.0);
-  var sAR = h2(0.0); var sBR = h2(0.0); var sErr = h2(0.0);
-  var lmin = h2(7.0); var lmax = h2(0.0);
+  // Pass 1, both channels — MOMENTS only. t = 7(v−r0)/(r1−r0) ∈ [0,7]
+  // (the seed covers the data), L = round(t), ρ = t − L.
+  var sL = h2(0.0); var sLL = h2(0.0); var pR = h2(0.0); var pLR = h2(0.0);
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let t = (v[k] - r0f) * scale;
+    let L = clamp(floor(t + h2(0.5)), h2(0.0), h2(7.0));
+    let rho = t - L;
+    sL = sL + L; sLL = sLL + L * L;
+    pR = pR + rho; pLR = pLR + L * rho;
+  }
+
+  // Per-block refit in f32 off the moments (see header for the identities).
+  let sLf = vec2<f32>(sL);
+  let sLLf = vec2<f32>(sLL);
+  let dirf = vec2<f32>(r1) - vec2<f32>(r0);
+  let sBB = sLLf * (1.0 / 49.0);
+  let sAB = sLf * (1.0 / 7.0) - sBB;
+  let sAA = vec2<f32>(16.0) - 2.0 * sLf * (1.0 / 7.0) + sBB;
+  let sBR = vec2<f32>(pLR) * dirf * (1.0 / 49.0);
+  let sAR = (vec2<f32>(pR) - vec2<f32>(pLR) * (1.0 / 7.0)) * dirf * (1.0 / 7.0);
+  let spread = 16.0 * sLLf != sLf * sLf;
+
+  let fx = refine(sAA.x, sBB.x, sAB.x, sAR.x, sBR.x, r0.x, r1.x, spread.x);
+  let fy = refine(sAA.y, sBB.y, sAB.y, sAR.y, sBR.y, r0.y, r1.y, spread.y);
+  let n0 = vec2<u32>(fx.x, fy.x);
+  let n1 = vec2<u32>(fx.y, fy.y);
+
+  // Pass 2, both channels — pack the shipped indices against the FINAL
+  // endpoints (rejected channels re-derive their seed assignment). iA
+  // holds pixels 0..7 (3 bits each), iB pixels 8..15.
+  let n0f = h2(vec2<f32>(n0));
+  let n1f = h2(vec2<f32>(n1));
+  let scale2 = h2(7.0) / (n1f - n0f);
   var iAx = 0u; var iBx = 0u; var iAy = 0u; var iBy = 0u;
   for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-    let vr = v[k] - r0f;
-    let L = clamp(floor(vr * scale + h2(0.5)), h2(0.0), h2(7.0));
-    lmin = min(lmin, L); lmax = max(lmax, L);
-    let b = L * h2(1.0 / 7.0);
-    let a = h2(1.0) - b;
-    let r16 = (vr - b * dir) * h2(1.0 / 16.0);
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAR = sAR + a * r16; sBR = sBR + b * r16; sErr = sErr + r16 * r16;
+    let L = clamp(floor((v[k] - n0f) * scale2 + h2(0.5)), h2(0.0), h2(7.0));
     iAx = iAx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << (k * 3u));
     iAy = iAy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << (k * 3u));
   }
   for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-    let vr = v[k] - r0f;
-    let L = clamp(floor(vr * scale + h2(0.5)), h2(0.0), h2(7.0));
-    lmin = min(lmin, L); lmax = max(lmax, L);
-    let b = L * h2(1.0 / 7.0);
-    let a = h2(1.0) - b;
-    let r16 = (vr - b * dir) * h2(1.0 / 16.0);
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAR = sAR + a * r16; sBR = sBR + b * r16; sErr = sErr + r16 * r16;
+    let L = clamp(floor((v[k] - n0f) * scale2 + h2(0.5)), h2(0.0), h2(7.0));
     iBx = iBx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << ((k - 8u) * 3u));
     iBy = iBy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << ((k - 8u) * 3u));
-  }
-
-  // Closed-form LSQ refit per channel. Rank-1 guard: with every pixel on ONE
-  // level the system is singular and det is pure f16 rounding noise (≲0.03);
-  // with ≥2 distinct levels det = Σ_i<j (b_j − b_i)² ≥ 15/49 ≈ 0.306 — 0.1
-  // separates cleanly. Endpoints clamp to [0,255], NOT the block's value
-  // range: for a scalar channel, endpoints beyond the data range are often
-  // genuinely optimal and there is no colour axis to bend (the bbox clamp
-  // the colour formats need costs ~0.3 dB here).
-  let det = sAA * sBB - sAB * sAB;
-  let d0 = (sBB * sAR - sAB * sBR) * h2(16.0);
-  let d1 = (sAA * sBR - sAB * sAR) * h2(16.0);
-  var n0 = r0; var n1 = r1;
-  for (var c: u32 = 0u; c < 2u; c = c + 1u) {
-    if (lmin[c] < lmax[c] && abs(det[c]) > h(0.1)) {
-      let e0 = clamp(r0f[c] + d0[c] / det[c], h(0.0), h(255.0));
-      let e1 = clamp(r1f[c] + d1[c] / det[c], h(0.0), h(255.0));
-      // The integer optimum of the E() quadratic isn't always the
-      // component-wise rounding of the fractional solve, so price all four
-      // floor/ceil combinations — closed-form, no per-pixel work — and
-      // keep the best that stays in 6-interp mode (q0 > q1 strictly) and
-      // beats the seed (E(seed) − sErr = 0).
-      var bestE = h(0.0);
-      for (var m: u32 = 0u; m < 4u; m = m + 1u) {
-        let q0f = clamp(floor(e0) + h(f32(m & 1u)), h(0.0), h(255.0));
-        let q1f = clamp(floor(e1) + h(f32(m >> 1u)), h(0.0), h(255.0));
-        let q0 = u32(q0f);
-        let q1 = u32(q1f);
-        if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
-          let dd0 = (q0f - r0f[c]) * h(1.0 / 16.0);
-          let dd1 = (q1f - r1f[c]) * h(1.0 / 16.0);
-          let eNew = -h(2.0) * (dd0 * sAR[c] + dd1 * sBR[c])
-            + dd0 * dd0 * sAA[c] + h(2.0) * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
-          if (eNew < bestE) {
-            bestE = eNew;
-            n0[c] = q0; n1[c] = q1;
-          }
-        }
-      }
-    }
   }
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.

@@ -18,21 +18,21 @@
 // for the reference this encoder is validated against.
 //
 // Same algorithm as bc5_fast_f16.wgsl (see that file for the full notes):
-//   • both channels processed as vec2 lanes of one fused pass — projection
-//     assignment, branch-free packed indices, and LSQ sums in residual
-//     coordinates;
-//   • the refit is accepted CLOSED-FORM from the sums (no trial projection
-//     pass): E(δ) = sErr − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB + δ1²sBB
-//     for the re-quantised endpoint deltas δ, compared against the seed's
-//     error; accepted refits ship the SEED indices (no reprojection pass —
-//     see the f16 module's header for the measured trade);
+//   • both channels processed as vec2 lanes of the fused passes;
+//   • pass 1 accumulates MOMENTS (ΣL, ΣL², Σρ, ΣLρ) from which every LSQ
+//     normal-equation sum is an O(1) per-block expression; the rank guard
+//     is the exact 16·ΣL² == (ΣL)² test;
+//   • the closed-form refit prices the nearest rounding of the solve
+//     through E(δ) = err − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB
+//     + δ1²sBB, accept-if-better;
+//   • pass 2 packs the indices ONCE, against the FINAL endpoints — full
+//     reprojection quality at parity cost;
 //   • the 16 texel reads are 8 textureGather fetches (4 quads × R,G)
 //     through a clamp-to-edge sampler, byte-identical to per-texel loads;
 //   • 3-bit indices accumulate branch-free into two 24-bit words (pixels
 //     0..7 and 8..15) recombined with constant shifts — no per-pixel
 //     straddle branches.
-// Values are kept in the [0,255] f32 domain; the only difference from the
-// f16 module is that no /16 range scaling is needed.
+// Values are kept in the [0,255] f32 domain throughout.
 //
 // Level → BC4 index LUT (0,2,3,4,5,6,7,1) packed as 3-bit entries in
 // 0x3F58D0.
@@ -50,6 +50,35 @@ struct Params {
 @group(0) @binding(3) var smp: sampler;
 
 const IDX_LUT: u32 = 0x3F58D0u;
+
+// Closed-form accept-if-better endpoint refinement for one channel — same
+// as the f16 module's `refine` (both run this per-block step in f32).
+// Endpoints clamp to [0,255], NOT the block's value range: for a scalar
+// channel, endpoints beyond the data range are often genuinely optimal and
+// there is no colour axis to bend.
+fn refine(sAA: f32, sBB: f32, sAB: f32, sAR: f32, sBR: f32, b0: u32, b1: u32, spread: bool) -> vec2<u32> {
+  var out = vec2<u32>(b0, b1);
+  let det = sAA * sBB - sAB * sAB;
+  if (!spread || abs(det) <= 1e-3) { return out; }
+  let b0f = f32(b0);
+  let b1f = f32(b1);
+  let e0 = clamp(b0f + (sBB * sAR - sAB * sBR) / det, 0.0, 255.0);
+  let e1 = clamp(b1f + (sAA * sBR - sAB * sAR) / det, 0.0, 255.0);
+  let q0f = floor(e0 + 0.5);
+  let q1f = floor(e1 + 0.5);
+  let q0 = u32(q0f);
+  let q1 = u32(q1f);
+  if (q0 > q1 && !(q0 == b0 && q1 == b1)) {
+    let dd0 = q0f - b0f;
+    let dd1 = q1f - b1f;
+    let eNew = -2.0 * (dd0 * sAR + dd1 * sBR)
+      + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
+    if (eNew < 0.0) {
+      out = vec2<u32>(q0, q1);
+    }
+  }
+  return out;
+}
 
 @compute @workgroup_size(8, 8, 1)
 fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -107,72 +136,48 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dir = r1f - r0f;
   let scale = vec2<f32>(7.0) / dir;
 
-  // ONE fused pass, both channels: projection assignment, branch-free packed
-  // indices, and the least-squares sums in residual coordinates.
-  var sAA = vec2<f32>(0.0); var sBB = vec2<f32>(0.0); var sAB = vec2<f32>(0.0);
-  var sAR = vec2<f32>(0.0); var sBR = vec2<f32>(0.0); var sErr = vec2<f32>(0.0);
-  var lmin = vec2<f32>(7.0); var lmax = vec2<f32>(0.0);
+  // Pass 1, both channels — MOMENTS only. t = 7(v−r0)/(r1−r0) ∈ [0,7]
+  // (the seed covers the data), L = round(t), ρ = t − L.
+  var sL = vec2<f32>(0.0); var sLL = vec2<f32>(0.0);
+  var pR = vec2<f32>(0.0); var pLR = vec2<f32>(0.0);
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let t = (v[k] - r0f) * scale;
+    let L = clamp(floor(t + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
+    let rho = t - L;
+    sL = sL + L; sLL = sLL + L * L;
+    pR = pR + rho; pLR = pLR + L * rho;
+  }
+
+  // Per-block refit off the moments (see bc5_fast_f16.wgsl for the
+  // identities).
+  let sBB = sLL * (1.0 / 49.0);
+  let sAB = sL * (1.0 / 7.0) - sBB;
+  let sAA = vec2<f32>(16.0) - 2.0 * sL * (1.0 / 7.0) + sBB;
+  let sBR = pLR * dir * (1.0 / 49.0);
+  let sAR = (pR - pLR * (1.0 / 7.0)) * dir * (1.0 / 7.0);
+  let spread = 16.0 * sLL != sL * sL;
+
+  let fx = refine(sAA.x, sBB.x, sAB.x, sAR.x, sBR.x, r0.x, r1.x, spread.x);
+  let fy = refine(sAA.y, sBB.y, sAB.y, sAR.y, sBR.y, r0.y, r1.y, spread.y);
+  let n0 = vec2<u32>(fx.x, fy.x);
+  let n1 = vec2<u32>(fx.y, fy.y);
+
+  // Pass 2, both channels — pack the shipped indices against the FINAL
+  // endpoints (rejected channels re-derive their seed assignment). iA
+  // holds pixels 0..7 (3 bits each), iB pixels 8..15.
+  let n0f = vec2<f32>(n0);
+  let n1f = vec2<f32>(n1);
+  let scale2 = vec2<f32>(7.0) / (n1f - n0f);
   var iAx = 0u; var iBx = 0u; var iAy = 0u; var iBy = 0u;
   for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-    let vr = v[k] - r0f;
-    let L = clamp(floor(vr * scale + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
-    lmin = min(lmin, L); lmax = max(lmax, L);
-    let b = L * (1.0 / 7.0);
-    let a = 1.0 - b;
-    let r = vr - b * dir;
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAR = sAR + a * r; sBR = sBR + b * r; sErr = sErr + r * r;
+    let L = clamp(floor((v[k] - n0f) * scale2 + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
     iAx = iAx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << (k * 3u));
     iAy = iAy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << (k * 3u));
   }
   for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-    let vr = v[k] - r0f;
-    let L = clamp(floor(vr * scale + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
-    lmin = min(lmin, L); lmax = max(lmax, L);
-    let b = L * (1.0 / 7.0);
-    let a = 1.0 - b;
-    let r = vr - b * dir;
-    sAA = sAA + a * a; sBB = sBB + b * b; sAB = sAB + a * b;
-    sAR = sAR + a * r; sBR = sBR + b * r; sErr = sErr + r * r;
+    let L = clamp(floor((v[k] - n0f) * scale2 + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
     iBx = iBx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << ((k - 8u) * 3u));
     iBy = iBy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << ((k - 8u) * 3u));
-  }
-
-  // Closed-form LSQ refit per channel. Rank-1 guard: with every pixel on ONE
-  // level the system is singular (det is float rounding noise); with ≥2
-  // distinct levels det = Σ_i<j (b_j − b_i)² ≥ 15/49 ≈ 0.306. Endpoints
-  // clamp to [0,255], NOT the block's value range: for a scalar channel,
-  // endpoints beyond the data range are often genuinely optimal and there is
-  // no colour axis to bend.
-  let det = sAA * sBB - sAB * sAB;
-  let d0 = sBB * sAR - sAB * sBR;
-  let d1 = sAA * sBR - sAB * sAR;
-  var n0 = r0; var n1 = r1;
-  for (var c: u32 = 0u; c < 2u; c = c + 1u) {
-    if (lmin[c] < lmax[c] && abs(det[c]) > 1e-3) {
-      let e0 = clamp(r0f[c] + d0[c] / det[c], 0.0, 255.0);
-      let e1 = clamp(r1f[c] + d1[c] / det[c], 0.0, 255.0);
-      // Price all four floor/ceil roundings of the fractional solve
-      // closed-form (see bc5_fast_f16.wgsl); keep the best that stays in
-      // 6-interp mode and beats the seed.
-      var bestE = 0.0;
-      for (var m: u32 = 0u; m < 4u; m = m + 1u) {
-        let q0f = clamp(floor(e0) + f32(m & 1u), 0.0, 255.0);
-        let q1f = clamp(floor(e1) + f32(m >> 1u), 0.0, 255.0);
-        let q0 = u32(q0f);
-        let q1 = u32(q1f);
-        if (q0 > q1 && !(q0 == r0[c] && q1 == r1[c])) {
-          let dd0 = q0f - r0f[c];
-          let dd1 = q1f - r1f[c];
-          let eNew = -2.0 * (dd0 * sAR[c] + dd1 * sBR[c])
-            + dd0 * dd0 * sAA[c] + 2.0 * dd0 * dd1 * sAB[c] + dd1 * dd1 * sBB[c];
-          if (eNew < bestE) {
-            bestE = eNew;
-            n0[c] = q0; n1[c] = q1;
-          }
-        }
-      }
-    }
   }
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.

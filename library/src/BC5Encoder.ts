@@ -27,6 +27,14 @@ export class BC5Encoder extends Encoder {
   override get supportsSrgb(): boolean {
     return false
   }
+  // BC5 stores only R and G — a two-channel source texture halves the
+  // encode pass's DRAM reads. Measured on the pass (/ab 2026-07): −4% on a
+  // real 4K normal map, −8..−12% on procedural 2048²/4096², and the raw
+  // read floor itself drops 35%, so the win grows as the kernel's ALU
+  // shrinks. Also halves source-texture memory during encodes.
+  protected override get srcTextureFormat(): GPUTextureFormat {
+    return 'rg8unorm'
+  }
 
   override wgslSource(): string {
     return shaderSource

@@ -348,6 +348,19 @@ export abstract class Encoder {
   }
 
   /**
+   * Format of the single-shot source texture the encode pass samples.
+   * Encoders that read only a channel subset can narrow it to cut DRAM
+   * traffic on the bandwidth-bound compute pass (BC5 reads rg8unorm — half
+   * the bytes of rgba8). Must be valid as a copyExternalImageToTexture
+   * destination and renderable. Chain encodes keep rgba8unorm regardless
+   * (their inputs are RGBA mip levels / texture views); the WGSL is
+   * format-agnostic (`texture_2d<f32>`), so mixing is byte-identical.
+   */
+  protected get srcTextureFormat(): GPUTextureFormat {
+    return 'rgba8unorm'
+  }
+
+  /**
    * Optional f16 WGSL variant. Used only when the device reports the
    * `shader-f16` feature; the format's f32 `wgslSource()` is the automatic
    * fallback. Returns null when there's no f16 variant.
@@ -501,7 +514,7 @@ export abstract class Encoder {
         srcTex = device.createTexture({
           label: `${this.label}-src`,
           size: [paddedWidth, paddedHeight, 1],
-          format: 'rgba8unorm',
+          format: this.srcTextureFormat,
           // RENDER_ATTACHMENT is required by copyExternalImageToTexture
           // (internally a blit) even though we never render into this texture.
           usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
