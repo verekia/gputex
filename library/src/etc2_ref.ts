@@ -28,9 +28,8 @@
 //     selection run on D = luma(p) − luma(base) alone (exact modulo decode
 //     clamping): O(1) flip preselect from quadrant variance, subblock-average
 //     bases (differential when the delta fits, else individual), a
-//     two-candidate table search around max|D|, one cheap refit round
-//     (skew-predicted base shift, accepted without a rescore) gated on
-//     busy blocks, and a closed-form planar contest.
+//     two-candidate table search around max|D| (no base refit — dropped
+//     as a speed/quality trade), and a closed-form planar contest.
 //   'high': exhaustive — both flips, BOTH differential (delta clamped into
 //     range) and individual bases, full 8-table × 4-modifier search with
 //     decode-exact clamped errors, up to 4 exact-accepted refit rounds, a
@@ -482,7 +481,6 @@ function packPlanar(cand: PlanarCandidate): ETC2Block {
 const A3 = MODIFIERS.map(m => 3 * m[0])
 const B3 = MODIFIERS.map(m => 3 * m[1])
 const THR3 = MODIFIERS.map(m => 1.5 * (m[0] + m[1]))
-const FAST_GATE = 300
 const PLANAR_FUDGE = 8
 
 /** Σ m3·(m3 − 2|D|) for one table over a subblock's D values (×3 scale). */
@@ -626,41 +624,15 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
     flip = resB < resA ? 1 : 0
     cur = evalFlip(flip, flip === 0 ? pair(0, 2) : pair(0, 1), flip === 0 ? pair(1, 3) : pair(2, 3))
   }
-  const s0 = flip === 0 ? pair(0, 2) : pair(0, 1)
-  const s1 = flip === 0 ? pair(1, 3) : pair(2, 3)
   const texels0 = SUBBLOCKS[flip]![0]!
   const texels1 = SUBBLOCKS[flip]![1]!
   const diff = cur.diff
-  const avg0 = s0.sum.map(v => v / 8)
-  const avg1 = s1.sum.map(v => v / 8)
-  let codes = cur.codes
-  let lb0 = cur.lb0
-  let lb1 = cur.lb1
-
-  // One CHEAP refit round: the modifier sum predicts the selection-skew
-  // bias (relative to the unquantised mean ΣD = 0), and the requantised
-  // base is accepted without a re-search or rescore — tables kept, index
-  // packing deferred to the final base. Mirrors etc2.wgsl: the
-  // exact-accept version cost +15% GPU for ≤0.03 dB.
-  if (cur.est > FAST_GATE) {
-    const mod0 = fastIndices(Dof(texels0, lb0), cur.t0).modSum
-    const mod1 = fastIndices(Dof(texels1, lb1), cur.t1).modSum
-    const nAvg0 = avg0.map(v => v - mod0 / 8)
-    const nAvg1 = avg1.map(v => v - mod1 / 8)
-    const nCodes = quantiseBases(nAvg0, nAvg1, diff, true)
-    if (
-      nCodes &&
-      !(nCodes.codes0.every((v, c) => v === codes.codes0[c]) && nCodes.codes1.every((v, c) => v === codes.codes1[c]))
-    ) {
-      codes = nCodes
-      const b0 = decodeBases(nCodes.codes0, diff)
-      const b1 = decodeBases(nCodes.codes1, diff)
-      lb0 = b0[0]! + b0[1]! + b0[2]!
-      lb1 = b1[0]! + b1[1]! + b1[2]!
-    }
-  }
-  const fit0 = fastIndices(Dof(texels0, lb0), cur.t0)
-  const fit1 = fastIndices(Dof(texels1, lb1), cur.t1)
+  const codes = cur.codes
+  // NO base refit — dropped with the shader (2026-07): ~0.2 dB on
+  // photographic colour for 13-30% GPU. The 'high' path keeps its exact
+  // refit rounds, so the reference still bounds what a refit could buy.
+  const fit0 = fastIndices(Dof(texels0, cur.lb0), cur.t0)
+  const fit1 = fastIndices(Dof(texels1, cur.lb1), cur.t1)
 
   // Planar contest, closed-form: the residual of the plane the hardware
   // will ACTUALLY decode — quantised, clamped corners — via the

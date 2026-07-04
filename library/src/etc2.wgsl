@@ -31,12 +31,11 @@
 //   • Table search is pruned to two candidates — the table whose LARGE
 //     magnitude covers max|D| and its lower neighbour (outlier hedge).
 //     One candidate loses ~1.2-1.6 dB on photos; all eight gain ≤0.05 dB.
-//   • One CHEAP refit round (base ← subblock mean − mean chosen modifier
-//     from a dedicated modifier-sum pass, requantised, accepted without a
-//     re-search or rescore, tables kept, index packing deferred to the
-//     final base), gated on est > GATE. Worth ~0.2 dB on photographic
-//     content; the exact-accept version it replaces cost +15% GPU for
-//     ≤0.03 dB.
+//   • NO base refit. The refit family (base ← subblock mean − mean chosen
+//     modifier) was worth ~0.2 dB on photographic colour (rock-color
+//     33.98 → 33.79 without it) but even its cheapest accepted form cost
+//     ~13% GPU and the exact-accept original ~30% — dropped 2026-07 as a
+//     deliberate speed/quality trade; see the suite baselines.
 //   • PLANAR runs unconditionally: with the right-hand sides folded into
 //     the load loop the LSQ solve is O(1) (the Gram inverse of the fixed
 //     sample positions is a constant, det = 25) and its residual is the
@@ -68,7 +67,6 @@ const A3  = array<f32, 8>(6.0, 15.0, 27.0, 39.0, 54.0, 72.0, 99.0, 141.0);
 const B3  = array<f32, 8>(24.0, 51.0, 87.0, 126.0, 180.0, 240.0, 318.0, 549.0);
 const THR = array<f32, 8>(15.0, 33.0, 57.0, 82.5, 117.0, 156.0, 208.5, 345.0);
 
-const GATE = 300.0;
 // Planar's closed-form estimate models the QUANTISED corners exactly; only
 // decode's floor-rounding (±½ per sample) is unmodelled. This small bias
 // keeps near-ties on the predictable ETC1 side.
@@ -226,23 +224,6 @@ fn sb_indices(luma: ptr<function, array<f32, 16>>, flip: u32, sb: u32, lb: f32, 
   return indices;
 }
 
-// Sum of the chosen modifiers — the refit's base-shift input. Relative to
-// the unquantised subblock mean ΣD = 0, so a nonzero mean modifier is pure
-// selection skew (asymmetric magnitude quantisation); this pass predicts
-// the bias the refit removes, without packing indices.
-fn sb_modsum(luma: ptr<function, array<f32, 16>>, flip: u32, sb: u32, lb: f32, t: u32) -> f32 {
-  let am = A3[t] / 3.0;
-  let bm = B3[t] / 3.0;
-  let thr = THR[t];
-  var mod_sum = 0.0;
-  for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-    let d = (*luma)[texel_of(flip, sb, i)] - lb;
-    let m = select(am, bm, abs(d) > thr);
-    mod_sum = mod_sum + select(m, -m, d < 0.0);
-  }
-  return mod_sum;
-}
-
 @compute @workgroup_size(8, 8, 1)
 fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= params.blocks_x || gid.y >= params.blocks_y) {
@@ -328,50 +309,15 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       bflip = f;
     }
   }
-  let bsum0 = select(sum0a, sum0b, bflip == 1u);
-  let bsum1 = select(sum1a, sum1b, bflip == 1u);
-  let bsq0 = select(sq0a, sq0b, bflip == 1u);
-  let bsq1 = select(sq1a, sq1b, bflip == 1u);
   let bdiff = sel.diff;
 
-  var best_est = sel.est;
-  var codes0 = sel.bases.codes0;
-  var codes1 = sel.bases.codes1;
-  var lb0 = sel.lb0;
-  var lb1 = sel.lb1;
+  let best_est = sel.est;
+  let codes0 = sel.bases.codes0;
+  let codes1 = sel.bases.codes1;
   let t0 = sel.t0;
   let t1 = sel.t1;
-
-  // ------------------------------------------------------ cheap refit --
-  // One modifier-sum pass predicts the skew bias; the requantised base is
-  // accepted without a re-search or rescore (tables kept), and index
-  // packing is deferred to the final base. The exact-accept refit this
-  // replaces re-ran the search and packed indices up to twice — +15% GPU
-  // for ≤0.03 dB (measured on all five suite images).
-  if (best_est > GATE) {
-    let mod0 = sb_modsum(&luma, bflip, 0u, lb0, t0);
-    let mod1 = sb_modsum(&luma, bflip, 1u, lb1, t1);
-    let navg0 = bsum0 * 0.125 - vec3<f32>(mod0 * 0.125);
-    let navg1 = bsum1 * 0.125 - vec3<f32>(mod1 * 0.125);
-    let nb = quantise_bases(navg0, navg1, bdiff, true);
-    if (any(nb.codes0 != codes0) || any(nb.codes1 != codes1)) {
-      var n0: vec3<f32>;
-      var n1: vec3<f32>;
-      if (bdiff) {
-        n0 = extend5(nb.codes0);
-        n1 = extend5(nb.codes1);
-      } else {
-        n0 = extend4(nb.codes0);
-        n1 = extend4(nb.codes1);
-      }
-      codes0 = nb.codes0;
-      codes1 = nb.codes1;
-      lb0 = n0.r + n0.g + n0.b;
-      lb1 = n1.r + n1.g + n1.b;
-    }
-  }
-  let fit0 = sb_indices(&luma, bflip, 0u, lb0, t0);
-  let fit1 = sb_indices(&luma, bflip, 1u, lb1, t1);
+  let fit0 = sb_indices(&luma, bflip, 0u, sel.lb0, t0);
+  let fit1 = sb_indices(&luma, bflip, 1u, sel.lb1, t1);
 
   // ------------------------------------------------------------ planar --
   // Always evaluated: with the rhs folded into the load loop this is O(1),

@@ -103,8 +103,10 @@ constants and the flip preselect computed O(1) from quadrant sums. A gated
 base-colour refit and a closed-form least-squares fit of ETC2's planar mode
 (which rescues the smooth gradients ETC1-style blocks band on) complete the
 block, all driven by the same estimates. The rewrite took the GPU pass from
-6.0 ms to 0.24 ms at 2048² (25×, within ~0.2 dB of the exhaustive search).
-It ships as f32 only: the estimates are integer-exact sums that overflow f16.
+6.0 ms to 0.20 ms at 2048² (30×, within ~0.4 dB of the exhaustive search —
+a base-refit stage worth ~0.2 dB on photographic colour was deliberately
+dropped for the last −20%). It ships as f32 only: the estimates are
+integer-exact sums that overflow f16.
 
 On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
 per-block reference encoders (BC5 matches the reference exactly; ASTC and
@@ -347,13 +349,13 @@ end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 | BC7      | f32           | 0.59 ms     |
 | ASTC 4×4 | f16 (default) | **0.26 ms** |
 | ASTC 4×4 | f32           | 0.56 ms     |
-| ETC2     | f32 (only)    | 0.24 ms     |
+| ETC2     | f32 (only)    | 0.20 ms     |
 
 The ETC2 figure is the interleaved `/ab` harness measurement (batched
-dispatches, clock-stable): the scalar-luma selection rewrite plus a cheap
-skew-predicted refit took it from 6.0 ms to 0.24 ms in-session — for
-reference, a 16-loads-only null shader measures 0.14 ms, and the encoder is
-memory-bound below ~0.19 ms (ALU hides fully under the texel fetches).
+dispatches, clock-stable): the scalar-luma selection rewrite took it from
+6.0 ms to 0.20 ms in-session — for reference, a 16-loads-only null shader
+measures 0.15 ms on the same hardware, so the whole encode adds only ~⅓ of
+a load-pass on top of reading the pixels.
 
 Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
 timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare

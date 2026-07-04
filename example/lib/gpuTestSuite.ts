@@ -158,18 +158,18 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 49.45,
-  // ETC2 (2026-07, f32-only, minus ~0.15 dB; re-pinned for the scalar-luma
-  // fast shader — 21× the brute-force encoder at −0.06..−0.21 dB). Matches
-  // or beats BC1 on photographic/grayscale content; the low 'color'-card
-  // number is the format, not the encoder (the reference measures
-  // 20.02 dB): ETC1-family blocks modulate only luma per pixel, so the
-  // card's per-pixel chroma checkers crater without the unimplemented T/H
-  // modes.
-  'etc2:color': 19.83,
-  'etc2:packed-1024': 31.88,
-  'etc2:rock-color-1k': 33.85,
-  'etc2:rock-roughness-1k': 40.0,
-  'etc2:wood-color-1k': 39.15,
+  // ETC2 (2026-07, f32-only, minus ~0.15 dB; re-pinned twice — for the
+  // scalar-luma fast shader, then for the deliberate REFIT DROP that traded
+  // ~0.2 dB on photographic colour for −20% GPU; rock-color now sits just
+  // below BC1's). The low 'color'-card number is the format, not the
+  // encoder (the reference measures 20.02 dB): ETC1-family blocks modulate
+  // only luma per pixel, so the card's per-pixel chroma checkers crater
+  // without the unimplemented T/H modes.
+  'etc2:color': 19.82,
+  'etc2:packed-1024': 31.86,
+  'etc2:rock-color-1k': 33.64,
+  'etc2:rock-roughness-1k': 39.99,
+  'etc2:wood-color-1k': 39.06,
   'bc5:wood-normal-1k': 47.8,
   'bc1:wood-roughness-1k': 40.4,
   'bc1:wood-displacement-1k': 43.1,
@@ -227,12 +227,12 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc1:wood-color-1k': 0.05,
   'bc7:wood-color-1k': 0.05,
   'astc:wood-color-1k': 0.05,
-  // ETC2 (2026-07 scalar-luma shader, observed 0.199 / 0.019 / 0.077 /
-  // 0.023 / 0.038 — estimate-based selection trails the exact reference a
-  // little more per block than the other formats' exact searches do).
-  'etc2:color': 0.3,
+  // ETC2 (2026-07 no-refit shader, observed 0.291 / 0.029 / 0.112 /
+  // 0.023 / 0.038 — estimate-based selection without a refit trails the
+  // exact reference more per block than the other formats do).
+  'etc2:color': 0.45,
   'etc2:packed-1024': 0.05,
-  'etc2:rock-color-1k': 0.15,
+  'etc2:rock-color-1k': 0.2,
   'etc2:rock-roughness-1k': 0.05,
   'etc2:wood-color-1k': 0.08,
   'bc5:wood-normal-1k': 0.05,
