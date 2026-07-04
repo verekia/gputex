@@ -15,6 +15,12 @@
 // actually the target format, occupancy from smaller registers is the
 // cheapest speed there is.
 //
+// The COLOUR accumulators deliberately stay f32 even though quadrant and
+// pair sums (<= 2040) would be exact in f16: porting them (vec3<f16>
+// qsum + per-texel conversions for the squared terms) measured 15%
+// SLOWER on Apple/metal-3 — the conversion traffic outweighs the
+// register saving. Luma + the table/modifier search are the f16 surface.
+//
 // Each invocation encodes one 4x4 pixel block into an 8-byte ETC2 RGB8 block
 // written as 2 x u32 into the destination storage buffer. ETC2 blocks are
 // big-endian on the wire (byte 0 = bits 63..56), so both words are byte-

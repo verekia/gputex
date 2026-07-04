@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p example/public/ab
-for f in bc1 bc5 bc7 astc4x4; do
+for f in bc1 bc5 bc7 astc4x4 etc2; do
   for v in "" "_fast_f16"; do
     src="library/src/${f}${v}.wgsl"
     short="${f/astc4x4/astc}${v/_fast_f16/_f16}"
@@ -13,7 +13,4 @@ for f in bc1 bc5 bc7 astc4x4; do
     git show "HEAD:$src" > "example/public/ab/${short}_head.wgsl" 2>/dev/null || true
   done
 done
-# etc2 has no f16 variant.
-cp library/src/etc2.wgsl example/public/ab/etc2_work.wgsl
-git show "HEAD:library/src/etc2.wgsl" > example/public/ab/etc2_head.wgsl 2>/dev/null || true
 echo "synced $(ls example/public/ab | wc -l | tr -d ' ') files into example/public/ab/"
