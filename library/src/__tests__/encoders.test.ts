@@ -124,10 +124,7 @@ describe('ETC2Encoder', () => {
     // Sanity: the shader exposes the ETC2-specific helpers by name.
     expect(src).toContain('fn sb_maxad')
     expect(src).toContain('fn quantise_bases')
-    // The encode pass reads the PREPARED split source, not raw RGBA8.
-    const prep: string = view.wgslPrepSource()
-    expect(prep).toContain('texture_storage_2d<r32uint, write>')
-    expect(prep).toContain('texture_storage_2d<rgba8unorm, write>')
+    expect(src).toMatch(/planar/i)
   })
 })
 

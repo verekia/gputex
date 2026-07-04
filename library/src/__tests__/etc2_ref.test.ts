@@ -101,7 +101,7 @@ describe('encodeETC2Block basics', () => {
     }
   })
 
-  it("tracks a clean colour gradient closely ('high' via planar, 'fast' via ETC1 only)", () => {
+  it('picks planar mode for a clean colour gradient and tracks it closely', () => {
     const px = new Float32Array(48)
     for (let k = 0; k < 16; k++) {
       const x = k & 3
@@ -110,22 +110,11 @@ describe('encodeETC2Block basics', () => {
       px[k * 3 + 1] = 0.3 + y * 0.1
       px[k * 3 + 2] = 0.5 + x * 0.04 - y * 0.06
     }
-    // 'high' still emits planar — the natural fit for a smooth gradient.
-    const high = encodeETC2Block(px, { quality: 'high' })
-    expect(readETC2Mode(high)).toBe('planar')
-    const decodedHigh = decodeETC2Block(high)
+    const block = encodeETC2Block(px)
+    expect(readETC2Mode(block)).toBe('planar')
+    const decoded = decodeETC2Block(block)
     for (let i = 0; i < 48; i++) {
-      expect(Math.abs(decodedHigh[i]! - px[i]!)).toBeLessThanOrEqual(4 / 255)
-    }
-    // 'fast' (the GPU mirror) dropped planar in the bandwidth rewrite; it
-    // must still track the gradient via ETC1 modes, much more loosely
-    // (scalar luma modulation cannot follow two independent chroma slopes
-    // — worst sample ≈ 34/255 here; the bound just rules out catastrophe).
-    const fast = encodeETC2Block(px)
-    expect(readETC2Mode(fast)).not.toBe('planar')
-    const decodedFast = decodeETC2Block(fast)
-    for (let i = 0; i < 48; i++) {
-      expect(Math.abs(decodedFast[i]! - px[i]!)).toBeLessThanOrEqual(48 / 255)
+      expect(Math.abs(decoded[i]! - px[i]!)).toBeLessThanOrEqual(4 / 255)
     }
   })
 

@@ -102,14 +102,11 @@ threshold tests against a two-candidate table shortlist, with subblock error
 constants and the flip preselect computed O(1) from quadrant sums. A gated
 base-colour refit and a closed-form least-squares fit of ETC2's planar mode
 (which rescues the smooth gradients ETC1-style blocks band on) complete the
-block, all driven by the same estimates. Two rewrites took the GPU pass
-from 6.0 ms to 0.11 ms at 2048² (55×): the scalar-luma selection rewrite,
-then a bandwidth-first restructure — the encoder is DRAM-bound, so a
-preparation pass splits the source into a packed-luma plane plus half-res
-quadrant averages (2 bytes/pixel, the only data the algorithm reads) and
-the planar mode and base refit were dropped, trading ~1 dB average versus
-the exhaustive reference for a ~1.8× faster pass. It ships as f32 only:
-the estimates are integer-exact sums that overflow f16.
+block, all driven by the same estimates. The rewrite took the GPU pass
+from 6.0 ms to ~0.18 ms at 2048² (33×, within ~0.7 dB of the exhaustive
+search — the base refit and one of the two scored table candidates were
+traded for speed along the way). It ships as f32 only: the estimates are
+integer-exact sums that overflow f16.
 
 On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
 per-block reference encoders (BC5 matches the reference exactly; ASTC and
@@ -352,14 +349,14 @@ end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 | BC7      | f32           | 0.59 ms     |
 | ASTC 4×4 | f16 (default) | **0.26 ms** |
 | ASTC 4×4 | f32           | 0.56 ms     |
-| ETC2     | f32 (only)    | 0.11 ms     |
+| ETC2     | f32 (only)    | 0.18 ms     |
 
 The ETC2 figure is the interleaved `/ab` harness measurement (batched
-dispatches, clock-stable) of the encode pass reading its prepared source —
-the preparation pass costs one extra read of the RGBA8 source and is cached
-per texture, folded into mip-chain encodes. On a 100 GB/s part the
-prepared-source read floor alone is ~0.10 ms, so the entire selection ALU
-adds ~10% on top of touching the bytes.
+dispatches, clock-stable). On a 100 GB/s part just reading the 2048² RGBA8
+source costs ~0.15 ms, so the entire selection ALU adds ~20% on top of
+touching the bytes — a two-pass variant with a 2 B/px prepared source made
+the encode pass itself faster but lost per-texture (the preparation pass is
+also bandwidth-bound and cannot overlap it; see git history).
 
 Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
 timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare
