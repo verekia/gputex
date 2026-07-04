@@ -28,9 +28,8 @@
 //     selection run on D = luma(p) − luma(base) alone (exact modulo decode
 //     clamping): O(1) flip preselect from quadrant variance, subblock-average
 //     bases (differential when the delta fits, else individual), a
-//     hedged O(1) table pick around max|D| (the scored two-candidate
-//     search and the base refit were dropped as speed/quality trades),
-//     and a closed-form planar contest.
+//     two-candidate table search around max|D| (no base refit — dropped
+//     as a speed/quality trade), and a closed-form planar contest.
 //   'high': exhaustive — both flips, BOTH differential (delta clamped into
 //     range) and individual bases, full 8-table × 4-modifier search with
 //     decode-exact clamped errors, up to 4 exact-accepted refit rounds, a
@@ -484,20 +483,6 @@ const B3 = MODIFIERS.map(m => 3 * m[1])
 const THR3 = MODIFIERS.map(m => 1.5 * (m[0] + m[1]))
 const PLANAR_FUDGE = 8
 
-/**
- * Table pick — mirrors etc2.wgsl's table_hedged: the table whose large
- * magnitude covers max|D|, downgraded to its neighbour when the D mass
- * sits well below the extreme (mean-square D under max²/4, with v the
- * luma D-variance about the base).
- */
-function fastTable(D: readonly number[], v: number): number {
-  let mx = 0
-  for (let i = 0; i < D.length; i++) mx = Math.max(mx, Math.abs(D[i]!))
-  let cover = 0
-  while (cover < 7 && B3[cover]! < mx) cover++
-  return cover > 0 && v * 0.25 < mx * mx ? cover - 1 : cover
-}
-
 /** Σ m3·(m3 − 2|D|) for one table over a subblock's D values (×3 scale). */
 function fastTableScore(D: readonly number[], t: number): number {
   let acc = 0
@@ -507,6 +492,19 @@ function fastTableScore(D: readonly number[], t: number): number {
     acc += m3 * (m3 - 2 * ad)
   }
   return acc
+}
+
+/** Two-candidate table search: the table whose large magnitude covers
+ *  max|D| plus its lower neighbour. */
+function fastSearch(D: readonly number[]): { table: number; acc: number } {
+  let mx = 0
+  for (let i = 0; i < D.length; i++) mx = Math.max(mx, Math.abs(D[i]!))
+  let cover = 0
+  while (cover < 7 && B3[cover]! < mx) cover++
+  const tLo = cover === 0 ? 0 : cover - 1
+  const accLo = fastTableScore(D, tLo)
+  const accHi = fastTableScore(D, cover)
+  return accLo <= accHi ? { table: tLo, acc: accLo } : { table: cover, acc: accHi }
 }
 
 /** Wire indices + modifier sum for a chosen table (selection on D only). */
@@ -574,8 +572,8 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
   }
   const evalCodes = (
     flip: number,
-    s0: { sum: number[]; sq: number; lsq: number },
-    s1: { sum: number[]; sq: number; lsq: number },
+    s0: { sum: number[]; sq: number },
+    s1: { sum: number[]; sq: number },
     diff: boolean,
     c: { codes0: number[]; codes1: number[] },
   ): FlipEval => {
@@ -583,32 +581,19 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
     const b1 = decodeBases(c.codes1, diff)
     const lb0 = b0[0]! + b0[1]! + b0[2]!
     const lb1 = b1[0]! + b1[1]! + b1[2]!
-    // Luma D-variance about each base drives the table hedge; the chosen
-    // table is then scored exactly, keeping the estimate exact modulo
-    // decode clamping.
-    const lsum0 = s0.sum[0]! + s0.sum[1]! + s0.sum[2]!
-    const lsum1 = s1.sum[0]! + s1.sum[1]! + s1.sum[2]!
-    const v0 = Math.max(s0.lsq - 2 * lb0 * lsum0 + 8 * lb0 * lb0, 0)
-    const v1 = Math.max(s1.lsq - 2 * lb1 * lsum1 + 8 * lb1 * lb1, 0)
-    const D0 = Dof(SUBBLOCKS[flip]![0]!, lb0)
-    const D1 = Dof(SUBBLOCKS[flip]![1]!, lb1)
-    const t0 = fastTable(D0, v0)
-    const t1 = fastTable(D1, v1)
+    const f0 = fastSearch(Dof(SUBBLOCKS[flip]![0]!, lb0))
+    const f1 = fastSearch(Dof(SUBBLOCKS[flip]![1]!, lb1))
     return {
-      est: constErr(s0, b0) + constErr(s1, b1) + (fastTableScore(D0, t0) + fastTableScore(D1, t1)) / 3,
+      est: constErr(s0, b0) + constErr(s1, b1) + (f0.acc + f1.acc) / 3,
       diff,
       codes: c,
-      t0,
-      t1,
+      t0: f0.table,
+      t1: f1.table,
       lb0,
       lb1,
     }
   }
-  const evalFlip = (
-    flip: number,
-    s0: { sum: number[]; sq: number; lsq: number },
-    s1: { sum: number[]; sq: number; lsq: number },
-  ): FlipEval => {
+  const evalFlip = (flip: number, s0: { sum: number[]; sq: number }, s1: { sum: number[]; sq: number }): FlipEval => {
     const avg0 = s0.sum.map(v => v / 8)
     const avg1 = s1.sum.map(v => v / 8)
     const tryDiff = quantiseBases(avg0, avg1, true, false)

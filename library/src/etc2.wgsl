@@ -3,49 +3,61 @@
 // Each invocation encodes one 4x4 pixel block into an 8-byte ETC2 RGB8 block
 // written as 2 x u32 into the destination storage buffer. ETC2 blocks are
 // big-endian on the wire (byte 0 = bits 63..56), so both words are byte-
-// swapped on the way out. f32 only — there is no f16 module (the estimates
-// are integer-exact sums that overflow f16, and the pass is read-bound).
+// swapped on the way out. The f16 module (etc2_fast_f16.wgsl) is an
+// EXACT-VALUE port — byte-identical output; see its header.
 //
-// ALGORITHM — scalar-luma selection (2026-07; brute force measured 6.0 ms
-// @2048² on Apple/metal-3, this shader ~0.18 ms with the DRAM read floor
-// at ~0.15):
+// ALGORITHM — scalar-luma selection (2026-07 rewrite; the original
+// brute-force 8-table × 4-modifier × vec3-with-clamp search measured
+// 6.0 ms @2048² on Apple/metal-3, this one ~0.197 ms with the DRAM read
+// floor — 16 loads + store, nothing else — at ~0.15). This is the SETTLED
+// speed/quality point: the two-candidate scored search below was once
+// swapped for an O(1) hedged pick (−4-7% GPU) but cost −0.5 dB average —
+// a ~10× worse dB-per-percent trade than the refit drop — and was
+// restored. A two-pass prepared-source variant (encode pass 0.115 ms) is
+// in git history: its prep pass is also DRAM-bound and cannot overlap,
+// so the per-texture total regressed. Reading the full RGBA8 source once
+// is this machine's hard floor for any single-pass encoder; the ~0.045
+// above it is the whole algorithm.
 //
 //   • The ETC1 modifier is a SCALAR shift along (1,1,1), so per texel
-//     err(m) = ‖e‖² − 2mD + 3m² with D = luma(p) − luma(base), where
+//     err(m) = ||e||² − 2mD + 3m² with D = luma(p) − luma(base), where
 //     luma(x) = x.r+x.g+x.b. Selection therefore needs only |D| threshold
-//     tests (A3/B3/THR are 3× the modifier magnitudes; THR = 1.5(a+b)),
-//     and Σ‖e‖² per subblock is O(1) from the load loop's quadrant sums.
+//     tests: the best table entry is the m with 3m nearest D (A3/B3/THR
+//     below), and Σ||e||² per subblock is O(1) from the load loop's
+//     quadrant sums (Σ||p||² − 2·base·Σp + 8·||base||²). This estimate is
+//     EXACT for unclamped decode and an UPPER BOUND on the true clamped
+//     error (clamping toward [0,255] can only shrink per-channel error),
+//     so every est-based gate is conservative.
 //   • Flip preselect, O(1): per subblock the residual after PERFECT
 //     continuous luma modulation is within-variance − (luma variance)/3;
 //     the flip with the smaller summed residual wins and only it is
-//     evaluated. Exact-grayscale blocks tie at zero, so near-ties evaluate
-//     both flips (worth ~1.25 dB on roughness/AO-style content).
-//   • Table pick: one 8-texel max pass per subblock gives the table whose
-//     large magnitude covers max|D|, downgraded to its neighbour when the D
-//     mass sits well below the extreme (mean-square D < max²/4, from the
-//     O(1) luma D-variance). The chosen table is then scored EXACTLY in a
-//     single pass — replacing the old two-candidate scored search: one
-//     score pass saved, and the hedge decides between the same two
-//     candidates it used to score. The exact score matters: a variance
-//     proxy for it mis-prices perfectly representable blocks and hands
-//     them to planar.
-//   • NO base refit (its ~0.2 dB cost 13-30% GPU — dropped earlier).
+//     searched (both-flip est search measured +23% GPU for ≤0.15 dB).
+//     Exact-grayscale blocks have BOTH residuals identically zero (all
+//     variance is along luma), so near-ties fall back to scoring both
+//     flips — without that, roughness/AO-style content loses ~1.25 dB.
+//   • Table search is pruned to two candidates — the table whose LARGE
+//     magnitude covers max|D| and its lower neighbour (outlier hedge).
+//     One candidate loses ~1.2-1.6 dB on photos; all eight gain ≤0.05 dB.
+//   • NO base refit. The refit family (base ← subblock mean − mean chosen
+//     modifier) was worth ~0.2 dB on photographic colour (rock-color
+//     33.98 → 33.79 without it) but even its cheapest accepted form cost
+//     ~13% GPU and the exact-accept original ~30% — dropped 2026-07 as a
+//     deliberate speed/quality trade; see the suite baselines.
 //   • PLANAR runs unconditionally: with the right-hand sides folded into
-//     the load loop the LSQ solve is O(1) (constant Gram inverse, det 25)
-//     and its residual is the closed-form Σ‖p‖² − 2·θ·rhs + θᵀGθ with the
-//     QUANTISED, clamped corners — clamp-aware, which the contest needs.
-//   • T and H modes are decoded by hardware but never emitted.
-//
-// A two-pass variant (prepared 2 B/px split source, etc2_prep.wgsl in git
-// history) made the encode pass ~0.115 ms but the preparation pass is also
-// DRAM-bound and cannot overlap it, so the per-texture total regressed to
-// ~0.30 ms — reverted. Reading the full RGBA8 source once (~0.15 ms of
-// bandwidth at 2048² on a 100 GB/s part) is this machine's hard floor for
-// any single-pass encoder.
+//     the load loop the LSQ solve is O(1) (the Gram inverse of the fixed
+//     sample positions is a constant, det = 25) and its residual is the
+//     closed-form Σ||p||² − 2·θ·rhs + θᵀGθ evaluated with the QUANTISED,
+//     clamped corners — exact up to decode's floor-rounding, and crucially
+//     clamp-aware (a continuous-corner estimate mis-picks planar on steep
+//     gradients). Gating planar cost −0.31 dB on smooth content for zero
+//     measured speed.
+//   • T and H modes are decoded by hardware but never emitted — their win
+//     is limited to two-chroma-cluster blocks (the colour card's per-pixel
+//     chroma checkers are the visible gap) and needs a clustering pass.
 //
 // Numeric notes: texel loads use round(load·255) (integer-exact unorm trip);
 // every m3 in A3/B3 is divisible by 3 so m = m3/3 is exact; est values are
-// integer sums held exactly in f32 (< 2^24) apart from the κ·v/3 credit.
+// integer sums held exactly in f32 (< 2^24).
 
 struct Params {
   blocks_x: u32,
@@ -120,28 +132,10 @@ fn quantise_bases(avg0: vec3<f32>, avg1: vec3<f32>, diff: bool, clamp_delta: boo
   return out;
 }
 
-// Table pick: ONE max pass, then the table whose large magnitude covers
-// max|D|, downgraded to its neighbour when the D mass sits well below the
-// extreme (mean-square D under max²/4, v = luma D-variance about the
-// base). Replaces the two-candidate scored search: one of its two score
-// passes is saved, and the remaining one scores only the chosen table —
-// keeping the estimate EXACT (a v-variance proxy mis-prices perfectly
-// representable blocks and hands them to planar).
-fn sb_maxad(luma: ptr<function, array<f32, 16>>, flip: u32, sb: u32, lb: f32) -> f32 {
-  var mx = 0.0;
-  for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-    mx = max(mx, abs((*luma)[texel_of(flip, sb, i)] - lb));
-  }
-  return mx;
-}
-fn table_hedged(mx: f32, v: f32) -> u32 {
-  let cover = min(
-    u32(mx > 24.0) + u32(mx > 51.0) + u32(mx > 87.0) + u32(mx > 126.0) +
-    u32(mx > 180.0) + u32(mx > 240.0) + u32(mx > 318.0),
-    7u,
-  );
-  return select(cover, cover - 1u, cover > 0u && v * 0.25 < mx * mx);
-}
+struct SearchOut {
+  table: u32,
+  acc: f32,
+};
 fn sb_table_score(luma: ptr<function, array<f32, 16>>, flip: u32, sb: u32, lb: f32, t: u32) -> f32 {
   let a3 = A3[t];
   let b3 = B3[t];
@@ -153,6 +147,25 @@ fn sb_table_score(luma: ptr<function, array<f32, 16>>, flip: u32, sb: u32, lb: f
     acc = acc + m3 * (m3 - 2.0 * ad);
   }
   return acc;
+}
+fn sb_search(luma: ptr<function, array<f32, 16>>, flip: u32, sb: u32, lb: f32) -> SearchOut {
+  var mx = 0.0;
+  for (var i: u32 = 0u; i < 8u; i = i + 1u) {
+    mx = max(mx, abs((*luma)[texel_of(flip, sb, i)] - lb));
+  }
+  let cover = min(
+    u32(mx > 24.0) + u32(mx > 51.0) + u32(mx > 87.0) + u32(mx > 126.0) +
+    u32(mx > 180.0) + u32(mx > 240.0) + u32(mx > 318.0),
+    7u,
+  );
+  let t_lo = select(cover - 1u, 0u, cover == 0u);
+  let acc_lo = sb_table_score(luma, flip, sb, lb, t_lo);
+  let acc_hi = sb_table_score(luma, flip, sb, lb, cover);
+  var out: SearchOut;
+  let lo_wins = acc_lo <= acc_hi;
+  out.table = select(cover, t_lo, lo_wins);
+  out.acc = select(acc_hi, acc_lo, lo_wins);
+  return out;
 }
 
 // One flip's base quantisation + table search: everything the flip contest
@@ -171,10 +184,8 @@ fn eval_flip(
   flip: u32,
   sum0: vec3<f32>,
   sq0: f32,
-  lsq0: f32,
   sum1: vec3<f32>,
   sq1: f32,
-  lsq1: f32,
 ) -> FlipFit {
   let avg0 = sum0 * 0.125;
   let avg1 = sum1 * 0.125;
@@ -197,17 +208,13 @@ fn eval_flip(
   }
   out.lb0 = b0.r + b0.g + b0.b;
   out.lb1 = b1.r + b1.g + b1.b;
-  // Luma D-variance about each base drives the table hedge; the chosen
-  // table is then scored exactly (Σ m3(m3 − 2|D|), negative when the
-  // modifiers absorb energy), keeping the estimate exact modulo clamping.
-  let v0 = max(lsq0 - 2.0 * out.lb0 * dot(sum0, vec3<f32>(1.0)) + 8.0 * out.lb0 * out.lb0, 0.0);
-  let v1 = max(lsq1 - 2.0 * out.lb1 * dot(sum1, vec3<f32>(1.0)) + 8.0 * out.lb1 * out.lb1, 0.0);
-  out.t0 = table_hedged(sb_maxad(luma, flip, 0u, out.lb0), v0);
-  out.t1 = table_hedged(sb_maxad(luma, flip, 1u, out.lb1), v1);
+  let s0 = sb_search(luma, flip, 0u, out.lb0);
+  let s1 = sb_search(luma, flip, 1u, out.lb1);
+  out.t0 = s0.table;
+  out.t1 = s1.table;
   out.est = (sq0 - 2.0 * dot(b0, sum0) + 8.0 * dot(b0, b0)) +
             (sq1 - 2.0 * dot(b1, sum1) + 8.0 * dot(b1, b1)) +
-            (sb_table_score(luma, flip, 0u, out.lb0, out.t0) +
-             sb_table_score(luma, flip, 1u, out.lb1, out.t1)) * (1.0 / 3.0);
+            (s0.acc + s1.acc) * (1.0 / 3.0);
   return out;
 }
 
@@ -301,10 +308,8 @@ fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
       f,
       select(sum0a, sum0b, f == 1u),
       select(sq0a, sq0b, f == 1u),
-      select(lsq0a, lsq0b, f == 1u),
       select(sum1a, sum1b, f == 1u),
       select(sq1a, sq1b, f == 1u),
-      select(lsq1a, lsq1b, f == 1u),
     );
     if (attempt == 0u || cand.est < sel.est) {
       sel = cand;

@@ -158,19 +158,19 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 49.45,
-  // ETC2 (2026-07, f32-only, minus ~0.15 dB; re-pinned three times — for
-  // the scalar-luma fast shader, the refit drop, and the hedged table pick
-  // that replaced the two-candidate scored search: one score pass saved
-  // for ~-0.5 dB average, settled as the speed/quality point after the
-  // two-pass prepared-source experiment lost per-texture). The low
-  // 'color'-card number is the format, not the encoder: ETC1-family blocks
-  // modulate only luma per pixel, so the card's per-pixel chroma checkers
-  // crater without the unimplemented T/H modes.
-  'etc2:color': 19.03,
-  'etc2:packed-1024': 31.84,
-  'etc2:rock-color-1k': 33.41,
-  'etc2:rock-roughness-1k': 39.44,
-  'etc2:wood-color-1k': 38.31,
+  // ETC2 (2026-07, minus ~0.15 dB; SETTLED at the two-candidate scored
+  // search + planar + no refit — the hedged O(1) table pick saved ~3% GPU
+  // for −0.5 dB and was reverted, the two-pass prepared source lost
+  // per-texture; both live in git history. f16 and f32 modules are
+  // byte-identical (exact-value f16), so both rows share these pins. The
+  // low 'color'-card number is the format, not the encoder: ETC1-family
+  // blocks modulate only luma per pixel, so the card's per-pixel chroma
+  // checkers crater without the unimplemented T/H modes.
+  'etc2:color': 19.82,
+  'etc2:packed-1024': 31.86,
+  'etc2:rock-color-1k': 33.64,
+  'etc2:rock-roughness-1k': 39.99,
+  'etc2:wood-color-1k': 39.06,
   'bc5:wood-normal-1k': 47.8,
   'bc1:wood-roughness-1k': 40.4,
   'bc1:wood-displacement-1k': 43.1,
@@ -228,15 +228,13 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc1:wood-color-1k': 0.05,
   'bc7:wood-color-1k': 0.05,
   'astc:wood-color-1k': 0.05,
-  // ETC2 (2026-07 hedged-table shader, observed 1.54 / 0.029 / 0.206 /
-  // 0.038 / 0.049) — the hedge trails the exhaustive reference more per
-  // block than a scored search did; the color-card figure is dominated by
-  // smooth tiles where the estimate-driven mode contest differs from
-  // 'high'. Limits catch catastrophic wrong-colour-tile regressions.
-  'etc2:color': 2.0,
-  'etc2:packed-1024': 0.06,
-  'etc2:rock-color-1k': 0.3,
-  'etc2:rock-roughness-1k': 0.08,
+  // ETC2 (2026-07 scored-search shader, observed 0.291 / 0.029 / 0.112 /
+  // 0.023 / 0.038 — estimate-based selection trails the exact reference a
+  // little more per block than the other formats' exact searches do).
+  'etc2:color': 0.45,
+  'etc2:packed-1024': 0.05,
+  'etc2:rock-color-1k': 0.2,
+  'etc2:rock-roughness-1k': 0.05,
   'etc2:wood-color-1k': 0.08,
   'bc5:wood-normal-1k': 0.05,
   'bc1:wood-roughness-1k': 0.1,

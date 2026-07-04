@@ -103,13 +103,13 @@ constants and the flip preselect computed O(1) from quadrant sums. A gated
 base-colour refit and a closed-form least-squares fit of ETC2's planar mode
 (which rescues the smooth gradients ETC1-style blocks band on) complete the
 block, all driven by the same estimates. The rewrite took the GPU pass
-from 6.0 ms to ~0.18 ms at 2048² (33×, within ~0.7 dB of the exhaustive
-search — the base refit and one of the two scored table candidates were
-traded for speed along the way). Its f16 module is EXACT-VALUE: lumas, D
-values and thresholds are integers f16 represents exactly, while the
-sums-of-squares estimates stay f32 (they overflow f16), so the two
-modules produce byte-identical output — f16 buys register pressure on
-mobile GPUs, not different results.
+from 6.0 ms to ~0.2 ms at 2048² (30×, within ~0.2 dB of the exhaustive
+search on photographic content — only the base refit was traded for
+speed). Its f16 module is EXACT-VALUE: lumas, D values and thresholds
+are integers f16 represents exactly, while the sums-of-squares estimates
+stay f32 (they overflow f16), so the two modules produce byte-identical
+output — f16 buys register pressure on mobile GPUs, not different
+results.
 
 On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
 per-block reference encoders (BC5 matches the reference exactly; ASTC and
@@ -352,14 +352,16 @@ end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 | BC7      | f32           | 0.59 ms     |
 | ASTC 4×4 | f16 (default) | **0.26 ms** |
 | ASTC 4×4 | f32           | 0.56 ms     |
-| ETC2     | f16 + f32     | 0.18 ms     |
+| ETC2     | f16 + f32     | 0.20 ms     |
 
 The ETC2 figure is the interleaved `/ab` harness measurement (batched
 dispatches, clock-stable). On a 100 GB/s part just reading the 2048² RGBA8
-source costs ~0.15 ms, so the entire selection ALU adds ~20% on top of
-touching the bytes — a two-pass variant with a 2 B/px prepared source made
-the encode pass itself faster but lost per-texture (the preparation pass is
-also bandwidth-bound and cannot overlap it; see git history).
+source costs ~0.15 ms, so the entire selection algorithm adds ~30% on top
+of touching the bytes. Two faster variants live in git history and were
+deliberately not shipped: a two-pass 2 B/px prepared source (encode pass
+0.115 ms, but the prep pass is also bandwidth-bound and cannot overlap, so
+the per-texture total regressed) and an O(1) hedged table pick (−3% for
+−0.5 dB — a poor trade against the scored search).
 
 Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
 timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare
