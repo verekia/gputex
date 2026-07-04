@@ -192,6 +192,9 @@ export abstract class Encoder {
   // follows construction (image decode, first upload) instead of stalling
   // the first dispatch; encodes await readiness.
   protected _pipelineReady!: Promise<GPUComputePipeline>
+  // Source-preparation pipeline, when the subclass declares one (ETC2's
+  // packed-luma + quadrant-average split). Null for direct-source encoders.
+  protected _prepPipelineReady: Promise<GPUComputePipeline> | null = null
 
   // -------------------------------------------------------------------- //
   // Per-encoder GPU resource cache. Creating the source texture, output/
@@ -219,6 +222,8 @@ export abstract class Encoder {
   private _cachedParams: GPUBuffer | null = null
   private _lastParams: [number, number, number, number] | null = null
   private _cachedBindGroup: GPUBindGroup | null = null
+  private _cachedPrepPlanes: GPUTexture[] | null = null
+  private _cachedPrepBindGroup: GPUBindGroup | null = null
   private _resourcesBusy = false
   /** Set when the active shader declares a @binding(3) sampler (the BC5
    * kernels read texels through textureGather + clamp-to-edge). */
@@ -233,6 +238,8 @@ export abstract class Encoder {
   // same-sized textures through `compressTexture()`).
   private _chainSig: string | null = null
   private _chainTextures: GPUTexture[] = []
+  private _chainPrepPlanes: GPUTexture[][] = []
+  private _chainPrepBindGroups: GPUBindGroup[] = []
   private _chainParams: GPUBuffer | null = null
   private _chainBindGroups: GPUBindGroup[] = []
   private _chainDst: GPUBuffer | null = null
@@ -263,6 +270,16 @@ export abstract class Encoder {
       layout: 'auto',
       compute: { module, entryPoint: 'encode', ...(constants ? { constants } : {}) },
     })
+    const prepCode = this.wgslPrepSource()
+    if (prepCode) {
+      const prepModule = device.createShaderModule({ label: `${this.label}-prep`, code: prepCode })
+      this._prepPipelineReady = device.createComputePipelineAsync({
+        label: `${this.label}-prep-pipeline`,
+        layout: 'auto',
+        compute: { module: prepModule, entryPoint: 'encode' },
+      })
+      this._prepPipelineReady.catch(() => {})
+    }
     // An encoder may be constructed and never used, or rebuilt before first
     // use (BC7's adaptiveMode4 constructor path) — don't let an orphaned
     // promise surface as an unhandled rejection. Encodes await the live
@@ -272,6 +289,9 @@ export abstract class Encoder {
 
   destroy(): void {
     this._cachedSrcTex?.destroy()
+    if (this._cachedPrepPlanes) for (const t of this._cachedPrepPlanes) t.destroy()
+    this._cachedPrepPlanes = null
+    this._cachedPrepBindGroup = null
     this._cachedDst?.destroy()
     this._cachedStaging?.destroy()
     this._cachedParams?.destroy()
@@ -283,6 +303,9 @@ export abstract class Encoder {
     this._cachedBindGroup = null
     for (const tex of this._chainTextures) tex.destroy()
     this._chainTextures = []
+    for (const planes of this._chainPrepPlanes) for (const t of planes) t.destroy()
+    this._chainPrepPlanes = []
+    this._chainPrepBindGroups = []
     this._chainParams?.destroy()
     this._chainDst?.destroy()
     this._chainStaging?.destroy()
@@ -341,6 +364,68 @@ export abstract class Encoder {
   /** WGSL compute-shader source (f32; the fallback when f16 is unavailable). */
   abstract wgslSource(): string
 
+  // ------------------------------------------------------------------ //
+  // Optional source-preparation pass (null/empty for direct encoders). //
+  // A subclass returning a prep shader gets a two-pass encode: the prep
+  // pass reads the RGBA8 source (binding 0) and writes the prepared
+  // planes as storage textures (plane 0 at binding 1, plane 1 at
+  // binding 3, params at binding 2); the encode pass then reads plane 0
+  // at binding 0 and plane 1 at binding 3 instead of the source.
+  // ------------------------------------------------------------------ //
+
+  /** WGSL for the preparation pass, or null when the encoder reads the
+   *  RGBA8 source directly. */
+  protected wgslPrepSource(): string | null {
+    return null
+  }
+
+  /** Formats and sizes of the prepared planes for a padded source size. */
+  protected prepPlanes(
+    paddedWidth: number,
+    paddedHeight: number,
+  ): { format: GPUTextureFormat; width: number; height: number }[] {
+    void paddedWidth
+    void paddedHeight
+    return []
+  }
+
+  /** Workgroup counts for the prep dispatch. */
+  protected prepDispatch(blocksX: number, blocksY: number): [number, number] {
+    return [blocksX, blocksY]
+  }
+
+  /** Create the prepared-plane textures for one padded source size. */
+  private _createPrepPlanes(paddedWidth: number, paddedHeight: number): GPUTexture[] {
+    return this.prepPlanes(paddedWidth, paddedHeight).map((p, i) =>
+      this.device.createTexture({
+        label: `${this.label}-prep-${i}`,
+        size: [p.width, p.height, 1],
+        format: p.format,
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+      }),
+    )
+  }
+
+  /** Bind group for one prep dispatch. */
+  private _createPrepBindGroup(
+    prepPipeline: GPUComputePipeline,
+    srcView: GPUTextureView,
+    planes: readonly GPUTexture[],
+    params: GPUBuffer,
+    paramsOffset = 0,
+  ): GPUBindGroup {
+    return this.device.createBindGroup({
+      label: `${this.label}-prep-bg`,
+      layout: prepPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: srcView },
+        { binding: 1, resource: planes[0]!.createView() },
+        { binding: 2, resource: { buffer: params, offset: paramsOffset, size: 16 } },
+        { binding: 3, resource: planes[1]!.createView() },
+      ],
+    })
+  }
+
   /** e.g. 'bc1-rgba-unorm-srgb'. */
   abstract gpuTextureFormat(opts: FormatVariant): GPUTextureFormat
 
@@ -391,6 +476,7 @@ export abstract class Encoder {
     // Resolves instantly after the first encode; only the first one can
     // actually wait on shader compilation.
     const pipeline = await this._pipelineReady
+    const prepPipeline = this._prepPipelineReady ? await this._prepPipelineReady : null
 
     // Acquire GPU resources — from the per-encoder cache when it's free (the
     // common sequential case), transiently when another encode on this
@@ -402,6 +488,7 @@ export abstract class Encoder {
     let dstBuffer: GPUBuffer | undefined
     let paramsBuffer: GPUBuffer | undefined
     let staging: GPUBuffer | undefined
+    let transientPrepPlanes: GPUTexture[] | null = null
 
     try {
       // 1. Source texture sized to the padded block grid. Reused while the
@@ -424,6 +511,24 @@ export abstract class Encoder {
           this._cachedSrcTex = srcTex
           this._cachedSrcW = paddedWidth
           this._cachedSrcH = paddedHeight
+        }
+      }
+      // Prepared planes track the source texture's size exactly.
+      let prepPlanes: GPUTexture[] | null = null
+      let prepPlanesNew = false
+      if (prepPipeline) {
+        if (useCache && !srcTexIsNew && this._cachedPrepPlanes) {
+          prepPlanes = this._cachedPrepPlanes
+        } else {
+          prepPlanes = this._createPrepPlanes(paddedWidth, paddedHeight)
+          prepPlanesNew = true
+          if (useCache) {
+            if (this._cachedPrepPlanes) for (const t of this._cachedPrepPlanes) t.destroy()
+            this._cachedPrepPlanes = prepPlanes
+            this._cachedPrepBindGroup = null
+          } else {
+            transientPrepPlanes = prepPlanes
+          }
         }
       }
       const uploadSkippable =
@@ -500,16 +605,20 @@ export abstract class Encoder {
         device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
       }
 
-      // 4. Bind group, kept until a bound resource is recreated.
-      if (useCache && (srcTexIsNew || dstIsNew)) this._cachedBindGroup = null
+      // 4. Bind groups, kept until a bound resource is recreated. With a
+      //    prep pass the encode pass reads the prepared planes; without one
+      //    it reads the source texture directly.
+      if (useCache && (srcTexIsNew || dstIsNew || prepPlanesNew)) this._cachedBindGroup = null
       let bindGroup = useCache ? this._cachedBindGroup : null
       if (!bindGroup) {
         const entries: GPUBindGroupEntry[] = [
-          { binding: 0, resource: srcTex.createView() },
+          { binding: 0, resource: prepPlanes ? prepPlanes[0]!.createView() : srcTex.createView() },
           { binding: 1, resource: { buffer: dstBuffer } },
           { binding: 2, resource: { buffer: paramsBuffer } },
         ]
-        if (this._usesSampler) {
+        if (prepPlanes) {
+          entries.push({ binding: 3, resource: prepPlanes[1]!.createView() })
+        } else if (this._usesSampler) {
           this._sampler ??= device.createSampler({
             label: `${this.label}-clamp-sampler`,
             addressModeU: 'clamp-to-edge',
@@ -524,6 +633,11 @@ export abstract class Encoder {
         })
         if (useCache) this._cachedBindGroup = bindGroup
       }
+      let prepBindGroup = useCache && !prepPlanesNew && !srcTexIsNew ? this._cachedPrepBindGroup : null
+      if (prepPipeline && prepPlanes && !prepBindGroup) {
+        prepBindGroup = this._createPrepBindGroup(prepPipeline, srcTex.createView(), prepPlanes, paramsBuffer)
+        if (useCache) this._cachedPrepBindGroup = prepBindGroup
+      }
 
       // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When
       //    asked (and the device has 'timestamp-query'), bracket the pass
@@ -533,12 +647,24 @@ export abstract class Encoder {
       const [wgX, wgY] = this.workgroupSize
       const t0 = performance.now()
       const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
+      // The prep pass writes storage textures the encode pass samples, so
+      // they cannot share a compute pass; timestamps span both.
+      if (prepPipeline && prepBindGroup) {
+        const prepPass = enc.beginComputePass(
+          timing ? { timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: 0 } } : undefined,
+        )
+        prepPass.setPipeline(prepPipeline)
+        prepPass.setBindGroup(0, prepBindGroup)
+        const [px, py] = this.prepDispatch(blocksX, blocksY)
+        prepPass.dispatchWorkgroups(Math.ceil(px / wgX), Math.ceil(py / wgY), 1)
+        prepPass.end()
+      }
       const pass = enc.beginComputePass(
         timing
           ? {
               timestampWrites: {
                 querySet: timing.querySet,
-                beginningOfPassWriteIndex: 0,
+                ...(prepPipeline ? {} : { beginningOfPassWriteIndex: 0 }),
                 endOfPassWriteIndex: 1,
               },
             }
@@ -578,6 +704,7 @@ export abstract class Encoder {
         dstBuffer?.destroy()
         staging?.destroy()
         paramsBuffer?.destroy()
+        if (transientPrepPlanes) for (const t of transientPrepPlanes) t.destroy()
       }
     }
   }
@@ -611,6 +738,7 @@ export abstract class Encoder {
       throw new Error(`${this.label}Encoder: encodeMipChainToBytes needs at least one level`)
     }
     const pipeline = await this._pipelineReady
+    const prepPipeline = this._prepPipelineReady ? await this._prepPipelineReady : null
     const t0 = performance.now()
 
     levels.forEach((level, i) => {
@@ -631,6 +759,8 @@ export abstract class Encoder {
     if (useCache) this._chainBusy = true
 
     let textures: GPUTexture[] | undefined
+    let prepPlaneSets: GPUTexture[][] | undefined
+    let prepBindGroups: GPUBindGroup[] | undefined
     let params: GPUBuffer | undefined
     let bindGroups: GPUBindGroup[] | undefined
     let dst: GPUBuffer | undefined
@@ -665,6 +795,8 @@ export abstract class Encoder {
         textures = this._chainTextures
         params = this._chainParams
         bindGroups = this._chainBindGroups
+        prepPlaneSets = this._chainPrepPlanes
+        prepBindGroups = this._chainPrepBindGroups
       } else {
         const texs = geoms.map((g, i) =>
           device.createTexture({
@@ -700,13 +832,27 @@ export abstract class Encoder {
         }
         const dstBuf = dst
         const paramsBuf = params
+        const planeSets = prepPipeline ? geoms.map(g => this._createPrepPlanes(g.paddedWidth, g.paddedHeight)) : []
+        prepPlaneSets = planeSets
+        prepBindGroups = prepPipeline
+          ? geoms.map((g, i) =>
+              this._createPrepBindGroup(prepPipeline, texs[i]!.createView(), planeSets[i]!, paramsBuf, i * CHAIN_ALIGN),
+            )
+          : []
         bindGroups = geoms.map((g, i) => {
           const entries: GPUBindGroupEntry[] = [
-            { binding: 0, resource: texs[i]!.createView() },
+            {
+              binding: 0,
+              resource: prepPipeline ? planeSets[i]![0]!.createView() : texs[i]!.createView(),
+            },
             { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
             { binding: 2, resource: { buffer: paramsBuf, offset: i * CHAIN_ALIGN, size: 16 } },
           ]
-          if (this._usesSampler) entries.push({ binding: 3, resource: this._sampler! })
+          if (prepPipeline) {
+            entries.push({ binding: 3, resource: planeSets[i]![1]!.createView() })
+          } else if (this._usesSampler) {
+            entries.push({ binding: 3, resource: this._sampler! })
+          }
           return device.createBindGroup({
             label: `${this.label}-chain-bg-${i}`,
             layout: pipeline.getBindGroupLayout(0),
@@ -716,8 +862,11 @@ export abstract class Encoder {
 
         if (useCache) {
           for (const tex of this._chainTextures) tex.destroy()
+          for (const planes of this._chainPrepPlanes) for (const t of planes) t.destroy()
           this._chainParams?.destroy()
           this._chainTextures = textures
+          this._chainPrepPlanes = planeSets
+          this._chainPrepBindGroups = prepBindGroups
           this._chainParams = params
           this._chainBindGroups = bindGroups
           this._chainSig = sig
@@ -751,8 +900,19 @@ export abstract class Encoder {
         ])
       }
 
-      // One compute pass, one dispatch per level, one submit, one readback.
-      return await this._submitChainAndRead(pipeline, geoms, byteSpan, bindGroups, dst, staging, withGpuTime, t0)
+      // One submission: a prep pass (when the encoder has one), the encode
+      // pass with one dispatch per level, one readback.
+      return await this._submitChainAndRead(
+        pipeline,
+        geoms,
+        byteSpan,
+        bindGroups,
+        dst,
+        staging,
+        withGpuTime,
+        t0,
+        prepPipeline && prepBindGroups ? { pipeline: prepPipeline, bindGroups: prepBindGroups } : null,
+      )
     } finally {
       if (useCache) {
         this._chainBusy = false
@@ -762,6 +922,7 @@ export abstract class Encoder {
       }
       if (transientLevelSet) {
         if (textures) for (const tex of textures) tex.destroy()
+        if (prepPlaneSets) for (const planes of prepPlaneSets) for (const t of planes) t.destroy()
         params?.destroy()
       }
     }
@@ -786,6 +947,7 @@ export abstract class Encoder {
   ): Promise<EncodeMipChainResult> {
     const device = this.device
     const pipeline = await this._pipelineReady
+    const prepPipeline = this._prepPipelineReady ? await this._prepPipelineReady : null
     const t0 = performance.now()
 
     const dims: { width: number; height: number }[] = []
@@ -800,6 +962,7 @@ export abstract class Encoder {
     let dst: GPUBuffer | undefined
     let staging: GPUBuffer | undefined
     let params: GPUBuffer | undefined
+    let planeSets: GPUTexture[][] | null = null
     try {
       // Grow-only dst/staging, shared with encodeMipChainToBytes()'s cache
       // slots. Recreating dst invalidates that path's cached bind groups
@@ -854,13 +1017,34 @@ export abstract class Encoder {
       }
       const dstBuf = dst
       const paramsBuf = params
+      planeSets = prepPipeline ? geoms.map(g => this._createPrepPlanes(g.paddedWidth, g.paddedHeight)) : null
+      const planes = planeSets
+      const prepBindGroups =
+        prepPipeline && planes
+          ? geoms.map((_, i) =>
+              this._createPrepBindGroup(
+                prepPipeline,
+                srcTex.createView({ baseMipLevel: i, mipLevelCount: 1 }),
+                planes[i]!,
+                paramsBuf,
+                i * CHAIN_ALIGN,
+              ),
+            )
+          : null
       const bindGroups = geoms.map((g, i) => {
         const entries: GPUBindGroupEntry[] = [
-          { binding: 0, resource: srcTex.createView({ baseMipLevel: i, mipLevelCount: 1 }) },
+          {
+            binding: 0,
+            resource: planes ? planes[i]![0]!.createView() : srcTex.createView({ baseMipLevel: i, mipLevelCount: 1 }),
+          },
           { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
           { binding: 2, resource: { buffer: paramsBuf, offset: i * CHAIN_ALIGN, size: 16 } },
         ]
-        if (this._usesSampler) entries.push({ binding: 3, resource: this._sampler! })
+        if (planes) {
+          entries.push({ binding: 3, resource: planes[i]![1]!.createView() })
+        } else if (this._usesSampler) {
+          entries.push({ binding: 3, resource: this._sampler! })
+        }
         return device.createBindGroup({
           label: `${this.label}-chain-bg-${i}`,
           layout: pipeline.getBindGroupLayout(0),
@@ -868,7 +1052,17 @@ export abstract class Encoder {
         })
       })
 
-      return await this._submitChainAndRead(pipeline, geoms, byteSpan, bindGroups, dst, staging, withGpuTime, t0)
+      return await this._submitChainAndRead(
+        pipeline,
+        geoms,
+        byteSpan,
+        bindGroups,
+        dst,
+        staging,
+        withGpuTime,
+        t0,
+        prepPipeline && prepBindGroups ? { pipeline: prepPipeline, bindGroups: prepBindGroups } : null,
+      )
     } finally {
       if (useCache) {
         this._chainBusy = false
@@ -877,8 +1071,9 @@ export abstract class Encoder {
         staging?.destroy()
       }
       // Safe immediately after submit: destruction is deferred until the
-      // GPU is done with the buffer.
+      // GPU is done with the buffer/textures.
       params?.destroy()
+      if (planeSets) for (const planes of planeSets) for (const t of planes) t.destroy()
     }
   }
 
@@ -916,17 +1111,32 @@ export abstract class Encoder {
     staging: GPUBuffer,
     withGpuTime: boolean,
     t0: number,
+    prep: { pipeline: GPUComputePipeline; bindGroups: readonly GPUBindGroup[] } | null = null,
   ): Promise<EncodeMipChainResult> {
     const device = this.device
     const timing = withGpuTime ? this._createTiming() : null
     const [wgX, wgY] = this.workgroupSize
     const enc = device.createCommandEncoder({ label: `${this.label}-encode-chain` })
+    // Prep writes storage textures the encode pass samples — separate passes.
+    if (prep) {
+      const prepPass = enc.beginComputePass(
+        timing ? { timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: 0 } } : undefined,
+      )
+      prepPass.setPipeline(prep.pipeline)
+      for (let i = 0; i < geoms.length; i++) {
+        const g = geoms[i]!
+        prepPass.setBindGroup(0, prep.bindGroups[i]!)
+        const [px, py] = this.prepDispatch(g.blocksX, g.blocksY)
+        prepPass.dispatchWorkgroups(Math.ceil(px / wgX), Math.ceil(py / wgY), 1)
+      }
+      prepPass.end()
+    }
     const pass = enc.beginComputePass(
       timing
         ? {
             timestampWrites: {
               querySet: timing.querySet,
-              beginningOfPassWriteIndex: 0,
+              ...(prep ? {} : { beginningOfPassWriteIndex: 0 }),
               endOfPassWriteIndex: 1,
             },
           }

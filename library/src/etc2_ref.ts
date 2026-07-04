@@ -481,31 +481,6 @@ function packPlanar(cand: PlanarCandidate): ETC2Block {
 const A3 = MODIFIERS.map(m => 3 * m[0])
 const B3 = MODIFIERS.map(m => 3 * m[1])
 const THR3 = MODIFIERS.map(m => 1.5 * (m[0] + m[1]))
-const PLANAR_FUDGE = 8
-
-/** Σ m3·(m3 − 2|D|) for one table over a subblock's D values (×3 scale). */
-function fastTableScore(D: readonly number[], t: number): number {
-  let acc = 0
-  for (let i = 0; i < D.length; i++) {
-    const ad = Math.abs(D[i]!)
-    const m3 = ad > THR3[t]! ? B3[t]! : A3[t]!
-    acc += m3 * (m3 - 2 * ad)
-  }
-  return acc
-}
-
-/** Two-candidate table search: the table whose large magnitude covers
- *  max|D| plus its lower neighbour. */
-function fastSearch(D: readonly number[]): { table: number; acc: number } {
-  let mx = 0
-  for (let i = 0; i < D.length; i++) mx = Math.max(mx, Math.abs(D[i]!))
-  let cover = 0
-  while (cover < 7 && B3[cover]! < mx) cover++
-  const tLo = cover === 0 ? 0 : cover - 1
-  const accLo = fastTableScore(D, tLo)
-  const accHi = fastTableScore(D, cover)
-  return accLo <= accHi ? { table: tLo, acc: accLo } : { table: cover, acc: accHi }
-}
 
 /** Wire indices + modifier sum for a chosen table (selection on D only). */
 function fastIndices(D: readonly number[], t: number): SubblockFit {
@@ -521,44 +496,49 @@ function fastIndices(D: readonly number[], t: number): SubblockFit {
   return { table: t, indices, err: 0, modSum }
 }
 
-/** The scalar-luma fast encode — mirrors etc2.wgsl decision for decision. */
+/**
+ * The fast encode — mirrors the GPU pipeline decision for decision,
+ * INCLUDING its source preparation: the shader never sees the raw pixels,
+ * only a packed 8-bit luma plane (round((r+g+b)/3), etc2_prep.wgsl) and
+ * rounded 2×2 quadrant averages. Both are derived here first so the mirror
+ * is byte-comparable. ETC1-only: planar/T/H are never emitted (the 'high'
+ * path still emits planar, bounding what it would buy).
+ */
 function encodeFastBlock(px: Int32Array): ETC2Block {
-  // Per-texel luma sums and quadrant statistics (Σp, Σ||p||², Σℓ²).
+  // Prepared-source derivation. Quad cells are the block's 2×2 quadrant
+  // sub-cells; sums are reconstructed as rounded-average × 4, exactly as
+  // the shader reads them.
   const luma = new Float64Array(16)
-  const qsum = [
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-    [0, 0, 0],
-  ]
-  const qsq = [0, 0, 0, 0]
   const qlsq = [0, 0, 0, 0]
   for (let k = 0; k < 16; k++) {
-    const r = px[k * 3]!
-    const g = px[k * 3 + 1]!
-    const b = px[k * 3 + 2]!
-    const l = r + g + b
+    const l = 3 * Math.round((px[k * 3]! + px[k * 3 + 1]! + px[k * 3 + 2]!) / 3)
     luma[k] = l
     const q = ((k & 3) >= 2 ? 1 : 0) | (k >> 2 >= 2 ? 2 : 0)
-    qsum[q]![0]! += r
-    qsum[q]![1]! += g
-    qsum[q]![2]! += b
-    qsq[q]! += r * r + g * g + b * b
     qlsq[q]! += l * l
   }
-  const pair = (a: number, b: number): { sum: number[]; sq: number; lsq: number } => ({
+  const qsum: number[][] = []
+  for (let q = 0; q < 4; q++) {
+    const bx = (q & 1) * 2
+    const by = (q >> 1) * 2
+    const s = [0, 0, 0]
+    for (const [dx, dy] of [
+      [0, 0],
+      [1, 0],
+      [0, 1],
+      [1, 1],
+    ] as const) {
+      const k = (by + dy) * 4 + bx + dx
+      for (let c = 0; c < 3; c++) s[c]! += px[k * 3 + c]!
+    }
+    qsum.push(s.map(v => Math.round(v / 4) * 4))
+  }
+  // NOTE: the shader's quadrant index is (x-half) | (y-half)<<1 — qsum above
+  // is built in that same order (q&1 = right half, q>>1 = bottom half).
+
+  const pair = (a: number, b: number): { sum: number[]; lsq: number } => ({
     sum: [qsum[a]![0]! + qsum[b]![0]!, qsum[a]![1]! + qsum[b]![1]!, qsum[a]![2]! + qsum[b]![2]!],
-    sq: qsq[a]! + qsq[b]!,
     lsq: qlsq[a]! + qlsq[b]!,
   })
-
-  // Estimate of one base pair: Σ||p − b||² (O(1) from the sums) plus the
-  // scalar table term. Exact modulo decode clamping; an upper bound on the
-  // true error.
-  const constErr = (s: { sum: number[]; sq: number }, b: readonly number[]): number =>
-    s.sq -
-    2 * (b[0]! * s.sum[0]! + b[1]! * s.sum[1]! + b[2]! * s.sum[2]!) +
-    8 * (b[0]! * b[0]! + b[1]! * b[1]! + b[2]! * b[2]!)
   const Dof = (texels: readonly number[], lb: number): number[] => texels.map(k => luma[k]! - lb)
 
   interface FlipEval {
@@ -570,49 +550,62 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
     lb0: number
     lb1: number
   }
-  const evalCodes = (
-    flip: number,
-    s0: { sum: number[]; sq: number },
-    s1: { sum: number[]; sq: number },
-    diff: boolean,
-    c: { codes0: number[]; codes1: number[] },
-  ): FlipEval => {
-    const b0 = decodeBases(c.codes0, diff)
-    const b1 = decodeBases(c.codes1, diff)
-    const lb0 = b0[0]! + b0[1]! + b0[2]!
-    const lb1 = b1[0]! + b1[1]! + b1[2]!
-    const f0 = fastSearch(Dof(SUBBLOCKS[flip]![0]!, lb0))
-    const f1 = fastSearch(Dof(SUBBLOCKS[flip]![1]!, lb1))
-    return {
-      est: constErr(s0, b0) + constErr(s1, b1) + (f0.acc + f1.acc) / 3,
-      diff,
-      codes: c,
-      t0: f0.table,
-      t1: f1.table,
-      lb0,
-      lb1,
-    }
+  // Table covering max|D|, downgraded to its neighbour when the D mass sits
+  // well below the extreme (mean-square D under max²/4) — the unscored
+  // stand-in for the old two-candidate search.
+  const tableOf = (D: readonly number[], v: number): number => {
+    let mx = 0
+    for (let i = 0; i < D.length; i++) mx = Math.max(mx, Math.abs(D[i]!))
+    let cover = 0
+    while (cover < 7 && B3[cover]! < mx) cover++
+    return cover > 0 && v * 0.25 < mx * mx ? cover - 1 : cover
   }
-  const evalFlip = (flip: number, s0: { sum: number[]; sq: number }, s1: { sum: number[]; sq: number }): FlipEval => {
+  const evalFlip = (flip: number, s0: { sum: number[]; lsq: number }, s1: { sum: number[]; lsq: number }): FlipEval => {
     const avg0 = s0.sum.map(v => v / 8)
     const avg1 = s1.sum.map(v => v / 8)
     const tryDiff = quantiseBases(avg0, avg1, true, false)
     const diff = tryDiff !== null
     const c = tryDiff ?? quantiseBases(avg0, avg1, false, false)!
-    return evalCodes(flip, s0, s1, diff, c)
+    const b0 = decodeBases(c.codes0, diff)
+    const b1 = decodeBases(c.codes1, diff)
+    const lb0 = b0[0]! + b0[1]! + b0[2]!
+    const lb1 = b1[0]! + b1[1]! + b1[2]!
+    const lsum0 = s0.sum[0]! + s0.sum[1]! + s0.sum[2]!
+    const lsum1 = s1.sum[0]! + s1.sum[1]! + s1.sum[2]!
+    // Luma D-variance about each base — drives the table hedge and the
+    // contest estimate.
+    const v0 = Math.max(s0.lsq - 2 * lb0 * lsum0 + 8 * lb0 * lb0, 0)
+    const v1 = Math.max(s1.lsq - 2 * lb1 * lsum1 + 8 * lb1 * lb1, 0)
+    const t0 = tableOf(Dof(SUBBLOCKS[flip]![0]!, lb0), v0)
+    const t1 = tableOf(Dof(SUBBLOCKS[flip]![1]!, lb1), v1)
+    // RELATIVE estimate (the flip-invariant Σ‖p‖² is dropped): base
+    // distance MINUS κ·v/3 — the tables absorb most of the D energy, so v
+    // is a credit, not a penalty (the sign steers the flip contest).
+    const bTerm = (b: readonly number[], s: { sum: number[] }): number =>
+      -2 * (b[0]! * s.sum[0]! + b[1]! * s.sum[1]! + b[2]! * s.sum[2]!) +
+      8 * (b[0]! * b[0]! + b[1]! * b[1]! + b[2]! * b[2]!)
+    return {
+      est: bTerm(b0, s0) + bTerm(b1, s1) - (v0 + v1) * (0.85 / 3),
+      diff,
+      codes: c,
+      t0,
+      t1,
+      lb0,
+      lb1,
+    }
   }
 
-  // O(1) flip preselect: within-variance minus the luma-direction component
-  // the modifier tables can absorb, summed over both subblocks. For
-  // exact-grayscale blocks BOTH residuals are identically zero (all
-  // variance is along luma), so near-ties fall back to scoring both flips.
-  const residual = (s: { sum: number[]; sq: number; lsq: number }): number => {
-    const dotSum = s.sum[0]! * s.sum[0]! + s.sum[1]! * s.sum[1]! + s.sum[2]! * s.sum[2]!
-    const lsum = s.sum[0]! + s.sum[1]! + s.sum[2]!
-    return s.sq - dotSum / 8 - (s.lsq - (lsum * lsum) / 8) / 3
+  // O(1) flip preselect from quadrant-level chroma splits: the rgb
+  // difference between a subblock's two quadrants, minus its luma
+  // component — the part luma modulation cannot fix. Exact-grayscale
+  // blocks tie at zero, so near-ties evaluate both flips.
+  const chroma = (a: number, b: number): number => {
+    const d = [qsum[a]![0]! - qsum[b]![0]!, qsum[a]![1]! - qsum[b]![1]!, qsum[a]![2]! - qsum[b]![2]!]
+    const dl = d[0]! + d[1]! + d[2]!
+    return d[0]! * d[0]! + d[1]! * d[1]! + d[2]! * d[2]! - (dl * dl) / 3
   }
-  const resA = residual(pair(0, 2)) + residual(pair(1, 3))
-  const resB = residual(pair(0, 1)) + residual(pair(2, 3))
+  const resA = chroma(0, 2) + chroma(1, 3)
+  const resB = chroma(0, 1) + chroma(2, 3)
   let flip: number
   let cur: FlipEval
   if (Math.abs(resA - resB) < 1) {
@@ -624,67 +617,17 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
     flip = resB < resA ? 1 : 0
     cur = evalFlip(flip, flip === 0 ? pair(0, 2) : pair(0, 1), flip === 0 ? pair(1, 3) : pair(2, 3))
   }
-  const texels0 = SUBBLOCKS[flip]![0]!
-  const texels1 = SUBBLOCKS[flip]![1]!
-  const diff = cur.diff
-  const codes = cur.codes
-  // NO base refit — dropped with the shader (2026-07): ~0.2 dB on
-  // photographic colour for 13-30% GPU. The 'high' path keeps its exact
-  // refit rounds, so the reference still bounds what a refit could buy.
-  const fit0 = fastIndices(Dof(texels0, cur.lb0), cur.t0)
-  const fit1 = fastIndices(Dof(texels1, cur.lb1), cur.t1)
-
-  // Planar contest, closed-form: the residual of the plane the hardware
-  // will ACTUALLY decode — quantised, clamped corners — via the
-  // normal-equation identity Σ||p − f||² = Σ||p||² − 2·θ·rhs + θᵀGθ
-  // (G = the constant Gram matrix of the sample positions). Only decode's
-  // floor-rounding is unmodelled (PLANAR_FUDGE). Always evaluated — it is
-  // O(1) and gating it loses smooth content.
-  const o: number[] = []
-  const h: number[] = []
-  const v: number[] = []
-  const maxCode = [63, 127, 63]
-  const extendOHV = [extend6, extend7, extend6]
-  let planarEst = PLANAR_FUDGE
-  for (let c = 0; c < 3; c++) {
-    let sA = 0
-    let sB = 0
-    let sC = 0
-    let sq = 0
-    for (let k = 0; k < 16; k++) {
-      const x = (k & 3) / 4
-      const y = (k >> 2) / 4
-      const p = px[k * 3 + c]!
-      sA += (1 - x - y) * p
-      sB += x * p
-      sC += y * p
-      sq += p * p
-    }
-    const oc = PLANAR_GINV[0]![0]! * sA + PLANAR_GINV[0]![1]! * sB + PLANAR_GINV[0]![2]! * sC
-    const hc = PLANAR_GINV[1]![0]! * sA + PLANAR_GINV[1]![1]! * sB + PLANAR_GINV[1]![2]! * sC
-    const vc = PLANAR_GINV[2]![0]! * sA + PLANAR_GINV[2]![1]! * sB + PLANAR_GINV[2]![2]! * sC
-    const qO = quant(oc, maxCode[c]!)
-    const qH = quant(hc, maxCode[c]!)
-    const qV = quant(vc, maxCode[c]!)
-    o.push(qO)
-    h.push(qH)
-    v.push(qV)
-    const eO = extendOHV[c]!(qO)
-    const eH = extendOHV[c]!(qH)
-    const eV = extendOHV[c]!(qV)
-    planarEst +=
-      sq -
-      2 * (eO * sA + eH * sB + eV * sC) +
-      3.5 * (eO * eO + eH * eH + eV * eV) +
-      0.5 * eO * eH +
-      0.5 * eO * eV +
-      4.5 * eH * eV
-  }
-
-  if (cur.est <= planarEst) {
-    return packEtc1({ diff, flip, codes0: codes.codes0, codes1: codes.codes1, fit0, fit1, err: cur.est })
-  }
-  return packPlanar({ o, h, v, err: planarEst })
+  const fit0 = fastIndices(Dof(SUBBLOCKS[flip]![0]!, cur.lb0), cur.t0)
+  const fit1 = fastIndices(Dof(SUBBLOCKS[flip]![1]!, cur.lb1), cur.t1)
+  return packEtc1({
+    diff: cur.diff,
+    flip,
+    codes0: cur.codes.codes0,
+    codes1: cur.codes.codes1,
+    fit0,
+    fit1,
+    err: cur.est,
+  })
 }
 
 // -------------------------------------------------------------------------

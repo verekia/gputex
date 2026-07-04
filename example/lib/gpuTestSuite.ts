@@ -158,18 +158,19 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 49.45,
-  // ETC2 (2026-07, f32-only, minus ~0.15 dB; re-pinned twice — for the
-  // scalar-luma fast shader, then for the deliberate REFIT DROP that traded
-  // ~0.2 dB on photographic colour for −20% GPU; rock-color now sits just
-  // below BC1's). The low 'color'-card number is the format, not the
-  // encoder (the reference measures 20.02 dB): ETC1-family blocks modulate
-  // only luma per pixel, so the card's per-pixel chroma checkers crater
-  // without the unimplemented T/H modes.
-  'etc2:color': 19.82,
-  'etc2:packed-1024': 31.86,
-  'etc2:rock-color-1k': 33.64,
-  'etc2:rock-roughness-1k': 39.99,
-  'etc2:wood-color-1k': 39.06,
+  // ETC2 (2026-07, f32-only, minus ~0.15 dB; re-pinned three times — for
+  // the scalar-luma fast shader, the refit drop, and finally the
+  // BANDWIDTH-FIRST rewrite: a 2 B/pixel prepared source (packed luma +
+  // quadrant averages) with planar dropped, trading ~1 dB average for a
+  // ~1.8× faster GPU pass. The low 'color'-card number is the format, not
+  // the encoder: ETC1-family blocks modulate only luma per pixel, so the
+  // card's per-pixel chroma checkers crater without the unimplemented T/H
+  // modes — and without planar the smooth tiles lean on ETC1 gradients.
+  'etc2:color': 18.6,
+  'etc2:packed-1024': 30.92,
+  'etc2:rock-color-1k': 33.35,
+  'etc2:rock-roughness-1k': 38.83,
+  'etc2:wood-color-1k': 37.32,
   'bc5:wood-normal-1k': 47.8,
   'bc1:wood-roughness-1k': 40.4,
   'bc1:wood-displacement-1k': 43.1,
@@ -227,13 +228,15 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc1:wood-color-1k': 0.05,
   'bc7:wood-color-1k': 0.05,
   'astc:wood-color-1k': 0.05,
-  // ETC2 (2026-07 no-refit shader, observed 0.291 / 0.029 / 0.112 /
-  // 0.023 / 0.038 — estimate-based selection without a refit trails the
-  // exact reference more per block than the other formats do).
-  'etc2:color': 0.45,
-  'etc2:packed-1024': 0.05,
+  // ETC2 (2026-07 bandwidth-first shader, observed 1.54 / 0.18 / 0.12 /
+  // 0.065 / 0.047). These are looser than the other formats by design: the
+  // 'high' reference emits planar and the fast path no longer does, so on
+  // smooth EASY blocks the structural gap is real, not a bug — the limits
+  // only catch catastrophic (wrong-colour-tile) regressions.
+  'etc2:color': 2.0,
+  'etc2:packed-1024': 0.3,
   'etc2:rock-color-1k': 0.2,
-  'etc2:rock-roughness-1k': 0.05,
+  'etc2:rock-roughness-1k': 0.12,
   'etc2:wood-color-1k': 0.08,
   'bc5:wood-normal-1k': 0.05,
   'bc1:wood-roughness-1k': 0.1,
@@ -348,7 +351,7 @@ const DECODERS: Record<FormatKey, { bytesPerBlock: number; decode: BlockDecoder 
  * CPU-encode every block of `img` with the exhaustive reference encoder for
  * `format` — the quality yardstick the GPU encoder is gated against.
  */
-function referenceEncode(format: FormatKey, img: ImageData): Uint8Array {
+function referenceEncode(format: FormatKey, img: ImageData, quality: 'fast' | 'high' = 'high'): Uint8Array {
   const blocksX = (img.width + 3) >> 2
   const blocksY = (img.height + 3) >> 2
   const bpb = DECODERS[format].bytesPerBlock
@@ -359,7 +362,7 @@ function referenceEncode(format: FormatKey, img: ImageData): Uint8Array {
       if (format === 'bc1') {
         block = encodeBC1Block(extractBlock(img, bx, by, 3), { quality: 'high' })
       } else if (format === 'etc2') {
-        block = encodeETC2Block(extractBlock(img, bx, by, 3), { quality: 'high' })
+        block = encodeETC2Block(extractBlock(img, bx, by, 3), { quality })
       } else if (format === 'bc5') {
         const rgba = extractBlock(img, bx, by, 4)
         const r = new Float64Array(16)
@@ -531,13 +534,17 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     })
 
     // Clamp-to-edge padding: a non-multiple-of-4 image must land within a
-    // couple of dB of the exhaustive CPU reference — a padding bug (reading
-    // the zeroed padding strip, mis-clamped coordinates) craters this by far
-    // more than the encoder's normal gap to the reference.
+    // couple of dB of the CPU reference — a padding bug (reading the zeroed
+    // padding strip, mis-clamped coordinates) craters this by far more than
+    // the encoder's normal gap to the reference. ETC2 gates against its
+    // 'fast' mirror instead of 'high': the fast path no longer emits planar,
+    // so on smooth content the fast-vs-high gap alone can exceed the bug
+    // threshold — and the mirror comparison is the stronger contract anyway
+    // (the GPU pipeline matches it byte-for-byte, prepared source included).
     onProgress(`Correctness: ${format} odd-size padding vs CPU reference`)
     const oddImg = format === 'bc5' ? normalOdd : colorOdd
     const gpuOdd = await enc.encodeToBytes(oddImg)
-    const refOdd = referenceEncode(format, oddImg)
+    const refOdd = referenceEncode(format, oddImg, format === 'etc2' ? 'fast' : 'high')
     const gpuPsnr = computePsnr(format, oddImg, gpuOdd.data)
     const refPsnr = computePsnr(format, oddImg, refOdd)
     const delta = gpuPsnr - refPsnr

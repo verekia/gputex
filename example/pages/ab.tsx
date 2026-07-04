@@ -177,6 +177,21 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     return tex565
   }
 
+  // rgba8uint experiments ('ab-src-u8'): the same pixel bytes as an
+  // integer texture — loads skip the unorm->float conversion.
+  let texU8: GPUTexture | null = null
+  const getTexU8 = (): GPUTexture => {
+    if (!texU8) {
+      texU8 = device.createTexture({
+        size: [w, h],
+        format: 'rgba8uint',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      device.queue.writeTexture({ texture: texU8 }, img.data, { bytesPerRow: w * 4 }, [w, h])
+    }
+    return texU8
+  }
+
   // Packed-texel experiments: a shader that declares src_tex as
   // texture_2d<u32> reads the same bytes as an rgba32uint texture at
   // width/4 — one fetch returns four packed RGBA8 pixels (a block row).
@@ -191,6 +206,63 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
       device.queue.writeTexture({ texture: packedTex }, img.data, { bytesPerRow: w * 4 }, [w / 4, h])
     }
     return packedTex
+  }
+
+  // Y + quadrant-average split source ('ab-src-yq'): full-res r8uint luma
+  // (round((r+g+b)/3)) at binding 0 plus half-res rgba8unorm 2x2 averages at
+  // binding 3 — 2 B/pixel total, luma near-exact, chroma averaged.
+  let texY: GPUTexture | null = null
+  let texY32: GPUTexture | null = null
+  let texQ: GPUTexture | null = null
+  const getTexYQ = (): [GPUTexture, GPUTexture] => {
+    if (!texY || !texQ) {
+      texY = device.createTexture({
+        size: [w, h],
+        format: 'r8uint',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      const y = new Uint8Array(w * h)
+      for (let i = 0; i < w * h; i++) {
+        y[i] = Math.round((img.data[i * 4]! + img.data[i * 4 + 1]! + img.data[i * 4 + 2]!) / 3)
+      }
+      device.queue.writeTexture({ texture: texY }, y, { bytesPerRow: w }, [w, h])
+      // Same bytes viewed as r32uint at width/4 — 4 packed lumas per fetch.
+      texY32 = device.createTexture({
+        size: [w / 4, h],
+        format: 'r32uint',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      device.queue.writeTexture({ texture: texY32 }, y, { bytesPerRow: w }, [w / 4, h])
+      const qw = w >> 1
+      const qh = h >> 1
+      texQ = device.createTexture({
+        size: [qw, qh],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      const q = new Uint8Array(qw * qh * 4)
+      for (let yy = 0; yy < qh; yy++) {
+        for (let xx = 0; xx < qw; xx++) {
+          const o = (yy * qw + xx) * 4
+          for (let c = 0; c < 3; c++) {
+            let s = 0
+            for (let dy = 0; dy < 2; dy++) {
+              for (let dx = 0; dx < 2; dx++) {
+                s += img.data[((yy * 2 + dy) * w + xx * 2 + dx) * 4 + c]!
+              }
+            }
+            q[o + c] = Math.round(s / 4)
+          }
+          q[o + 3] = 255
+        }
+      }
+      device.queue.writeTexture({ texture: texQ }, q, { bytesPerRow: qw * 4 }, [qw, qh])
+    }
+    return [texY, texQ]
+  }
+  const getTexYQ32 = (): [GPUTexture, GPUTexture] => {
+    getTexYQ()
+    return [texY32!, texQ!]
   }
 
   const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
@@ -215,19 +287,31 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'encode' } })
     const usesBuf = /var<storage,\s*read>\s*src_buf/.test(code)
     const uses565 = code.includes('ab-src-565')
-    const usesPacked = !uses565 && /src_tex\s*:\s*texture_2d<u32>/.test(code)
+    const usesYQ32 = code.includes('ab-src-yq32')
+    const usesYQ = !usesYQ32 && code.includes('ab-src-yq')
+    const usesU8 = code.includes('ab-src-u8')
+    const usesPacked = !uses565 && !usesU8 && /src_tex\s*:\s*texture_2d<u32>/.test(code)
     const bindGroups = dsts.map(dst => {
       const entries: GPUBindGroupEntry[] = [
         usesBuf
           ? { binding: 0, resource: { buffer: getSrcBuf() } }
-          : uses565
-            ? { binding: 0, resource: getTex565().createView() }
-            : usesPacked
-              ? { binding: 0, resource: getPackedTex().createView() }
-              : { binding: 0, resource: tex.createView() },
+          : usesYQ32
+            ? { binding: 0, resource: getTexYQ32()[0].createView() }
+            : usesYQ
+              ? { binding: 0, resource: getTexYQ()[0].createView() }
+              : uses565
+                ? { binding: 0, resource: getTex565().createView() }
+                : usesU8
+                  ? { binding: 0, resource: getTexU8().createView() }
+                  : usesPacked
+                    ? { binding: 0, resource: getPackedTex().createView() }
+                    : { binding: 0, resource: tex.createView() },
         { binding: 1, resource: { buffer: dst } },
         { binding: 2, resource: { buffer: uniform } },
       ]
+      if (usesYQ || usesYQ32) {
+        entries.push({ binding: 3, resource: getTexYQ()[1].createView() })
+      }
       if (/:\s*sampler\s*;/.test(code)) {
         entries.push({
           binding: 3,
