@@ -1,4 +1,4 @@
-# GPUtex | On-the-fly GPU texture encoding
+# gputex | GPU texture encoding
 
 Runtime GPU texture compression via WebGPU compute shaders, with a WebGL2 fragment-shader fallback. Feed it a PNG/JPG/WebP/AVIF — or an SVG, rasterised on the fly — and get back a GPU-compressed texture (BC7, BC5, ASTC 4x4, BC1, or ETC2) ready for Three.js or React Three Fiber.
 
@@ -419,4 +419,4 @@ consumer can run the same validation.
 
 ## Acknowledgements
 
-The concept of encoding images on the GPU on the fly via compute shaders was first introduced by [spark.js](https://ludicon.com/sparkjs/). GPUtex is not derived from Spark. Its encoders have been implemented from scratch using official references, which have been ported to TypeScript, and then converted to WGSL and GLSL via AI. Spark was never mentioned or used as reference at any point of the implementation, and multiple reviews have found the implementations to be completely independent. For any serious production use of GPU-compressed textures, Spark is the recommended choice over GPUtex.
+The concept of encoding images on the GPU on the fly via compute shaders was first introduced by [spark.js](https://ludicon.com/sparkjs/). gputex is not derived from Spark. Its encoders have been implemented from scratch using official references, which have been ported to TypeScript, and then converted to WGSL and GLSL via AI. Spark was never mentioned or used as reference at any point of the implementation, and multiple reviews have found the implementations to be completely independent. For any serious production use of GPU-compressed textures, Spark is the recommended choice over gputex.
