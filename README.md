@@ -105,8 +105,11 @@ base-colour refit and a closed-form least-squares fit of ETC2's planar mode
 block, all driven by the same estimates. The rewrite took the GPU pass
 from 6.0 ms to ~0.18 ms at 2048² (33×, within ~0.7 dB of the exhaustive
 search — the base refit and one of the two scored table candidates were
-traded for speed along the way). It ships as f32 only: the estimates are
-integer-exact sums that overflow f16.
+traded for speed along the way). Its f16 module is EXACT-VALUE: lumas, D
+values and thresholds are integers f16 represents exactly, while the
+sums-of-squares estimates stay f32 (they overflow f16), so the two
+modules produce byte-identical output — f16 buys register pressure on
+mobile GPUs, not different results.
 
 On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
 per-block reference encoders (BC5 matches the reference exactly; ASTC and
@@ -349,7 +352,7 @@ end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
 | BC7      | f32           | 0.59 ms     |
 | ASTC 4×4 | f16 (default) | **0.26 ms** |
 | ASTC 4×4 | f32           | 0.56 ms     |
-| ETC2     | f32 (only)    | 0.18 ms     |
+| ETC2     | f16 + f32     | 0.18 ms     |
 
 The ETC2 figure is the interleaved `/ab` harness measurement (batched
 dispatches, clock-stable). On a 100 GB/s part just reading the 2048² RGBA8

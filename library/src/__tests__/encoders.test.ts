@@ -39,8 +39,8 @@ describe('BC1Encoder metadata', () => {
 })
 
 describe('f16 fast shader variants', () => {
-  it('every BC/ASTC encoder ships an f16 fast module (BC1 included)', () => {
-    for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ASTC4x4Encoder]) {
+  it('every encoder ships an f16 fast module', () => {
+    for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ASTC4x4Encoder, ETC2Encoder]) {
       const view: AnyProto = Object.create(cls.prototype)
       const src: string | null = view.wgslSourceFastF16()
       expect(typeof src).toBe('string')
@@ -49,9 +49,11 @@ describe('f16 fast shader variants', () => {
     }
   })
 
-  it('ETC2 has no f16 variant (integer-exact f32 algorithm)', () => {
+  it("ETC2's f16 module is the exact-value port (big sums stay f32)", () => {
     const view: AnyProto = Object.create(ETC2Encoder.prototype)
-    expect(view.wgslSourceFastF16()).toBe(null)
+    const src: string = view.wgslSourceFastF16()
+    expect(src).toContain('array<f16, 16>')
+    expect(src).toContain('EXACT-VALUE f16')
   })
 })
 

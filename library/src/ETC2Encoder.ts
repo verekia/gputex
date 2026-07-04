@@ -6,17 +6,19 @@
 //
 // Single-pass: the shader emits ETC1 individual/differential blocks and
 // ETC2 planar blocks; T and H modes are never emitted. See `etc2.wgsl` /
-// `etc2_ref.ts` for the algorithm and layout. There is no f16 variant: the
-// encode is integer-exact 0..255 arithmetic whose error sums overflow f16,
-// so the f32 module is the only one. (A two-pass prepared-source variant
-// lives in git history — its prep pass is also bandwidth-bound and made
-// the per-texture total slower.)
+// `etc2_ref.ts` for the algorithm and layout. The f16 variant is EXACT-
+// VALUE (every f16 quantity is an integer f16 represents exactly; the
+// big sums stay f32) so its output is byte-identical to the f32 module —
+// it exists for register pressure on mobile GPUs, not arithmetic rate.
+// (A two-pass prepared-source variant lives in git history — its prep
+// pass is also bandwidth-bound and made the per-texture total slower.)
 //
 // See `Encoder.ts` for the shared encode pipeline. This file only declares
-// the format metadata and loads the WGSL source.
+// the format metadata and loads the WGSL sources.
 
 import { Encoder, type FormatVariant } from './Encoder.js'
 import shaderSource from './etc2.wgsl'
+import shaderSourceF16 from './etc2_fast_f16.wgsl'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
 
 export class ETC2Encoder extends Encoder {
@@ -35,6 +37,10 @@ export class ETC2Encoder extends Encoder {
 
   override wgslSource(): string {
     return shaderSource
+  }
+
+  override wgslSourceFastF16(): string {
+    return shaderSourceF16
   }
 
   override gpuTextureFormat({ colorSpace }: FormatVariant): GPUTextureFormat {
