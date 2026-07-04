@@ -19,6 +19,12 @@
 //   batch=10       dispatches per timed pass (default 10)
 //   samples=25     timed samples per shader (default 25, +8 warmup)
 //   image=proc     proc | gray | alpha | /textures/... URL (default proc)
+//   dsts=1         output buffers rotated across the batch (default 1).
+//                  With 1, every dispatch writes the same buffer and the
+//                  driver serialises them on the write-write hazard —
+//                  a LATENCY measure. With dsts=batch each dispatch gets
+//                  its own buffer, dispatches may overlap and the source
+//                  stays cache-warm — a THROUGHPUT measure.
 //
 // Automation hook: window.__GPUTEX_AB__ = { status, results?, error? }
 // results = [{ name, minMs, medianMs, ratioVsFirst }] (per-dispatch ms)
@@ -93,7 +99,8 @@ async function loadImageData(url: string): Promise<ImageData> {
 interface ShaderCase {
   name: string
   pipeline: GPUComputePipeline
-  bindGroup: GPUBindGroup
+  /** One bind group per rotated output buffer (see the `dsts` param). */
+  bindGroups: GPUBindGroup[]
   wgX: number
   wgY: number
 }
@@ -105,6 +112,7 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
   const size = Number(q.get('size') ?? 4096)
   const batch = Number(q.get('batch') ?? 10)
   const samples = Number(q.get('samples') ?? 25)
+  const dstsCount = Math.max(1, Math.min(batch, Number(q.get('dsts') ?? 1)))
   const WARMUP = 8
   const imageParam = q.get('image') ?? 'proc'
 
@@ -146,6 +154,45 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     return srcBuf
   }
 
+  // RGB565 source experiments: a shader containing the marker 'ab-src-565'
+  // reads the image as r16uint-packed RGB565 — HALF the bytes per pixel.
+  // Lossy (quantised source); exists to measure the bandwidth trade.
+  let tex565: GPUTexture | null = null
+  const getTex565 = (): GPUTexture => {
+    if (!tex565) {
+      tex565 = device.createTexture({
+        size: [w, h],
+        format: 'r16uint',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      const packed = new Uint16Array(w * h)
+      for (let i = 0; i < w * h; i++) {
+        const r = img.data[i * 4]! >> 3
+        const g = img.data[i * 4 + 1]! >> 2
+        const b = img.data[i * 4 + 2]! >> 3
+        packed[i] = (r << 11) | (g << 5) | b
+      }
+      device.queue.writeTexture({ texture: tex565 }, packed, { bytesPerRow: w * 2 }, [w, h])
+    }
+    return tex565
+  }
+
+  // Packed-texel experiments: a shader that declares src_tex as
+  // texture_2d<u32> reads the same bytes as an rgba32uint texture at
+  // width/4 — one fetch returns four packed RGBA8 pixels (a block row).
+  let packedTex: GPUTexture | null = null
+  const getPackedTex = (): GPUTexture => {
+    if (!packedTex) {
+      packedTex = device.createTexture({
+        size: [w / 4, h],
+        format: 'rgba32uint',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      device.queue.writeTexture({ texture: packedTex }, img.data, { bytesPerRow: w * 4 }, [w / 4, h])
+    }
+    return packedTex
+  }
+
   const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
   device.queue.writeBuffer(uniform, 0, new Uint32Array([blocksX, blocksY, w, h]))
 
@@ -158,26 +205,38 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const wg = /@workgroup_size\((\d+)\s*,\s*(\d+)/.exec(code)
     if (!wg) throw new Error(`${name}: no @workgroup_size`)
     const bpb = name.includes('bc1') || name.includes('etc2') ? 8 : 16
-    const dst = device.createBuffer({ size: blocksX * blocksY * bpb, usage: GPUBufferUsage.STORAGE })
+    const dsts = Array.from({ length: dstsCount }, () =>
+      device.createBuffer({ size: blocksX * blocksY * bpb, usage: GPUBufferUsage.STORAGE }),
+    )
     const module = device.createShaderModule({ code })
     const info = await module.getCompilationInfo()
     const errors = info.messages.filter(m => m.type === 'error')
     if (errors.length) throw new Error(`${name}: ${errors.map(m => `${m.lineNum}: ${m.message}`).join('\n')}`)
     const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'encode' } })
     const usesBuf = /var<storage,\s*read>\s*src_buf/.test(code)
-    const entries: GPUBindGroupEntry[] = [
-      usesBuf ? { binding: 0, resource: { buffer: getSrcBuf() } } : { binding: 0, resource: tex.createView() },
-      { binding: 1, resource: { buffer: dst } },
-      { binding: 2, resource: { buffer: uniform } },
-    ]
-    if (/:\s*sampler\s*;/.test(code)) {
-      entries.push({
-        binding: 3,
-        resource: device.createSampler({ addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }),
-      })
-    }
-    const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries })
-    cases.push({ name, pipeline, bindGroup, wgX: Number(wg[1]), wgY: Number(wg[2]) })
+    const uses565 = code.includes('ab-src-565')
+    const usesPacked = !uses565 && /src_tex\s*:\s*texture_2d<u32>/.test(code)
+    const bindGroups = dsts.map(dst => {
+      const entries: GPUBindGroupEntry[] = [
+        usesBuf
+          ? { binding: 0, resource: { buffer: getSrcBuf() } }
+          : uses565
+            ? { binding: 0, resource: getTex565().createView() }
+            : usesPacked
+              ? { binding: 0, resource: getPackedTex().createView() }
+              : { binding: 0, resource: tex.createView() },
+        { binding: 1, resource: { buffer: dst } },
+        { binding: 2, resource: { buffer: uniform } },
+      ]
+      if (/:\s*sampler\s*;/.test(code)) {
+        entries.push({
+          binding: 3,
+          resource: device.createSampler({ addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' }),
+        })
+      }
+      return device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries })
+    })
+    cases.push({ name, pipeline, bindGroups, wgX: Number(wg[1]), wgY: Number(wg[2]) })
   }
 
   const querySet = device.createQuerySet({ type: 'timestamp', count: 2 })
@@ -191,8 +250,8 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
       timed ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
     )
     pass.setPipeline(c.pipeline)
-    pass.setBindGroup(0, c.bindGroup)
     for (let i = 0; i < batch; i++) {
+      pass.setBindGroup(0, c.bindGroups[i % c.bindGroups.length]!)
       pass.dispatchWorkgroups(Math.ceil(blocksX / c.wgX), Math.ceil(blocksY / c.wgY), 1)
     }
     pass.end()
