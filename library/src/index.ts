@@ -81,3 +81,19 @@ export { generateGpuMipChain, gpuMipLevelCount } from './gpuMipgen.js'
 // sources; exported for callers driving the core encoders directly — the
 // returned ImageBitmap is a valid `EncoderImageSource`. Main-thread only.
 export { rasterizeSvg, type RasterizeSvgOptions, type SvgRasterSize } from './svg.js'
+
+// The high-level engine-agnostic pipeline: source (URL / Blob / bitmap / SVG /
+// …) → capability-based format selection → WebGPU/WebGL2 encode (+ optional mip
+// chain) → raw compressed block bytes. `gputex/three`'s `compressTexture()`
+// wraps this into a `CompressedTexture`; other engines build their own texture
+// from `result.levels` (or `result.fallbackBitmap` on the RGBA8 fallback).
+export {
+  compressTextureToBytes,
+  releaseSharedGpuResources,
+  type CompressResult,
+  type CompressOptions,
+  type CompressTextureSource,
+} from './compressTexture.js'
+
+// In-memory transcode cache (opt-in via `CompressOptions.cache`).
+export { clearTranscodeCache, setTranscodeCacheLimit } from './transcodeCache.js'
