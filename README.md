@@ -58,6 +58,7 @@ Notes on the WebGL path:
 - It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present. ETC2 is WebGPU-only (no WebGL fragment encoder), so `quality: 'low'` on the WebGL tier can only deliver BC1.
 - The `device` / `adapter` options apply to the WebGPU path only.
 - All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas.
+- Encoders are shared per format across calls on that context, so the fragment shader is compiled and linked once rather than per texture (~3× faster per texture on the fallback tier: a 1024² BC7 encode goes 6.1 → 2.1 ms). Per-encode textures and framebuffers are still released immediately — caching those measured no gain and would have pinned the source texture's memory (64 MB at 4096²) for the life of the page. `releaseSharedGpuResources()` disposes the encoders.
 
 ## Usage
 
@@ -109,12 +110,35 @@ stay f32 (they overflow f16), so the two modules produce byte-identical
 output — f16 buys register pressure on mobile GPUs, not different
 results.
 
-On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
-per-block reference encoders (BC5 matches the reference exactly; ASTC and
-BC1-on-normal-maps measure slightly above it), trailing only on adversarial
-high-frequency noise, where any single-line seed loses to an exhaustive
-search — while encoding an order of magnitude faster. See the benchmark
-table below.
+How close is that to the per-block reference encoders? Measured on an Apple
+`metal-3` GPU across the suite's cards, the gap tracks how hard the image is,
+not the format:
+
+| Content                                                            | GPU vs reference                                |
+| ------------------------------------------------------------------ | ----------------------------------------------- |
+| The cards that stress the encoder (`color`, `packed-*`, ~32–38 dB) | within **0.25 dB** for every format             |
+| BC5 on normal maps                                                 | within **0.013 dB** — effectively the reference |
+| BC1 on normal maps                                                 | **0.23 dB above** the reference                 |
+| Smooth single-channel maps (displacement, AO, roughness)           | BC7 trails on RGBA, leads on RGB — see below    |
+
+That last row is BC7's weak spot, and it is a **metric artifact more than a
+quality one**. Mode 6 shares one p-bit across RGBA, so on opaque gray content
+alpha wants p=1 (255 is odd) while an even gray wants p=0. Equal-weight RGBA
+scores that constant alpha channel as if it carried data, which drags the
+number down: `rock-displacement-1k` reads 56.7 dB RGBA but **65.6 dB RGB**,
+and RGB is all those maps carry.
+
+Searching all four (p0, p1) combinations recovers ~+0.66 dB RGB there, but
+costs ~4× the block cost on gray content. That is sub-dB for ~4×, which is
+the wrong side of this library's trade, so it is **not shipped** — the
+encoders stay on the greedy per-endpoint p-bit choice. (Scoring that search
+on equal-weight RGBA instead makes it actively harmful: −1.63 dB mean RGB
+while appearing to gain +2.15 dB RGBA. If it is ever revisited, the
+objective must be RGB-only.)
+
+What did change is the measurement. The test suite now reports **RGB and
+alpha separately** and marks alpha `opaque` when the source has none, so a
+change that trades one for the other can no longer look like a win.
 
 #### SVG sources
 
@@ -324,10 +348,11 @@ WebGPU device and one encoder per format across calls: the first call pays the
 adapter/device request and pipeline compile, subsequent calls skip straight to
 the encode and reuse the encoder's cached GPU resources. The result's
 `destroy()` only disposes that call's texture; call `releaseSharedGpuResources()`
-(also exported from `gputex/three`) to tear down the shared device — the next
-`compressTexture()` call transparently recreates it. With `mipmaps: true` the
-whole chain is encoded in a single GPU submission (one compute pass, one
-readback) rather than a round trip per level.
+(also exported from `gputex/three`) to tear down the shared device **and** the
+WebGL tier's shared encoders — the next `compressTexture()` call transparently
+recreates whichever it needs. With `mipmaps: true` the whole chain is encoded in
+a single GPU submission (one compute pass, one readback) rather than a round
+trip per level.
 
 ## Benchmarks
 
@@ -400,10 +425,55 @@ PASS/FAIL tables (machine-readable copy on `window.__GPUTEX_TESTS__`):
 - **Performance** — the benchmark table above: wall + GPU-pass time per
   format × shader variant.
 
+### Reference encoders
+
 The `gputex/testing` entry point exports the CPU reference
 encoders/decoders (`encodeBC7Mode6Block`, `decodeASTC4x4Block`, …) — the
-exhaustive per-block yardstick the GPU shaders are gated against — so any
-consumer can run the same validation.
+per-block yardstick the GPU shaders are gated against — so any consumer can
+run the same validation.
+
+BC7 mode 6 and ASTC 4×4 search **two** endpoint seeds per block and keep the
+lower-error result:
+
+- the **farthest pixel pair** in the format's channel space — two real
+  texels, so the line is pinned to the data, but one outlier can drag it off
+  the distribution's axis;
+- the **principal axis** (power-iterated covariance) — fitted to all sixteen
+  texels, so it resists outliers but need not pass through any of them.
+
+Neither dominates the other, which is why both are tried; the principal axis
+is also what the GPU shaders seed from. Each seed is then refined by a
+least-squares endpoint refit, accepted only when it lowers the block's error.
+Because every step is keep-the-best over a superset of what a single seed
+explores, **no block encodes worse than it would with one seed** — verified
+over a 30k-block corpus (0 blocks worse, ~52% better for BC7 and ~26% for
+ASTC), using the same unrounded error metric the suite's PSNR uses.
+
+Measured on the suite's own cards, that is worth **+0.111 dB (BC7)** and
+**+0.100 dB (ASTC)** averaged over 46 format/image rows — every row improved
+or held flat, none regressed, with the biggest gains (+0.26 dB) on the colour
+and alpha cards and the smallest on near-lossless roughness maps where both
+seeds already agree. On synthetic blocks chosen to be hard the gain is larger
+(+0.22/+0.24 dB); real textures contain many easy blocks.
+
+The gain does not come at the cost of speed — both formats still round-trip a
+card faster than before the search was widened, because the block packing no
+longer goes through BigInt:
+
+| Format | PSNR (synthetic card) | Reference encode + CPU decode, 512² card |
+| ------ | --------------------- | ---------------------------------------- |
+| BC7    | 30.24 → **30.46 dB**  | 742 → **512 ms**                         |
+| ASTC   | 30.16 → **30.40 dB**  | 630 → **224 ms**                         |
+| BC5    | 45.03 dB (unchanged)  | 239 → **96 ms**                          |
+| BC1    | 28.85 dB (unchanged)  | 234 → **206 ms**                         |
+| ETC2   | 28.26 dB (unchanged)  | 780 ms (unchanged)                       |
+
+These are CPU-side numbers from `bun`, not GPU measurements; they move the
+cost of the browser suite's quality phase, not the shipped encoders. The
+shipped shaders are untouched: across the full suite all 94 quality rows
+produce byte-identical GPU PSNR before and after, and the worst-easy-block
+gate — the one gate measured _relative_ to the reference — moves at most
++0.0027, leaving BC7's tightest margin at 0.033 against a 0.05 limit.
 
 ## Requirements
 

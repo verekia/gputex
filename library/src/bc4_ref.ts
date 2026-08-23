@@ -147,22 +147,30 @@ function refitEndpoints6Interp(values: BC4Values, indices: ArrayLike<number>): {
 /**
  * Pack (red0_byte, red1_byte, 16 × 3-bit indices) into the 8-byte block
  * layout. Indices occupy a 48-bit field in bytes 2..7, little-endian,
- * with pixel 0 at bit 0. We build the whole field as a BigInt so the
- * straddling indices (those that span a byte boundary) come out right
- * without manual bit-fiddling per byte.
+ * with pixel 0 at bit 0.
+ *
+ * The field is built as two 24-bit halves rather than one BigInt: 8
+ * indices × 3 bits is exactly 24, so pixel 8 starts the upper half on a
+ * byte boundary and no index straddles the split. Each half fits a plain
+ * u32, which keeps the packing allocation-free.
  */
 function packBlock(red0: number, red1: number, indices: ArrayLike<number>): BC4Block {
   const out = new Uint8Array(8)
   out[0] = red0
   out[1] = red1
 
-  let bits = 0n
-  for (let k = 0; k < 16; k++) {
-    bits |= BigInt(indices[k]! & 7) << BigInt(3 * k)
+  let lo = 0
+  let hi = 0
+  for (let k = 0; k < 8; k++) {
+    lo |= (indices[k]! & 7) << (3 * k)
+    hi |= (indices[k + 8]! & 7) << (3 * k)
   }
-  for (let i = 0; i < 6; i++) {
-    out[2 + i] = Number((bits >> BigInt(i * 8)) & 0xffn)
-  }
+  out[2] = lo & 0xff
+  out[3] = (lo >>> 8) & 0xff
+  out[4] = (lo >>> 16) & 0xff
+  out[5] = hi & 0xff
+  out[6] = (hi >>> 8) & 0xff
+  out[7] = (hi >>> 16) & 0xff
   return out
 }
 
@@ -249,14 +257,15 @@ export function decodeBC4Block(block: BC4Block): Float32Array {
   const r1b = block[1]!
   const palette = r0b > r1b ? buildPalette6(r0b / 255, r1b / 255) : buildPalette4(r0b / 255, r1b / 255)
 
-  // Read the 48-bit index field as a BigInt.
-  let bits = 0n
-  for (let i = 0; i < 6; i++) bits |= BigInt(block[2 + i]!) << BigInt(i * 8)
+  // The 48-bit index field as two 24-bit halves — see `packBlock` for why
+  // the split at pixel 8 is exact.
+  const lo = block[2]! | (block[3]! << 8) | (block[4]! << 16)
+  const hi = block[5]! | (block[6]! << 8) | (block[7]! << 16)
 
   const out = new Float32Array(16)
-  for (let k = 0; k < 16; k++) {
-    const idx = Number((bits >> BigInt(3 * k)) & 7n)
-    out[k] = palette[idx]!
+  for (let k = 0; k < 8; k++) {
+    out[k] = palette[(lo >>> (3 * k)) & 7]!
+    out[k + 8] = palette[(hi >>> (3 * k)) & 7]!
   }
   return out
 }

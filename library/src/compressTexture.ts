@@ -40,10 +40,11 @@ import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSi
 import { buildTranscodeKey, readTranscodeCache, writeTranscodeCache } from './transcodeCache.js'
 import { selectWebGLFormat, type WebGLFormatSelection } from './webgl/selectWebGLFormat.js'
 import { detectWebGLCapabilities } from './webgl/webglCapabilities.js'
-import { getSharedWebGLContext } from './webgl/webglContext.js'
+import { getSharedWebGLContext, peekSharedWebGLContext } from './webgl/webglContext.js'
 import { needsWriteTextureWorkaround } from './workarounds.js'
 
 import type { TextureFormat } from './TextureFormat.js'
+import type { WebGLBlockEncoder, WebGLEncoderConstructor } from './webgl/WebGLBlockEncoder.js'
 
 /**
  * Everything `compressTexture()` can take as an image source. A superset
@@ -257,12 +258,39 @@ function getSharedGpu(): Promise<SharedGpu | null> {
   return sharedGpuPromise
 }
 
+// The WebGL tier's counterpart of the per-format encoder cache above.
+// Building a WebGL encoder compiles and links its fragment shader — tens of
+// ms for the larger kernels — and the encoder also carries the cached
+// source/target textures and framebuffer that make repeat encodes cheap.
+// Doing that per `compressTexture()` call threw both away every time.
+//
+// Keyed by context in a WeakMap: `getSharedWebGLContext()` builds a fresh
+// context after a context loss, and the old context's encoders (whose GL
+// objects died with it) become unreachable along with it.
+const webglEncoders = new WeakMap<WebGL2RenderingContext, Map<WebGLEncoderConstructor, WebGLBlockEncoder>>()
+
+function getSharedWebGLEncoder(gl: WebGL2RenderingContext, ctor: WebGLEncoderConstructor): WebGLBlockEncoder {
+  let byFormat = webglEncoders.get(gl)
+  if (!byFormat) {
+    byFormat = new Map()
+    webglEncoders.set(gl, byFormat)
+  }
+  let encoder = byFormat.get(ctor)
+  if (!encoder) {
+    encoder = ctor.create(gl)
+    byFormat.set(ctor, encoder)
+  }
+  return encoder
+}
+
 /**
- * Destroy the WebGPU device and encoders that `compressTexture()` shares
- * across calls (created lazily when neither the `device` nor the `adapter`
- * option is passed). Safe to call at any time — in-flight encodes on the
- * shared device will fail, and the next `compressTexture()` call recreates
- * everything. No-op when nothing is cached.
+ * Destroy the GPU resources `compressTexture()` shares across calls: the
+ * WebGPU device and per-format encoders (created lazily when neither the
+ * `device` nor the `adapter` option is passed), plus the WebGL fallback
+ * tier's per-format encoders on the shared context. Safe to call at any
+ * time — in-flight encodes on the shared device will fail, and the next
+ * `compressTexture()` call recreates everything. No-op when nothing is
+ * cached.
  */
 export function releaseSharedGpuResources(): void {
   const p = sharedGpuPromise
@@ -275,6 +303,16 @@ export function releaseSharedGpuResources(): void {
       shared.device.destroy()
     })
     .catch(() => {})
+
+  const gl = peekSharedWebGLContext()
+  if (gl) {
+    const byFormat = webglEncoders.get(gl)
+    if (byFormat) {
+      byFormat.forEach(encoder => encoder.destroy())
+      byFormat.clear()
+      webglEncoders.delete(gl)
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +497,11 @@ export async function compressTextureToBytes(
   // Resolve backend + format BEFORE touching pixels: format selection only
   // needs capabilities, and knowing it first lets a transcode-cache hit
   // skip the image decode and the encode entirely.
+  //
+  // (Overlapping the decode with adapter resolution was tried and removed:
+  // on a warm browser `requestAdapter` + `requestDevice` measured 0.6 ms
+  // total against ~32 ms of fetch + decode, so the overlap bought nothing
+  // and the extra control flow had already hidden one bug.)
   const gpu = await resolveWebGPU()
   const gl = gpu ? null : resolveWebGL()
 
@@ -697,7 +740,9 @@ export async function compressTextureToBytes(
    * producing a working texture.
    */
   function encodeViaWebGL({ gl, selection }: GlTier): CompressResult | null {
-    const encoder = selection.encoderClass.create(gl)
+    // Shared across calls; released by releaseSharedGpuResources(), never
+    // per-result.
+    const encoder = getSharedWebGLEncoder(gl, selection.encoderClass)
     try {
       if (!mipmaps) {
         const bytes = encoder.encodeToBytes(bitmap, { flipY })
@@ -709,7 +754,6 @@ export async function compressTextureToBytes(
             levels: [bytes],
           })
         }
-        encoder.destroy()
         return {
           levels: [bytes],
           fallbackBitmap: null,
@@ -749,7 +793,6 @@ export async function compressTextureToBytes(
           levels: encodedLevels,
         })
       }
-      encoder.destroy()
       return {
         levels: encodedLevels,
         fallbackBitmap: null,
@@ -766,7 +809,6 @@ export async function compressTextureToBytes(
         cacheHit: false,
       }
     } catch (e) {
-      encoder.destroy()
       console.warn('[compressTextureToBytes] WebGL fallback encode failed; returning uncompressed RGBA8.', e)
       return null
     }

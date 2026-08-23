@@ -176,43 +176,98 @@ function interp16(e0: number, e1: number, w: number): number {
 // from the low end, weights from bit 127 downward — so a positioned API
 // is easier to audit: the caller states exactly where each field lives.
 
+/**
+ * Low `n` bits set, as an unsigned 32-bit value. `1 << 32` is `1` in JS
+ * (shift counts are taken mod 32), so the n = 32 case needs its own arm.
+ */
+function mask32(n: number): number {
+  return n >= 32 ? 0xffffffff : ((1 << n) - 1) >>> 0
+}
+
+/**
+ * The 128 bits are held as four u32 words, word 0 covering bits 0..31.
+ * Fields may straddle a word boundary, so both directions loop over the
+ * (at most two) words a field touches.
+ *
+ * Words rather than a BigInt: packing a block writes each of the 16
+ * weights one bit at a time (up to 80 single-bit writes), and BigInt
+ * allocates a fresh heap value per operation — this was the single
+ * largest cost in `encodeASTC4x4Block`. Field values are limited to 32
+ * bits, which every ASTC field in our subset satisfies.
+ */
+function writeBits(w: Uint32Array, pos: number, nBits: number, value: number): void {
+  let v = (value & mask32(nBits)) >>> 0
+  let p = pos
+  let left = nBits < 32 ? nBits : 32
+  while (left > 0) {
+    const idx = p >>> 5
+    const off = p & 31
+    const take = 32 - off < left ? 32 - off : left
+    const m = mask32(take)
+    // Clear first, then OR in; makes the writer safe against re-writes at
+    // the same position (not used today, but removes a sharp edge).
+    w[idx] = ((w[idx]! & ~((m << off) >>> 0)) | ((v & m) << off)) >>> 0
+    v = take >= 32 ? 0 : v >>> take
+    p += take
+    left -= take
+  }
+}
+
+function readBits(w: Uint32Array, pos: number, nBits: number): number {
+  let out = 0
+  let scale = 1
+  let p = pos
+  let left = nBits
+  while (left > 0) {
+    const idx = p >>> 5
+    const off = p & 31
+    const take = 32 - off < left ? 32 - off : left
+    // `* scale` rather than `<< done`: keeps the accumulator a positive
+    // JS number instead of wrapping into int32's sign bit.
+    out += ((w[idx]! >>> off) & mask32(take)) * scale
+    scale *= 2 ** take
+    p += take
+    left -= take
+  }
+  return out
+}
+
 class BitWriter128 {
-  private bits = 0n
+  private readonly w = new Uint32Array(4)
 
   write(pos: number, nBits: number, value: number): void {
     if (pos < 0 || nBits < 0 || pos + nBits > 128) {
       throw new Error(`BitWriter128: out-of-range write pos=${pos}, n=${nBits}`)
     }
-    const mask = (1n << BigInt(nBits)) - 1n
-    // Clear first, then OR in; makes the writer safe against re-writes at
-    // the same position (not used today, but removes a sharp edge).
-    this.bits &= ~(mask << BigInt(pos))
-    this.bits |= (BigInt(value) & mask) << BigInt(pos)
+    writeBits(this.w, pos, nBits, value)
   }
 
   toBytes(): Uint8Array {
     const out = new Uint8Array(16)
-    let b = this.bits
-    for (let i = 0; i < 16; i++) {
-      out[i] = Number(b & 0xffn)
-      b >>= 8n
+    for (let i = 0; i < 4; i++) {
+      const v = this.w[i]!
+      const b = i * 4
+      out[b] = v & 0xff
+      out[b + 1] = (v >>> 8) & 0xff
+      out[b + 2] = (v >>> 16) & 0xff
+      out[b + 3] = (v >>> 24) & 0xff
     }
     return out
   }
 }
 
 class BitReader128 {
-  private bits: bigint
+  private readonly w = new Uint32Array(4)
 
   constructor(block: ASTC4x4Block) {
-    let b = 0n
-    for (let i = 0; i < 16; i++) b |= BigInt(block[i]!) << BigInt(i * 8)
-    this.bits = b
+    for (let i = 0; i < 4; i++) {
+      const b = i * 4
+      this.w[i] = (block[b]! | (block[b + 1]! << 8) | (block[b + 2]! << 16) | (block[b + 3]! << 24)) >>> 0
+    }
   }
 
   read(pos: number, nBits: number): number {
-    const mask = (1n << BigInt(nBits)) - 1n
-    return Number((this.bits >> BigInt(pos)) & mask)
+    return readBits(this.w, pos, nBits)
   }
 }
 
@@ -245,6 +300,79 @@ function farthestPair(vals: Float64Array, C: number): { i0: number; i1: number }
   }
   return { i0: bi0, i1: bi1 }
 }
+
+/**
+ * Seed endpoints from the principal axis of the class's channels: power-
+ * iterate the C×C covariance, then take the extremes of the texels'
+ * projection onto the dominant eigenvector.
+ *
+ * The counterpart to `farthestPair`, and a genuinely different candidate
+ * rather than a refinement: the farthest pair is two real texels, so it is
+ * pinned to the data but can be dragged off-axis by one outlier; the
+ * principal axis is fitted to all sixteen, so it resists outliers but need
+ * not pass through any texel. `encodeASTC4x4Block` runs both and keeps the
+ * lower-error result. It is also the seed the GPU encoders use.
+ */
+function principalAxisSeed(vals: Float64Array, C: number): { e0: number[]; e1: number[] } {
+  const mean = new Float64Array(C)
+  for (let k = 0; k < 16; k++) {
+    for (let c = 0; c < C; c++) mean[c]! += vals[k * C + c]! / 16
+  }
+  const cov = new Float64Array(C * C)
+  const d = new Float64Array(C)
+  for (let k = 0; k < 16; k++) {
+    for (let c = 0; c < C; c++) d[c] = vals[k * C + c]! - mean[c]!
+    for (let i = 0; i < C; i++) {
+      for (let j = 0; j < C; j++) cov[i * C + j]! += d[i]! * d[j]!
+    }
+  }
+  // Power iteration, stopped as soon as the vector settles; a matrix this
+  // small with a dominant eigenvalue converges in a handful of rounds. A
+  // flat block has no axis at all, which the zero-length guard turns into a
+  // degenerate (e0 == e1) seed — exactly right, since every texel is the
+  // same colour.
+  let v = new Float64Array(C).fill(1)
+  for (let it = 0; it < 12; it++) {
+    const n = new Float64Array(C)
+    for (let i = 0; i < C; i++) {
+      for (let j = 0; j < C; j++) n[i]! += cov[i * C + j]! * v[j]!
+    }
+    let len = 0
+    for (let i = 0; i < C; i++) len += n[i]! * n[i]!
+    len = Math.sqrt(len)
+    if (len < 1e-12) break
+    let move = 0
+    for (let i = 0; i < C; i++) {
+      n[i]! /= len
+      move += Math.abs(n[i]! - v[i]!)
+    }
+    v = n
+    if (move < 1e-6) break
+  }
+  let lo = Infinity
+  let hi = -Infinity
+  for (let k = 0; k < 16; k++) {
+    let t = 0
+    for (let c = 0; c < C; c++) t += (vals[k * C + c]! - mean[c]!) * v[c]!
+    if (t < lo) lo = t
+    if (t > hi) hi = t
+  }
+  const e0: number[] = []
+  const e1: number[] = []
+  for (let c = 0; c < C; c++) {
+    e0.push(clamp(Math.round(mean[c]! + lo * v[c]!), 0, 255))
+    e1.push(clamp(Math.round(mean[c]! + hi * v[c]!), 0, 255))
+  }
+  return { e0, e1 }
+}
+
+/**
+ * Refit rounds per seed. Measured on the repo-style test card, a second
+ * round is worth ~0.01 dB against a large chunk of extra encode time — the
+ * seed choice is what matters, not how long the refit is walked — so one
+ * round per seed, matching what the single-seed encoder always did.
+ */
+const MAX_REFIT_ROUNDS = 1
 
 /**
  * Build the palette (levels × C) from 8-bit endpoints and an unq table,
@@ -386,24 +514,67 @@ export function encodeASTC4x4Block(pixels: ASTC4x4Pixels): ASTC4x4Block {
     for (let c = 0; c < C; c++) vals[k * C + c] = pixels8[k * 4 + cls.channels[c]!]!
   }
 
-  // Step 2.
-  const fp = farthestPair(vals, C)
-  let e0: number[] = Array.from({ length: C }, (_, c) => vals[fp.i0 * C + c]!)
-  let e1: number[] = Array.from({ length: C }, (_, c) => vals[fp.i1 * C + c]!)
+  // Steps 2-4: two seeds, each run to convergence, lowest error wins.
+  let e0: number[] = []
+  let e1: number[] = []
+  let indices: Uint8Array = new Uint8Array(16)
+  let err = Infinity
 
-  // Step 3.
-  let { indices, err } = totalSqError(vals, C, e0, e1, cls.unq)
-
-  // Step 4.
-  const refit = refitEndpoints(vals, C, indices, cls.unq)
-  if (refit) {
-    const second = totalSqError(vals, C, refit.e0, refit.e1, cls.unq)
-    if (second.err < err) {
-      e0 = refit.e0
-      e1 = refit.e1
-      indices = second.indices
-      err = second.err
+  /**
+   * Run one seed: score it, then alternate least-squares endpoint refit /
+   * rescore while the error strictly falls. Anything better than the
+   * best-so-far replaces it.
+   */
+  const runSeed = (seed0: readonly number[], seed1: readonly number[]): void => {
+    let curE0 = seed0 as number[]
+    let curE1 = seed1 as number[]
+    let cur = totalSqError(vals, C, curE0, curE1, cls.unq)
+    if (cur.err < err) {
+      e0 = curE0
+      e1 = curE1
+      indices = cur.indices
+      err = cur.err
     }
+    if (cur.err === 0) return
+    for (let round = 0; round < MAX_REFIT_ROUNDS; round++) {
+      const refit = refitEndpoints(vals, C, cur.indices, cls.unq)
+      if (!refit) break
+      const next = totalSqError(vals, C, refit.e0, refit.e1, cls.unq)
+      // Strict: a round that ties has reached a fixed point, and the next
+      // one would refit from the same indices and tie again.
+      if (next.err >= cur.err) break
+      curE0 = refit.e0
+      curE1 = refit.e1
+      cur = next
+      if (cur.err < err) {
+        e0 = curE0
+        e1 = curE1
+        indices = cur.indices
+        err = cur.err
+      }
+      if (cur.err === 0) return
+    }
+  }
+
+  const fp = farthestPair(vals, C)
+  const far0 = Array.from({ length: C }, (_, c) => vals[fp.i0 * C + c]!)
+  const far1 = Array.from({ length: C }, (_, c) => vals[fp.i1 * C + c]!)
+  runSeed(far0, far1)
+
+  // Second seed skipped when the first already encodes the block exactly
+  // (flat and two-tone blocks, which are common), and when the principal
+  // axis lands on the same endpoints — re-running an identical search
+  // cannot change the answer.
+  if (err !== 0) {
+    const pca = principalAxisSeed(vals, C)
+    let same = true
+    for (let c = 0; c < C; c++) {
+      if (pca.e0[c] !== far0[c] || pca.e1[c] !== far1[c]) {
+        same = false
+        break
+      }
+    }
+    if (!same) runSeed(pca.e0, pca.e1)
   }
 
   // Step 5: endpoint ordering. For CEM 8/12 this dodges the decoder's

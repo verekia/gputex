@@ -18,6 +18,6 @@ export { BC5WebGLEncoder } from './BC5WebGLEncoder.js'
 export { BC7WebGLEncoder } from './BC7WebGLEncoder.js'
 export { ASTC4x4WebGLEncoder } from './ASTC4x4WebGLEncoder.js'
 
-export { createWebGLContext, getSharedWebGLContext, isWebGLAvailable } from './webglContext.js'
+export { createWebGLContext, getSharedWebGLContext, peekSharedWebGLContext, isWebGLAvailable } from './webglContext.js'
 export { detectWebGLCapabilities, type WebGLCapabilities, type ExtensionProvider } from './webglCapabilities.js'
 export { selectWebGLFormat, type WebGLFormatSelection } from './selectWebGLFormat.js'

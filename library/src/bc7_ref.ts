@@ -70,42 +70,113 @@ function interp8(e0: number, e1: number, w: number): number {
 }
 
 /**
- * 128-bit little-endian bit writer backed by a single BigInt. Matches
- * the BC7 "LSB-first" bitstream convention — the first value written
- * occupies the low-order bits.
+ * Low `n` bits set, as an unsigned 32-bit value. `1 << 32` is `1` in JS
+ * (shift counts are taken mod 32), so the n = 32 case needs its own arm.
+ */
+function mask32(n: number): number {
+  return n >= 32 ? 0xffffffff : ((1 << n) - 1) >>> 0
+}
+
+/**
+ * 128-bit little-endian bit store as four u32 words, word 0 holding bits
+ * 0..31. Fields are read/written LSB-first and may straddle a word
+ * boundary, so both directions loop over the (at most two) words a field
+ * touches.
+ *
+ * Words rather than a BigInt: every field in a BC7 block is ≤ 8 bits, and
+ * BigInt allocates a fresh heap value per operation — packing and
+ * unpacking blocks this way was a large share of the reference encoder's
+ * runtime. Field values are limited to 32 bits, which every BC7 field
+ * satisfies.
+ */
+function writeBits(w: Uint32Array, pos: number, nBits: number, value: number): void {
+  let v = (value & mask32(nBits)) >>> 0
+  let p = pos
+  let left = nBits < 32 ? nBits : 32
+  while (left > 0) {
+    const idx = p >>> 5
+    const off = p & 31
+    const take = 32 - off < left ? 32 - off : left
+    const m = mask32(take)
+    // Clear then OR, so a rewrite at the same position replaces rather
+    // than merges.
+    w[idx] = ((w[idx]! & ~((m << off) >>> 0)) | ((v & m) << off)) >>> 0
+    v = take >= 32 ? 0 : v >>> take
+    p += take
+    left -= take
+  }
+}
+
+function readBits(w: Uint32Array, pos: number, nBits: number): number {
+  let out = 0
+  let scale = 1
+  let p = pos
+  let left = nBits
+  while (left > 0) {
+    const idx = p >>> 5
+    const off = p & 31
+    const take = 32 - off < left ? 32 - off : left
+    // `* scale` rather than `<< done`: keeps the accumulator a positive
+    // JS number instead of wrapping into int32's sign bit.
+    out += ((w[idx]! >>> off) & mask32(take)) * scale
+    scale *= 2 ** take
+    p += take
+    left -= take
+  }
+  return out
+}
+
+function wordsToBytes(w: Uint32Array): Uint8Array {
+  const out = new Uint8Array(16)
+  for (let i = 0; i < 4; i++) {
+    const v = w[i]!
+    const b = i * 4
+    out[b] = v & 0xff
+    out[b + 1] = (v >>> 8) & 0xff
+    out[b + 2] = (v >>> 16) & 0xff
+    out[b + 3] = (v >>> 24) & 0xff
+  }
+  return out
+}
+
+function bytesToWords(block: BC7Block): Uint32Array {
+  const w = new Uint32Array(4)
+  for (let i = 0; i < 4; i++) {
+    const b = i * 4
+    w[i] = (block[b]! | (block[b + 1]! << 8) | (block[b + 2]! << 16) | (block[b + 3]! << 24)) >>> 0
+  }
+  return w
+}
+
+/**
+ * Append-only 128-bit writer. Matches the BC7 "LSB-first" bitstream
+ * convention — the first value written occupies the low-order bits.
  */
 class BitWriter128 {
-  private bits = 0n
+  private readonly w = new Uint32Array(4)
   private pos = 0
 
   write(value: number, nBits: number): void {
     if (this.pos + nBits > 128) throw new Error('BitWriter128 overflow')
-    const v = BigInt(value) & ((1n << BigInt(nBits)) - 1n)
-    this.bits |= v << BigInt(this.pos)
+    writeBits(this.w, this.pos, nBits, value)
     this.pos += nBits
   }
 
   toBytes(): Uint8Array {
-    const out = new Uint8Array(16)
-    for (let i = 0; i < 16; i++) {
-      out[i] = Number((this.bits >> BigInt(i * 8)) & 0xffn)
-    }
-    return out
+    return wordsToBytes(this.w)
   }
 }
 
 class BitReader128 {
-  private bits: bigint
+  private readonly w: Uint32Array
   private pos = 0
 
   constructor(block: BC7Block) {
-    let b = 0n
-    for (let i = 0; i < 16; i++) b |= BigInt(block[i]!) << BigInt(i * 8)
-    this.bits = b
+    this.w = bytesToWords(block)
   }
 
   read(nBits: number): number {
-    const v = Number((this.bits >> BigInt(this.pos)) & ((1n << BigInt(nBits)) - 1n))
+    const v = readBits(this.w, this.pos, nBits)
     this.pos += nBits
     return v
   }
@@ -124,78 +195,80 @@ export function readBC7Mode(block: BC7Block): number {
 // --- Mode 6 encode ----------------------------------------------------------
 
 /**
- * Quantize an 8-bit channel value to (7-bit, p-bit) where p is already
- * chosen. The effective reconstructed 8-bit is (q << 1) | p.
- * Returns {q, error²} where error² is squared distance from the ideal.
- */
-function quantizeChannelWithPbit(ideal8: number, p: 0 | 1): { q: number; err: number } {
-  // Closest 7-bit `q` such that (q<<1)|p is near ideal8.
-  const q = clamp(Math.round((ideal8 - p) / 2), 0, 127)
-  const effective = (q << 1) | p
-  const d = effective - ideal8
-  return { q, err: d * d }
-}
-
-/**
- * Quantize one endpoint (4 channels) under a fixed shared p-bit choice.
- * Returns the 7-bit RGBA vector and the total squared quantization error.
- */
-function quantizeEndpoint(
-  ideal8: readonly number[],
-  p: 0 | 1,
-): { rgba: [number, number, number, number]; err: number } {
-  const out: [number, number, number, number] = [0, 0, 0, 0]
-  let err = 0
-  for (let c = 0; c < 4; c++) {
-    const r = quantizeChannelWithPbit(ideal8[c]!, p)
-    out[c] = r.q
-    err += r.err
-  }
-  return { rgba: out, err }
-}
-
-/**
  * Build the 16-entry 8-bit-per-channel palette from two 8-bit RGBA endpoints.
  */
 function buildPalette6(
   e0: readonly [number, number, number, number],
   e1: readonly [number, number, number, number],
 ): Uint8Array {
-  // palette[i * 4 + c] = interp8(e0[c], e1[c], W4[i])
   const pal = new Uint8Array(16 * 4)
-  for (let i = 0; i < 16; i++) {
-    const w = W4[i]!
-    const base = i * 4
-    for (let c = 0; c < 4; c++) {
-      pal[base + c] = interp8(e0[c]!, e1[c]!, w)
-    }
-  }
+  fillPalette6(pal, e0[0]!, e0[1]!, e0[2]!, e0[3]!, e1[0]!, e1[1]!, e1[2]!, e1[3]!)
   return pal
 }
 
 /**
- * Nearest palette index for a single RGBA pixel. L2 across all 4 channels.
- * Operates on 8-bit values so the distance metric matches hardware behavior.
+ * `buildPalette6` into a caller-owned buffer, endpoints passed as loose
+ * channels. Identical arithmetic to `interp8`, inlined: the p-bit search
+ * rebuilds this palette eight times per block, so neither the array
+ * allocation nor the per-channel call survives the hot path.
  */
-function assignIndex6(
-  pixel: readonly [number, number, number, number],
-  palette: Uint8Array,
-): { idx: number; err: number } {
-  let bestIdx = 0
-  let bestD = Infinity
+function fillPalette6(
+  pal: Uint8Array,
+  e0r: number,
+  e0g: number,
+  e0b: number,
+  e0a: number,
+  e1r: number,
+  e1g: number,
+  e1b: number,
+  e1a: number,
+): void {
   for (let i = 0; i < 16; i++) {
+    const w = W4[i]!
+    const iw = 64 - w
     const base = i * 4
-    const dr = palette[base]! - pixel[0]!
-    const dg = palette[base + 1]! - pixel[1]!
-    const db = palette[base + 2]! - pixel[2]!
-    const da = palette[base + 3]! - pixel[3]!
-    const d = dr * dr + dg * dg + db * db + da * da
-    if (d < bestD) {
-      bestD = d
-      bestIdx = i
-    }
+    pal[base] = (iw * e0r + w * e1r + 32) >> 6
+    pal[base + 1] = (iw * e0g + w * e1g + 32) >> 6
+    pal[base + 2] = (iw * e0b + w * e1b + 32) >> 6
+    pal[base + 3] = (iw * e0a + w * e1a + 32) >> 6
   }
-  return { idx: bestIdx, err: bestD }
+}
+
+/**
+ * Nearest-palette-entry assignment for all 16 pixels at once, writing the
+ * indices into `indices` and returning the summed squared error.
+ *
+ * Linear scan per pixel with strict `<`, so the lowest index wins a tie.
+ * Pixels and results are carried in loose locals and the caller's buffer
+ * rather than a 4-tuple and a result object per pixel — that is 32
+ * short-lived objects per call, and this runs eight times per block.
+ */
+function assignAllIndices6(pixels8: Uint8Array, palette: Uint8Array, indices: Uint8Array): number {
+  let total = 0
+  for (let k = 0; k < 16; k++) {
+    const b = k * 4
+    const pr = pixels8[b]!
+    const pg = pixels8[b + 1]!
+    const pb = pixels8[b + 2]!
+    const pa = pixels8[b + 3]!
+    let bestIdx = 0
+    let bestD = Infinity
+    for (let i = 0; i < 16; i++) {
+      const c = i * 4
+      const dr = palette[c]! - pr
+      const dg = palette[c + 1]! - pg
+      const db = palette[c + 2]! - pb
+      const da = palette[c + 3]! - pa
+      const d = dr * dr + dg * dg + db * db + da * da
+      if (d < bestD) {
+        bestD = d
+        bestIdx = i
+      }
+    }
+    indices[k] = bestIdx
+    total += bestD
+  }
+  return total
 }
 
 /**
@@ -246,32 +319,16 @@ function refitEndpointsMode6(
   return { e0, e1 }
 }
 
-function totalSqErrorForEndpoints(
-  pixels8: Uint8Array,
-  e0_8: readonly [number, number, number, number],
-  e1_8: readonly [number, number, number, number],
-): { indices: Uint8Array; err: number } {
-  const pal = buildPalette6(e0_8, e1_8)
-  const indices = new Uint8Array(16)
-  let err = 0
-  for (let k = 0; k < 16; k++) {
-    const base = k * 4
-    const sel = assignIndex6([pixels8[base]!, pixels8[base + 1]!, pixels8[base + 2]!, pixels8[base + 3]!], pal)
-    indices[k] = sel.idx
-    err += sel.err
-  }
-  return { indices, err }
-}
-
 /**
  * Pack a mode 6 block into 16 bytes.
- *   e0_7, e1_7 are the 7-bit-per-channel RGBA endpoint vectors.
+ *   e0_7, e1_7 are the 7-bit-per-channel RGBA endpoint vectors (any
+ *   4-element indexable — the search hands over its Int32Array scratch).
  *   p0, p1 are the shared p-bits (one per endpoint).
  *   indices are 4-bit values, with indices[0]'s MSB already guaranteed 0.
  */
 function packMode6Block(
-  e0_7: readonly [number, number, number, number],
-  e1_7: readonly [number, number, number, number],
+  e0_7: ArrayLike<number>,
+  e1_7: ArrayLike<number>,
   p0: 0 | 1,
   p1: 0 | 1,
   indices: Uint8Array,
@@ -329,22 +386,139 @@ function farthestPair(pixels8: Uint8Array): { i0: number; i1: number } {
 }
 
 /**
+ * Seed endpoints from the block's principal axis: power-iterate the 4×4
+ * channel covariance, then take the extremes of the pixels' projection
+ * onto the dominant eigenvector.
+ *
+ * This is the seed the GPU encoders use, and it is a genuinely different
+ * candidate from `farthestPair` rather than a refinement of it. The
+ * farthest pair is by construction two actual pixels, which pins the line
+ * to the data but lets a single outlier drag it off the distribution's
+ * axis; the principal axis is fitted to all sixteen, so it survives
+ * outliers but need not pass through any pixel. Neither dominates, so
+ * both are tried and the lower-error result wins.
+ */
+function principalAxisSeed(pixels8: Uint8Array, e0: Int32Array, e1: Int32Array): void {
+  const mean = [0, 0, 0, 0]
+  for (let k = 0; k < 16; k++) {
+    for (let c = 0; c < 4; c++) mean[c]! += pixels8[k * 4 + c]! / 16
+  }
+  // Upper triangle is enough — the covariance is symmetric — but the full
+  // 4×4 keeps the multiply below branch-free.
+  const cov = new Float64Array(16)
+  const d = [0, 0, 0, 0]
+  for (let k = 0; k < 16; k++) {
+    for (let c = 0; c < 4; c++) d[c] = pixels8[k * 4 + c]! - mean[c]!
+    for (let i = 0; i < 4; i++) {
+      for (let j = 0; j < 4; j++) cov[i * 4 + j]! += d[i]! * d[j]!
+    }
+  }
+  // Power iteration, stopped as soon as the vector settles. A 4×4 with a
+  // dominant eigenvalue converges in a handful of rounds; the zero-length
+  // guard covers the degenerate (flat block) case with no axis at all.
+  let vx = 1,
+    vy = 1,
+    vz = 1,
+    vw = 1
+  for (let it = 0; it < 12; it++) {
+    const nx = cov[0]! * vx + cov[1]! * vy + cov[2]! * vz + cov[3]! * vw
+    const ny = cov[4]! * vx + cov[5]! * vy + cov[6]! * vz + cov[7]! * vw
+    const nz = cov[8]! * vx + cov[9]! * vy + cov[10]! * vz + cov[11]! * vw
+    const nw = cov[12]! * vx + cov[13]! * vy + cov[14]! * vz + cov[15]! * vw
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
+    if (len < 1e-12) break
+    const px = nx / len
+    const py = ny / len
+    const pz = nz / len
+    const pw = nw / len
+    const settled = Math.abs(px - vx) + Math.abs(py - vy) + Math.abs(pz - vz) + Math.abs(pw - vw) < 1e-6
+    vx = px
+    vy = py
+    vz = pz
+    vw = pw
+    if (settled) break
+  }
+  let lo = Infinity
+  let hi = -Infinity
+  for (let k = 0; k < 16; k++) {
+    const b = k * 4
+    const t =
+      (pixels8[b]! - mean[0]!) * vx +
+      (pixels8[b + 1]! - mean[1]!) * vy +
+      (pixels8[b + 2]! - mean[2]!) * vz +
+      (pixels8[b + 3]! - mean[3]!) * vw
+    if (t < lo) lo = t
+    if (t > hi) hi = t
+  }
+  const v = [vx, vy, vz, vw]
+  for (let c = 0; c < 4; c++) {
+    e0[c] = clamp(Math.round(mean[c]! + lo * v[c]!), 0, 255)
+    e1[c] = clamp(Math.round(mean[c]! + hi * v[c]!), 0, 255)
+  }
+}
+
+/** Copy one fit record over another (scratch records are reused). */
+function copyFit(dst: Mode6Fit, src: Mode6Fit): void {
+  dst.e0_7.set(src.e0_7)
+  dst.e1_7.set(src.e1_7)
+  dst.p0 = src.p0
+  dst.p1 = src.p1
+  dst.indices.set(src.indices)
+  dst.err = src.err
+}
+
+/**
+ * Refit rounds per seed. Measured on the repo-style test card, a second
+ * round is worth ~0.01 dB against ~40% more encode time — the seed choice
+ * is what matters, not how long the refit is walked — so one round per
+ * seed it is, matching what the single-seed encoder always did.
+ */
+const MAX_REFIT_ROUNDS = 1
+
+/**
+ * Run one seed to convergence: p-bit search, then alternate least-squares
+ * endpoint refit / p-bit search while the error strictly falls. Anything
+ * that beats `best` is copied into it.
+ */
+function runSeedToConvergence(pixels8: Uint8Array, e0: Int32Array, e1: Int32Array, best: Mode6Fit): void {
+  searchPbitCombos(pixels8, e0, e1, fitRun)
+  if (fitRun.err < best.err) copyFit(best, fitRun)
+  if (fitRun.err === 0) return
+  let prevErr = fitRun.err
+  for (let round = 0; round < MAX_REFIT_ROUNDS; round++) {
+    const refit = refitEndpointsMode6(pixels8, fitRun.indices)
+    if (!refit) break
+    searchPbitCombos(pixels8, refit.e0, refit.e1, fitRun)
+    // Strict: a round that ties has reached a fixed point, and the next
+    // one would refit from the same indices and tie again.
+    if (fitRun.err >= prevErr) break
+    prevErr = fitRun.err
+    if (fitRun.err < best.err) copyFit(best, fitRun)
+    if (fitRun.err === 0) return
+  }
+}
+
+/**
  * Encode 16 RGBA pixels (64 floats in [0,1]) as a BC7 mode 6 block.
  *
  * Algorithm:
  *   1. Convert to 8-bit per channel.
- *   2. Farthest-pair in 4D → initial 8-bit endpoints. (See farthestPair
- *      for why bbox corners aren't safe when channels vary in different
- *      directions along the data line.)
- *   3. For each p-bit combo {(0,0),(0,1),(1,0),(1,1)}:
+ *   2. Two candidate endpoint seeds — the farthest pixel pair in 4D, and
+ *      the block's principal axis. Neither dominates the other (see
+ *      farthestPair and principalAxisSeed), so both are tried.
+ *   3. For each seed, and each p-bit combo {(0,0),(0,1),(1,0),(1,1)}:
  *      quantize each endpoint to 7-bit under its chosen p-bit,
  *      rebuild palette, reassign indices, measure total error.
- *   4. Keep the best p-bit combo.
- *   5. One-pass least-squares refinement on the surviving indices,
- *      re-quantize with p-bit search, accept if error decreases.
+ *   4. Alternate least-squares endpoint refit / p-bit search while the
+ *      error strictly falls, capped at MAX_REFIT_ROUNDS.
+ *   5. Keep the lowest-error fit found across both seeds and every round.
  *   6. Anchor fix: if pixel 0's index has MSB=1, swap endpoints and
  *      invert all indices.
  *   7. Pack.
+ *
+ * Steps 2 and 4 are pure keep-the-best searches over a superset of what a
+ * single seed with a single refit round explores, so no block encodes
+ * worse than it otherwise would.
  */
 export function encodeBC7Mode6Block(pixels: BC7Pixels): BC7Block {
   if (pixels.length !== 64) {
@@ -355,65 +529,62 @@ export function encodeBC7Mode6Block(pixels: BC7Pixels): BC7Block {
   const pixels8 = new Uint8Array(64)
   for (let k = 0; k < 64; k++) pixels8[k] = to8(pixels[k]!)
 
-  // Step 2: initial endpoints via farthest-pair. Per-channel min/max gives
-  // the corners of the RGBA bounding box, which only coincides with the
-  // data-line endpoints when every channel varies in the same direction.
-  // If R rises while G falls (common for colorful gradients), the diagonal
-  // of the bbox doesn't pass through the data at all — the resulting
-  // palette is sideways, and refinement can't escape because the initial
-  // indices are already misassigned. Picking the two pixels that are
-  // farthest apart in 4D pins the endpoints to actual points on the data
-  // line, which works for any channel-orientation combination.
+  // Steps 2-5: two seeds, each run to convergence, lowest error wins.
+  //
+  // Seed A, farthest pair. Per-channel min/max gives the corners of the
+  // RGBA bounding box, which only coincides with the data-line endpoints
+  // when every channel varies in the same direction. If R rises while G
+  // falls (common for colourful gradients), the diagonal of the bbox
+  // doesn't pass through the data at all — the resulting palette is
+  // sideways, and refinement can't escape because the initial indices are
+  // already misassigned. Picking the two pixels that are farthest apart in
+  // 4D pins the endpoints to actual points on the data line, which works
+  // for any channel-orientation combination.
+  fitBest.err = Infinity
   const farthest = farthestPair(pixels8)
-  const ideal0: [number, number, number, number] = [
-    pixels8[farthest.i0 * 4]!,
-    pixels8[farthest.i0 * 4 + 1]!,
-    pixels8[farthest.i0 * 4 + 2]!,
-    pixels8[farthest.i0 * 4 + 3]!,
-  ]
-  const ideal1: [number, number, number, number] = [
-    pixels8[farthest.i1 * 4]!,
-    pixels8[farthest.i1 * 4 + 1]!,
-    pixels8[farthest.i1 * 4 + 2]!,
-    pixels8[farthest.i1 * 4 + 3]!,
-  ]
-
-  // Helper: given ideal 8-bit endpoints and a p-bit choice, quantize to
-  // 7-bit and return (7-bit vec, reconstructed 8-bit vec, quantization err).
-  function quantPair(
-    ideal: readonly [number, number, number, number],
-    p: 0 | 1,
-  ): {
-    seven: [number, number, number, number]
-    eight: [number, number, number, number]
-    err: number
-  } {
-    const r = quantizeEndpoint(ideal, p)
-    const eight: [number, number, number, number] = [
-      (r.rgba[0] << 1) | p,
-      (r.rgba[1] << 1) | p,
-      (r.rgba[2] << 1) | p,
-      (r.rgba[3] << 1) | p,
-    ]
-    return { seven: r.rgba, eight, err: r.err }
+  for (let c = 0; c < 4; c++) {
+    seedA[c] = pixels8[farthest.i0 * 4 + c]!
+    seedB[c] = pixels8[farthest.i1 * 4 + c]!
   }
+  runSeedToConvergence(pixels8, seedA, seedB, fitBest)
 
-  // Step 3: try all 4 p-bit combos for the initial bbox endpoints.
-  let best = tryPbitCombos(pixels8, ideal0, ideal1, quantPair)
-
-  // Step 5: one-pass least-squares refinement + p-bit search.
-  const refit = refitEndpointsMode6(pixels8, best.indices)
-  if (refit) {
-    const candidate = tryPbitCombos(pixels8, refit.e0, refit.e1, quantPair)
-    if (candidate.err < best.err) best = candidate
+  // Seed B, principal axis — fitted to all sixteen pixels rather than
+  // pinned to two of them, so it wins where an outlier drags the farthest
+  // pair off the distribution's axis (see principalAxisSeed).
+  //
+  // Skipped when seed A already encodes the block exactly (flat and
+  // two-tone blocks, which are common), and when the principal axis lands
+  // on the same endpoints seed A used — re-running an identical search
+  // cannot change the answer.
+  if (fitBest.err !== 0) {
+    const farA0 = seedA[0]!
+    const farA1 = seedA[1]!
+    const farA2 = seedA[2]!
+    const farA3 = seedA[3]!
+    const farB0 = seedB[0]!
+    const farB1 = seedB[1]!
+    const farB2 = seedB[2]!
+    const farB3 = seedB[3]!
+    principalAxisSeed(pixels8, seedA, seedB)
+    const same =
+      seedA[0] === farA0 &&
+      seedA[1] === farA1 &&
+      seedA[2] === farA2 &&
+      seedA[3] === farA3 &&
+      seedB[0] === farB0 &&
+      seedB[1] === farB1 &&
+      seedB[2] === farB2 &&
+      seedB[3] === farB3
+    if (!same) runSeedToConvergence(pixels8, seedA, seedB, fitBest)
   }
 
   // Step 6: anchor rule — pixel 0's index MSB must be 0.
+  const best = fitBest
   let e0_7 = best.e0_7
   let e1_7 = best.e1_7
   let p0 = best.p0
   let p1 = best.p1
-  let indices = best.indices
+  const indices = best.indices
   if ((indices[0]! & 0x8) !== 0) {
     // Swap endpoints and invert every index. The decoded palette is the
     // mirror of the original palette, so reflecting indices preserves the
@@ -424,9 +595,7 @@ export function encodeBC7Mode6Block(pixels: BC7Pixels): BC7Block {
     const tmpP = p0
     p0 = p1
     p1 = tmpP
-    const inv = new Uint8Array(16)
-    for (let k = 0; k < 16; k++) inv[k] = 15 - indices[k]!
-    indices = inv
+    for (let k = 0; k < 16; k++) indices[k] = 15 - indices[k]!
   }
 
   // Step 7: pack.
@@ -434,47 +603,106 @@ export function encodeBC7Mode6Block(pixels: BC7Pixels): BC7Block {
 }
 
 /**
- * Exhaustively try the 4 p-bit combinations (p0, p1) ∈ {0,1}² against the
- * given ideal-8-bit endpoints. For each combo, quantize endpoints, rebuild
- * palette, reassign indices, and sum the squared decode error. Returns the
- * combo with the smallest total error.
+ * One p-bit search result. Reused across calls (see `fitRun` / `fitBest`) so the
+ * search allocates nothing per block.
  */
-function tryPbitCombos(
-  pixels8: Uint8Array,
-  ideal0: readonly [number, number, number, number],
-  ideal1: readonly [number, number, number, number],
-  quantPair: (
-    ideal: readonly [number, number, number, number],
-    p: 0 | 1,
-  ) => {
-    seven: [number, number, number, number]
-    eight: [number, number, number, number]
-    err: number
-  },
-): {
-  e0_7: [number, number, number, number]
-  e1_7: [number, number, number, number]
+interface Mode6Fit {
+  /** 7-bit endpoint channels, RGBA. */
+  e0_7: Int32Array
+  e1_7: Int32Array
   p0: 0 | 1
   p1: 0 | 1
   indices: Uint8Array
   err: number
-} {
-  let best: ReturnType<typeof tryPbitCombos> | null = null
-  for (const p0 of [0, 1] as const) {
-    const q0 = quantPair(ideal0, p0)
-    for (const p1 of [0, 1] as const) {
-      const q1 = quantPair(ideal1, p1)
-      // Decode error = decode-distance of each pixel to nearest palette entry.
-      const { indices, err } = totalSqErrorForEndpoints(pixels8, q0.eight, q1.eight)
-      if (best == null || err < best.err) {
-        best = { e0_7: q0.seven, e1_7: q1.seven, p0, p1, indices, err }
+}
+
+function makeFit(): Mode6Fit {
+  return { e0_7: new Int32Array(4), e1_7: new Int32Array(4), p0: 0, p1: 0, indices: new Uint8Array(16), err: 0 }
+}
+
+// Scratch for the mode-6 search. `encodeBC7Mode6Block` is synchronous and
+// non-reentrant, so one module-level set is enough — and it takes the
+// block's allocation count from a few hundred to zero.
+const fitRun = makeFit()
+const fitBest = makeFit()
+const seedA = new Int32Array(4)
+const seedB = new Int32Array(4)
+const scratchPalette = new Uint8Array(16 * 4)
+const scratchIndices = new Uint8Array(16)
+// Quantised endpoint candidates, [p=0 RGBA, p=1 RGBA]: 7-bit stored values
+// and the 8-bit values they reconstruct to.
+const q0Seven = new Int32Array(8)
+const q0Eight = new Int32Array(8)
+const q1Seven = new Int32Array(8)
+const q1Eight = new Int32Array(8)
+
+/**
+ * Quantise one ideal 8-bit endpoint under both p-bit choices, filling
+ * `seven` / `eight` with the p=0 vector at offset 0 and p=1 at offset 4.
+ *
+ * The quantisation error is deliberately not computed: the p-bit search
+ * scores combos by the palette's total decode error, which already
+ * accounts for where quantisation moved the endpoints.
+ */
+function quantizeBothPbits(ideal: ArrayLike<number>, seven: Int32Array, eight: Int32Array): void {
+  for (let p = 0; p < 2; p++) {
+    const base = p * 4
+    for (let c = 0; c < 4; c++) {
+      const q = clamp(Math.round((ideal[c]! - p) / 2), 0, 127)
+      seven[base + c] = q
+      eight[base + c] = (q << 1) | p
+    }
+  }
+}
+
+/**
+ * Exhaustively try the 4 p-bit combinations (p0, p1) ∈ {0,1}² against the
+ * given ideal-8-bit endpoints. For each combo, quantize endpoints, rebuild
+ * palette, reassign indices, and sum the squared decode error. The combo
+ * with the smallest total error is written into `out`.
+ *
+ * Combos are visited in (0,0), (0,1), (1,0), (1,1) order and ties keep the
+ * earlier combo, matching the nested-loop search this replaced.
+ */
+function searchPbitCombos(
+  pixels8: Uint8Array,
+  ideal0: ArrayLike<number>,
+  ideal1: ArrayLike<number>,
+  out: Mode6Fit,
+): void {
+  quantizeBothPbits(ideal0, q0Seven, q0Eight)
+  quantizeBothPbits(ideal1, q1Seven, q1Eight)
+
+  let bestErr = Infinity
+  for (let p0 = 0; p0 < 2; p0++) {
+    const a = p0 * 4
+    for (let p1 = 0; p1 < 2; p1++) {
+      const b = p1 * 4
+      fillPalette6(
+        scratchPalette,
+        q0Eight[a]!,
+        q0Eight[a + 1]!,
+        q0Eight[a + 2]!,
+        q0Eight[a + 3]!,
+        q1Eight[b]!,
+        q1Eight[b + 1]!,
+        q1Eight[b + 2]!,
+        q1Eight[b + 3]!,
+      )
+      const err = assignAllIndices6(pixels8, scratchPalette, scratchIndices)
+      if (err < bestErr) {
+        bestErr = err
+        out.p0 = p0 as 0 | 1
+        out.p1 = p1 as 0 | 1
+        for (let c = 0; c < 4; c++) {
+          out.e0_7[c] = q0Seven[a + c]!
+          out.e1_7[c] = q1Seven[b + c]!
+        }
+        out.indices.set(scratchIndices)
       }
     }
   }
-  // `best` is always set after the loop — the guard on Array.prototype.forEach
-  // wouldn't fire here either; narrow explicitly.
-  if (best == null) throw new Error('unreachable: tryPbitCombos no-op')
-  return best
+  out.err = bestErr
 }
 
 // --- Mode 6 decode ----------------------------------------------------------

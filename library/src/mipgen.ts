@@ -111,19 +111,31 @@ export function padToBlockMultiple(level: MipLevel): MipLevel {
   const ph = (level.height + 3) & ~3
   if (pw === level.width && ph === level.height) return level
   const out = new Uint8ClampedArray(pw * ph * 4)
-  const maxX = level.width - 1
-  const maxY = level.height - 1
-  for (let y = 0; y < ph; y++) {
-    const sy = Math.min(y, maxY)
-    for (let x = 0; x < pw; x++) {
-      const sx = Math.min(x, maxX)
-      const si = (sy * level.width + sx) * 4
-      const di = (y * pw + x) * 4
-      out[di] = level.data[si]!
-      out[di + 1] = level.data[si + 1]!
-      out[di + 2] = level.data[si + 2]!
-      out[di + 3] = level.data[si + 3]!
+  const src = level.data
+  const w = level.width
+  const h = level.height
+  const srcRowBytes = w * 4
+  const dstRowBytes = pw * 4
+  // Copy each real row wholesale, then replicate its last texel across the
+  // ≤ 3 padding columns. `set` on a subarray is a memcpy; the per-pixel
+  // index arithmetic this replaces ran over the WHOLE level, so on a
+  // non-block-aligned 4K base level it was 16M iterations of scalar work.
+  for (let y = 0; y < h; y++) {
+    const di = y * dstRowBytes
+    out.set(src.subarray(y * srcRowBytes, y * srcRowBytes + srcRowBytes), di)
+    const lastTexel = di + srcRowBytes - 4
+    for (let x = w; x < pw; x++) {
+      const d = di + x * 4
+      out[d] = out[lastTexel]!
+      out[d + 1] = out[lastTexel + 1]!
+      out[d + 2] = out[lastTexel + 2]!
+      out[d + 3] = out[lastTexel + 3]!
     }
+  }
+  // Padding rows repeat the last real row verbatim, padding included.
+  const lastRow = (h - 1) * dstRowBytes
+  for (let y = h; y < ph; y++) {
+    out.copyWithin(y * dstRowBytes, lastRow, lastRow + dstRowBytes)
   }
   return { data: out, width: pw, height: ph }
 }

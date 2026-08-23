@@ -48,6 +48,17 @@ export function getSharedWebGLContext(): WebGL2RenderingContext | null {
   return sharedContext
 }
 
+/**
+ * The shared context if one has already been created and is still alive,
+ * else null — never creates one. For teardown paths
+ * (`releaseSharedGpuResources()`), which must not spin up a context just to
+ * discover there is nothing to release.
+ */
+export function peekSharedWebGLContext(): WebGL2RenderingContext | null {
+  if (!sharedContext || sharedContext.isContextLost()) return null
+  return sharedContext
+}
+
 /** True when a WebGL2 context can be created on this platform. */
 export function isWebGLAvailable(): boolean {
   return getSharedWebGLContext() !== null

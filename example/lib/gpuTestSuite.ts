@@ -55,6 +55,15 @@ export interface QualityResult {
    * encode is prohibitively slow (~16 s per format at 4096²).
    */
   refPsnrDb: number | null
+  /**
+   * PSNR over the colour channels only, and over alpha separately (null when
+   * the source is opaque, i.e. alpha carries no signal). Equal-weight RGBA
+   * `psnrDb` can move the wrong way on opaque single-channel maps — see
+   * `computePsnrSplit`.
+   */
+  rgbDb: number
+  alphaDb: number | null
+  refRgbDb: number | null
   thresholdDb: number
   /**
    * Worst EASY block: max over blocks that the CPU reference encodes
@@ -417,6 +426,64 @@ function computePsnr(format: FormatKey, img: ImageData, data: Uint8Array): numbe
 }
 
 /**
+ * PSNR split into the colour channels and alpha, for formats that store
+ * alpha (BC7, ASTC). Equal-weight RGBA hides a trade between the two: a
+ * change can buy alpha accuracy with RGB precision and still show a gain,
+ * which is exactly what happened to BC7's p-bit search — it measured
+ * +3.4 dB RGBA on a displacement map while losing 3 dB of RGB, the only
+ * channels that map actually carries.
+ *
+ * `alphaDb` is null when the source is fully opaque: a constant channel has
+ * no signal to score, and reporting it as if it did is what made the trade
+ * look free.
+ */
+function computePsnrSplit(
+  format: FormatKey,
+  img: ImageData,
+  data: Uint8Array,
+): { rgbDb: number; alphaDb: number | null } {
+  const { bytesPerBlock, decode } = DECODERS[format]
+  const blocksX = (img.width + 3) >> 2
+  const blocksY = (img.height + 3) >> 2
+  let rgbSum = 0
+  let rgbCount = 0
+  let aSum = 0
+  let aCount = 0
+  let opaque = true
+  for (let by = 0; by < blocksY; by++) {
+    for (let bx = 0; bx < blocksX; bx++) {
+      const off = (by * blocksX + bx) * bytesPerBlock
+      const { values, channels } = decode(data.subarray(off, off + bytesPerBlock))
+      for (let ly = 0; ly < 4; ly++) {
+        for (let lx = 0; lx < 4; lx++) {
+          const sx = bx * 4 + lx
+          const sy = by * 4 + ly
+          if (sx >= img.width || sy >= img.height) continue
+          const src = (sy * img.width + sx) * 4
+          const k = (ly * 4 + lx) * channels
+          for (let c = 0; c < channels && c < 3; c++) {
+            const d = values[k + c]! * 255 - img.data[src + c]!
+            rgbSum += d * d
+            rgbCount++
+          }
+          if (channels >= 4) {
+            if (img.data[src + 3]! !== 255) opaque = false
+            const d = values[k + 3]! * 255 - img.data[src + 3]!
+            aSum += d * d
+            aCount++
+          }
+        }
+      }
+    }
+  }
+  const db = (sum: number, count: number): number => (sum === 0 ? Infinity : 10 * Math.log10((255 * 255 * count) / sum))
+  return {
+    rgbDb: db(rgbSum, rgbCount),
+    alphaDb: aCount === 0 || opaque ? null : db(aSum, aCount),
+  }
+}
+
+/**
  * Per-block decoded squared error vs the source (clamp-padded), normalised
  * units, over the channels the format stores.
  */
@@ -650,11 +717,13 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
       // insensitive to a handful of catastrophically wrong blocks.
       let refSse: Float64Array | null = null
       let refPsnrDb: number | null = null
+      let refRgbDb: number | null = null
       if (ref) {
         onProgress(`Quality: ${format} CPU reference baseline on ${image}`)
         const refData = referenceEncode(format, img)
         refSse = perBlockSse(format, img, refData)
         refPsnrDb = computePsnr(format, img, refData)
+        refRgbDb = computePsnrSplit(format, img, refData).rgbDb
       }
 
       const variants: Array<['f16' | 'f32', Encoder]> =
@@ -668,6 +737,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
         onProgress(`Quality: ${format} (${variant}) PSNR on ${image}`)
         const { data } = await enc.encodeToBytes(img)
         const psnrDb = computePsnr(format, img, data)
+        const split = computePsnrSplit(format, img, data)
         const threshold = PSNR_THRESHOLDS[`${format}:${image}`] ?? null
 
         let worstBlockExcess: number | null = null
@@ -689,6 +759,9 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
           image,
           psnrDb,
           refPsnrDb,
+          rgbDb: split.rgbDb,
+          alphaDb: split.alphaDb,
+          refRgbDb,
           thresholdDb: threshold ?? 0,
           worstEasyBlockExcess,
           worstBlockExcess,
