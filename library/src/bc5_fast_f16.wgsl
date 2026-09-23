@@ -71,7 +71,7 @@
 enable f16;
 alias h = f16;
 alias h2 = vec2<f16>;
-struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, };
+struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, y0: u32, };
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
@@ -113,7 +113,9 @@ fn refine(sAA: f32, sBB: f32, sAB: f32, sAR: f32, sBR: f32, b0: u32, b1: u32, sp
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
+  // Row-band encodes dispatch a slice of the block grid starting at row y0.
+  let gid = vec3<u32>(gid_raw.x, gid_raw.y + params.y0, gid_raw.z);
   if (gid.x >= params.blocks_x || gid.y >= params.blocks_y) { return; }
   let bi = gid.y * params.blocks_x + gid.x;
   let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);

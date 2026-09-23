@@ -83,13 +83,19 @@ a bbox diagonal it follows anti-correlated channels, worth **+2–4 dB on
 normal-map-like content**) plus projection-based index assignment (each
 pixel is projected onto the colinear endpoint line in O(1) instead of
 searching every palette entry), and the block bits packed with
-straight-line constant shifts. The formats with coarse 4-level palettes
-(BC1, ASTC) add up to two least-squares endpoint refit rounds accepted per
-block only when they lower the error, and BC5 one; BC7's 16-level mode-6
-palette makes the refit redundant on a principal-axis seed (≤0.05 dB), so
-it skips it and stays the cheapest per pixel. On GPUs that report the
-`shader-f16` feature everything runs in f16 — the f32 shaders are the
-automatic fallback.
+straight-line constant shifts. BC1's coarse 4-level palette adds up to two
+least-squares endpoint refit rounds, solved from per-pass projection
+moments and accepted per block only when they lower the error; its
+near-flat blocks skip the line fit and take the endpoint pair whose ⅔/⅓
+interpolant lands nearest the block colour (direct 565 rounding is up to 4
+levels off — worth up to +3.9 dB on maps with flat regions). BC5 refits
+once; BC7's 16-level mode-6 palette makes the refit redundant on a
+principal-axis seed (≤0.05 dB). ASTC spends every one of its 128 bits: a
+wide-span opaque block gets 16 weight levels with 192-level (trit-coded)
+endpoints, a small-span one exact 8-bit endpoints with 8 levels,
+exactly-grayscale blocks a luminance-only mode with 32 levels. On GPUs that
+report the `shader-f16` feature everything runs in f16 — the f32 shaders
+are the automatic fallback.
 
 ETC2 is the exception to the endpoint-line story: its blocks are per-subblock
 base colours shifted by scalar modifier tables. The encoder exploits the
@@ -109,12 +115,12 @@ stay f32 (they overflow f16), so the two modules produce byte-identical
 output — f16 buys register pressure on mobile GPUs, not different
 results.
 
-On the repo's test cards this lands within **≤0.1 dB** of the exhaustive
-per-block reference encoders (BC5 matches the reference exactly; ASTC and
-BC1-on-normal-maps measure slightly above it), trailing only on adversarial
-high-frequency noise, where any single-line seed loses to an exhaustive
-search — while encoding an order of magnitude faster. See the benchmark
-table below.
+On the repo's test textures this lands within a few tenths of a dB of the
+per-block CPU reference encoders (`gputex/testing`) and above them on
+several (BC5 matches exactly; BC1 on flat content, BC7 and ASTC on some
+maps measure above), trailing only on adversarial high-frequency noise,
+where any single-line seed loses to an exhaustive search — while encoding
+an order of magnitude faster. See the benchmark table below.
 
 #### SVG sources
 
@@ -331,39 +337,46 @@ readback) rather than a round trip per level.
 
 ## Benchmarks
 
-Measured with the repo's GPU test suite (see below) on an Apple Silicon GPU
-(`metal-3`) in Chrome, encoding a 2048×2048 image. **GPU pass** is the compute
-shader alone (WebGPU timestamp queries, median of 20 runs); end-to-end wall
-time adds ~2–4 ms of image upload + result readback regardless of format.
-Each encoder caches its GPU resources (source texture, output/staging
-buffers, bind group) across encodes, so repeated encodes — including mip
-chains — skip per-call allocation: in an interleaved A/B this cuts BC7
-end-to-end wall time by ~10% at 512², ~20% at 1024–2048² and ~35% at 4096².
+Measured on an Apple Silicon GPU (`metal-3`, M3) in Chrome with the `/eval`
+dev page: per-dispatch compute time from timestamp queries over batches of
+back-to-back dispatches, all variants interleaved in one session, encoding
+the procedural 2048×2048 benchmark image. **GPU pass** is the compute
+shader alone.
 
 | Format   | Shader        | GPU pass    |
 | -------- | ------------- | ----------- |
-| BC1      | f16 (default) | **0.26 ms** |
-| BC1      | f32           | 0.46 ms     |
-| BC5      | f16 (default) | **0.26 ms** |
-| BC5      | f32           | 0.26 ms     |
-| BC7      | f16 (default) | **0.26 ms** |
-| BC7      | f32           | 0.59 ms     |
-| ASTC 4×4 | f16 (default) | **0.26 ms** |
-| ASTC 4×4 | f32           | 0.56 ms     |
+| BC1      | f16 (default) | **0.33 ms** |
+| BC1      | f32           | 0.50 ms     |
+| BC5      | f16 (default) | **0.14 ms** |
+| BC5      | f32           | 0.15 ms     |
+| BC7      | f16 (default) | **0.19 ms** |
+| BC7      | f32           | 0.52 ms     |
+| ASTC 4×4 | f16 (default) | **0.17 ms** |
+| ASTC 4×4 | f32           | 0.28 ms     |
 | ETC2     | f16 + f32     | 0.20 ms     |
 
-The ETC2 figure is the interleaved `/ab` harness measurement (batched
-dispatches, clock-stable). On a 100 GB/s part just reading the 2048² RGBA8
-source costs ~0.15 ms, so the entire selection algorithm adds ~30% on top
-of touching the bytes. Two faster variants live in git history and were
-deliberately not shipped: a two-pass 2 B/px prepared source (encode pass
+End-to-end `encodeToBytes()` wall time adds the upload and the readback.
+Each encoder caches its GPU resources (source texture, output/staging
+buffers, bind groups) across encodes, and outputs above ~3 MB are encoded
+in row bands — one submission and staging buffer per ~2 MB of output, so
+the readback of one band (a GPU-process copy that dominated large encodes)
+overlaps the compute of the next — with the result array pre-faulted while
+the GPU works. In an interleaved A/B against the single-submission
+readback this cuts wall time by 23–33% at 4096² and 5–25% at 2048²
+(bytes identical); a fresh 4096² encode is then dominated by the ~8 ms
+`copyExternalImageToTexture` upload.
+
+On a 100 GB/s part just reading the 2048² RGBA8 source costs ~0.15 ms, so
+BC5/BC7/ASTC/ETC2 sit within ~1.3× of simply touching the bytes; BC1's
+refit rounds keep it ALU-bound. Two faster ETC2 variants live in git
+history and were deliberately not shipped: a two-pass 2 B/px prepared source (encode pass
 0.115 ms, but the prep pass is also bandwidth-bound and cannot overlap, so
 the per-texture total regressed) and an O(1) hedged table pick (−3% for
 −0.5 dB — a poor trade against the scored search).
 
-Timestamps are quantised to 100 µs by Chrome and Apple GPU clock states swing
-timings by ~2×, so sub-millisecond figures are indicative (±0.1 ms); compare
-variants only within a single session.
+Single-dispatch timestamps are coarse and Apple GPU clock states swing
+timings by up to ~2× across page loads, so compare variants only within a
+single session, interleaved (as `/eval` and `/ab` do).
 
 ## Testing
 
@@ -381,6 +394,19 @@ A second page, `/bench`, measures median end-to-end `encodeToBytes()` wall
 time per format across image sizes (256²–4096²) — the numbers that matter
 for runtime streaming, where host overhead dominates small textures
 (results on `window.__GPUTEX_BENCH__`).
+
+For shader work, `/eval` compares WGSL variants on speed AND quality in one
+session: `example/scripts/ab-sync.sh` snapshots the working-tree shaders
+(`<fmt>_work`) and git HEAD's (`<fmt>_head`) into `example/public/ab/`, and
+`/eval?shaders=bc7_f16_head,bc7_f16_work` times them interleaved and scores
+each image through the GPU's own hardware decoder (the encoded blocks are
+copied into a real compressed texture and sampled), reporting PSNR, blocks
+that got worse/better, the worst regression on blocks the first variant
+encodes near-losslessly, and byte-identical coverage — over the full
+1K/2K/4K texture corpus in seconds (`window.__GPUTEX_EVAL__`). For host-side
+changes, `example/scripts/ab-lib.sh` builds git HEAD's library and the
+working tree side by side (`/ab/gputex_head.js`, `/ab/gputex_work.js`) so
+both can be driven in one page with alternating calls.
 
 The page runs three groups against the live WebGPU device and renders
 PASS/FAIL tables (machine-readable copy on `window.__GPUTEX_TESTS__`):
