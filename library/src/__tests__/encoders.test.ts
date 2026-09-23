@@ -52,7 +52,7 @@ describe('f16 fast shader variants', () => {
   it("ETC2's f16 module is the exact-value port (big sums stay f32)", () => {
     const view: AnyProto = Object.create(ETC2Encoder.prototype)
     const src: string = view.wgslSourceFastF16()
-    expect(src).toContain('array<f16, 16>')
+    expect(src).toContain('array<vec4<f16>, 4>')
     expect(src).toContain('EXACT-VALUE f16')
   })
 })

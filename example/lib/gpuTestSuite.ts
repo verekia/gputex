@@ -167,17 +167,17 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 50.7,
-  // ETC2 (2026-07, minus ~0.15 dB; SETTLED at the two-candidate scored
-  // search + planar + no refit — the hedged O(1) table pick saved ~3% GPU
-  // for −0.5 dB and was reverted, the two-pass prepared source lost
-  // per-texture; both live in git history. f16 and f32 modules are
-  // byte-identical (exact-value f16), so both rows share these pins. The
-  // low 'color'-card number is the format, not the encoder: ETC1-family
-  // blocks modulate only luma per pixel, so the card's per-pixel chroma
-  // checkers crater without the unimplemented T/H modes.
+  // ETC2 (observed minus ~0.15 dB). The 2026-09 speed rewrite (gather
+  // loads, register-resident lumas, gray-only dual-flip scoring) is ~1.7×
+  // faster and moved rock-color-1k up 33.79 → 33.86 (κ flip preselect);
+  // the other rows are unchanged to 0.002 dB. f16 and f32 modules are
+  // byte-identical on Apple (exact-value f16), so both rows share these
+  // pins. The low 'color'-card number is the format, not the encoder:
+  // ETC1-family blocks modulate only luma per pixel, so the card's
+  // per-pixel chroma checkers crater without the unimplemented T/H modes.
   'etc2:color': 19.82,
   'etc2:packed-1024': 31.86,
-  'etc2:rock-color-1k': 33.64,
+  'etc2:rock-color-1k': 33.7,
   'etc2:rock-roughness-1k': 39.99,
   'etc2:wood-color-1k': 39.06,
   'bc5:wood-normal-1k': 48.0,
@@ -237,9 +237,9 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc1:wood-color-1k': 0.05,
   'bc7:wood-color-1k': 0.05,
   'astc:wood-color-1k': 0.05,
-  // ETC2 (2026-07 scored-search shader, observed 0.291 / 0.029 / 0.112 /
-  // 0.023 / 0.038 — estimate-based selection trails the exact reference a
-  // little more per block than the other formats' exact searches do).
+  // ETC2 (observed 0.291 / 0.029 / 0.083 / 0.023 / 0.038 — estimate-based
+  // selection trails the exact reference a little more per block than the
+  // other formats' exact searches do).
   'etc2:color': 0.45,
   'etc2:packed-1024': 0.05,
   'etc2:rock-color-1k': 0.2,
@@ -508,8 +508,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     astc: new ASTC4x4Encoder({ device, adapter, disableF16: true }),
     etc2: new ETC2Encoder({ device, adapter, disableF16: true }),
   }
-  // ETC2 (and any future integer-domain encoder) ships no f16 module — its
-  // only variant is f32, so the f16/f32 twin logic below collapses for it.
+  // Formats without an f16 module collapse the f16/f32 twin logic below.
   const hasF16Variant = (format: FormatKey): boolean => hasF16 && encoders[format].wgslSourceFastF16() !== null
 
   onProgress('Loading test images…')
