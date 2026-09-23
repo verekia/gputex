@@ -26,7 +26,8 @@
 //   'fast' (default): the CPU mirror of etc2.wgsl's scalar-luma encoder —
 //     the ETC1 modifier is a scalar shift along (1,1,1), so table and index
 //     selection run on D = luma(p) − luma(base) alone (exact modulo decode
-//     clamping): O(1) flip preselect from quadrant variance, subblock-average
+//     clamping): O(1) flip preselect from quadrant variance (both flips
+//     scored for exactly-gray blocks), subblock-average
 //     bases (differential when the delta fits, else individual), a
 //     two-candidate table search around max|D| (no base refit — dropped
 //     as a speed/quality trade), and a closed-form planar contest.
@@ -482,6 +483,8 @@ const A3 = MODIFIERS.map(m => 3 * m[0])
 const B3 = MODIFIERS.map(m => 3 * m[1])
 const THR3 = MODIFIERS.map(m => 1.5 * (m[0] + m[1]))
 const PLANAR_FUDGE = 8
+// Fraction of the luma variance the flip preselect treats as absorbed.
+const KAPPA = 0.9
 
 /** Σ m3·(m3 − 2|D|) for one table over a subblock's D values (×3 scale). */
 function fastTableScore(D: readonly number[], t: number): number {
@@ -602,20 +605,21 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
     return evalCodes(flip, s0, s1, diff, c)
   }
 
-  // O(1) flip preselect: within-variance minus the luma-direction component
-  // the modifier tables can absorb, summed over both subblocks. For
-  // exact-grayscale blocks BOTH residuals are identically zero (all
-  // variance is along luma), so near-ties fall back to scoring both flips.
+  // O(1) flip preselect: within-variance minus KAPPA of the luma-direction
+  // component the modifier tables can absorb, summed over both subblocks.
+  // Exactly-gray blocks (every quadrant's R, G and B sums equal) have no
+  // chroma to steer it, so both flips are scored.
   const residual = (s: { sum: number[]; sq: number; lsq: number }): number => {
     const dotSum = s.sum[0]! * s.sum[0]! + s.sum[1]! * s.sum[1]! + s.sum[2]! * s.sum[2]!
     const lsum = s.sum[0]! + s.sum[1]! + s.sum[2]!
-    return s.sq - dotSum / 8 - (s.lsq - (lsum * lsum) / 8) / 3
+    return s.sq - dotSum / 8 - (KAPPA * (s.lsq - (lsum * lsum) / 8)) / 3
   }
   const resA = residual(pair(0, 2)) + residual(pair(1, 3))
   const resB = residual(pair(0, 1)) + residual(pair(2, 3))
+  const gray = qsum.every(q => q[0] === q[1] && q[1] === q[2])
   let flip: number
   let cur: FlipEval
-  if (Math.abs(resA - resB) < 1) {
+  if (gray) {
     const fa = evalFlip(0, pair(0, 2), pair(1, 3))
     const fb = evalFlip(1, pair(0, 1), pair(2, 3))
     flip = fb.est < fa.est ? 1 : 0

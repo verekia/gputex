@@ -3,78 +3,75 @@
 // Each invocation encodes one 4x4 pixel block into an 8-byte ETC2 RGB8 block
 // written as 2 x u32 into the destination storage buffer. ETC2 blocks are
 // big-endian on the wire (byte 0 = bits 63..56), so both words are byte-
-// swapped on the way out. This is that f16 module.
+// swapped on the way out. This is the f16 module; etc2.wgsl is the f32
+// fallback with the same algorithm.
 //
 // EXACT-VALUE f16: unlike the other formats' f16 fast paths (which accept
-// float rounding in a [0,1] domain), every f16 value in this shader is an
-// integer that f16 represents exactly — lumas and bases (<= 765), D values
-// (|D| <= 765) and thresholds (<= 549) all sit below f16's 2048 integer-
-// exactness limit. Sums of squares, scores and estimates stay f32 (they
-// reach +-5e5..9e6, far past f16's 65504 max). The output is therefore
-// BYTE-IDENTICAL to the f32 module — verified per-block on the suite
-// textures — and the two modules share every pin and every test gate.
+// float rounding in a [0,1] domain), the f16 values here are integers (or
+// half-integers) that f16 represents exactly — per-texel lumas and base
+// lumas (<= 765), luma deviations |D| (<= 765) and the index thresholds
+// (<= 345, halves included) all sit below f16's exactness limits. Sums,
+// scores and estimates stay f32 (they reach ~1e6). Where the sampler's
+// unorm→float conversion is exact (verified on Apple/metal-3), the f16 and
+// f32 modules are BYTE-IDENTICAL; elsewhere they can differ only on exact
+// decision ties. f16 buys register space (the 16 lumas are 4 × vec4<f16>)
+// and measured 1-3% faster than the f32 module on Apple.
 //
-// What f16 buys here is register pressure (the luma array halves), not
-// arithmetic rate: on Apple/metal-3 the two modules measure identical
-// (the shader is DRAM-read-bound), but on the mobile GPUs where ETC2 is
-// actually the target format, occupancy from smaller registers is the
-// cheapest speed there is. The COLOUR accumulators deliberately stay f32
-// even though quadrant/pair sums (<= 2040) would be exact in f16: porting
-// them measured 15% SLOWER on Apple (conversion traffic outweighs the
-// register saving). Luma + the table search are the f16 surface.
-//
-// ALGORITHM — scalar-luma selection (2026-07 rewrite; the original
-// brute-force 8-table × 4-modifier × vec3-with-clamp search measured
-// 6.0 ms @2048² on Apple/metal-3, this one ~0.197 ms with the DRAM read
-// floor — 16 loads + store, nothing else — at ~0.15). This is the SETTLED
-// speed/quality point: the two-candidate scored search below was once
-// swapped for an O(1) hedged pick (−4-7% GPU) but cost −0.5 dB average —
-// a ~10× worse dB-per-percent trade than the refit drop — and was
-// restored. A two-pass prepared-source variant (encode pass 0.115 ms) is
-// in git history: its prep pass is also DRAM-bound and cannot overlap,
-// so the per-texture total regressed. Reading the full RGBA8 source once
-// is this machine's hard floor for any single-pass encoder; the ~0.045
-// above it is the whole algorithm.
+// ALGORITHM — scalar-luma selection:
 //
 //   • The ETC1 modifier is a SCALAR shift along (1,1,1), so per texel
 //     err(m) = ||e||² − 2mD + 3m² with D = luma(p) − luma(base), where
 //     luma(x) = x.r+x.g+x.b. Selection therefore needs only |D| threshold
-//     tests: the best table entry is the m with 3m nearest D (A3/B3/THR
-//     below), and Σ||e||² per subblock is O(1) from the load loop's
-//     quadrant sums (Σ||p||² − 2·base·Σp + 8·||base||²). This estimate is
-//     EXACT for unclamped decode and an UPPER BOUND on the true clamped
-//     error (clamping toward [0,255] can only shrink per-channel error),
-//     so every est-based gate is conservative.
-//   • Flip preselect, O(1): per subblock the residual after PERFECT
-//     continuous luma modulation is within-variance − (luma variance)/3;
-//     the flip with the smaller summed residual wins and only it is
-//     searched (both-flip est search measured +23% GPU for ≤0.15 dB).
-//     Exact-grayscale blocks have BOTH residuals identically zero (all
-//     variance is along luma), so near-ties fall back to scoring both
-//     flips — without that, roughness/AO-style content loses ~1.25 dB.
+//     tests, and Σ||e||² per subblock is O(1) from the quadrant sums. The
+//     block-constant Σ||p||² is dropped from EVERY estimate (ETC1 flips and
+//     planar alike): only differences between estimates are ever used.
+//     The estimate is exact for unclamped decode and an upper bound on the
+//     true clamped error.
+//   • Loads: 4 textureGather quads × R,G,B for interior blocks (the gather
+//     point, normalised by the PHYSICAL texture size, sits exactly between
+//     the quad's texel centres; interior quads never touch the zeroed
+//     padding strip). Blocks straddling the edge of a non-multiple-of-4
+//     image fall back to clamped per-texel loads. Lumas are kept as 4
+//     COLUMN vectors — wire pixel order is x·4 + y — so both flips' half-
+//     blocks and the index packing use only constant indexing.
+//   • Flip preselect, O(1): per subblock the residual after continuous luma
+//     modulation is within-variance − κ·(luma variance)/3, κ = 0.9. κ = 1
+//     is the exact chroma residual; keeping a tenth of the luma variance
+//     prefers the split with less luma spread for the 4-level tables to
+//     cover (+0.07-0.10 dB on photo colour vs κ = 1, free). Only the chosen
+//     flip is searched.
+//   • Exactly-gray blocks (every quadrant's R, G and B sums equal) have no
+//     chroma to steer the preselect, so both flips are scored — worth
+//     ~0.3 dB on roughness/AO content over any O(1) proxy tried (luma
+//     variance, luma range, squared range all land at −0.30 dB). They use
+//     a one-channel copy of the fit (fit_gray) and the second flip is a
+//     separate straight-line call: the older single-call-site loop cost
+//     7-9% even on colour content that never ran its second iteration.
+//     Widening the second evaluation to chroma near-ties (the previous
+//     rule) cost 12-25% on colour textures through warp divergence for
+//     ≤ 0.015 dB.
 //   • Table search is pruned to two candidates — the table whose LARGE
 //     magnitude covers max|D| and its lower neighbour (outlier hedge).
-//     One candidate loses ~1.2-1.6 dB on photos; all eight gain ≤0.05 dB.
-//   • NO base refit. The refit family (base ← subblock mean − mean chosen
-//     modifier) was worth ~0.2 dB on photographic colour (rock-color
-//     33.98 → 33.79 without it) but even its cheapest accepted form cost
-//     ~13% GPU and the exact-accept original ~30% — dropped 2026-07 as a
-//     deliberate speed/quality trade; see the suite baselines.
-//   • PLANAR runs unconditionally: with the right-hand sides folded into
-//     the load loop the LSQ solve is O(1) (the Gram inverse of the fixed
-//     sample positions is a constant, det = 25) and its residual is the
-//     closed-form Σ||p||² − 2·θ·rhs + θᵀGθ evaluated with the QUANTISED,
-//     clamped corners — exact up to decode's floor-rounding, and crucially
-//     clamp-aware (a continuous-corner estimate mis-picks planar on steep
-//     gradients). Gating planar cost −0.31 dB on smooth content for zero
-//     measured speed.
+//     One candidate loses ~0.7-2.9 dB; all eight gain ≤ 0.05 dB. Scores use
+//     the min form: per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) is the
+//     threshold rule exactly, and its a3 part sums in closed form.
+//   • NO base refit (worth ~0.2 dB on photo colour for ≥ 13% GPU).
+//   • PLANAR runs unconditionally: the LSQ solve is O(1) from the block sum
+//     and the first moments Σx·p, Σy·p (the Gram inverse of the fixed
+//     sample positions is a constant; folding it into fewer coefficients
+//     saved ~1% but resolved rounding ties unlike the CPU mirror on ~9% of
+//     the colour card's blocks), and its residual is the closed form
+//     −2·θ·rhs + θᵀGθ evaluated with the QUANTISED, clamped corners —
+//     clamp-aware, which a continuous-corner estimate is not. Gating the
+//     quantised evaluation on the continuous plane's residual (an exact
+//     lower bound) is byte-identical but measured 0-1%: ~half the warps
+//     still hold a block that needs it.
 //   • T and H modes are decoded by hardware but never emitted — their win
-//     is limited to two-chroma-cluster blocks (the colour card's per-pixel
-//     chroma checkers are the visible gap) and needs a clustering pass.
+//     is limited to two-chroma-cluster blocks and needs a clustering pass.
 //
-// Numeric notes: texel loads use round(load·255) (integer-exact unorm trip);
-// every m3 in A3/B3 is divisible by 3 so m = m3/3 is exact; est values are
-// integer sums held exactly in f32 (< 2^24).
+// Numeric notes: every m3 in A3/B3 is divisible by 3 so m = m3/3 is exact;
+// est values are integer sums held exactly in f32 (< 2^24) apart from the
+// planar solve's decimal weights.
 
 enable f16;
 
@@ -89,6 +86,7 @@ struct Params {
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var smp: sampler;
 
 const A3  = array<f32, 8>(6.0, 15.0, 27.0, 39.0, 54.0, 72.0, 99.0, 141.0);
 const B3  = array<f32, 8>(24.0, 51.0, 87.0, 126.0, 180.0, 240.0, 318.0, 549.0);
@@ -98,24 +96,10 @@ const THR = array<f32, 8>(15.0, 33.0, 57.0, 82.5, 117.0, 156.0, 208.5, 345.0);
 // decode's floor-rounding (±½ per sample) is unmodelled. This small bias
 // keeps near-ties on the predictable ETC1 side.
 const PLANAR_FUDGE = 8.0;
-
-fn texel_of(flip: u32, sb: u32, i: u32) -> u32 {
-  if (flip == 0u) {
-    return (i >> 1u) * 4u + sb * 2u + (i & 1u);
-  }
-  return (sb * 2u + (i >> 2u)) * 4u + (i & 3u);
-}
-
-fn quant_codes(v: vec3<f32>, max_code: vec3<f32>) -> vec3<u32> {
-  return vec3<u32>(clamp(floor(v * max_code * (1.0 / 255.0) + 0.5), vec3<f32>(0.0), max_code));
-}
-
-fn extend4(c: vec3<u32>) -> vec3<f32> {
-  return vec3<f32>((c << vec3<u32>(4u)) | c);
-}
-fn extend5(c: vec3<u32>) -> vec3<f32> {
-  return vec3<f32>((c << vec3<u32>(3u)) | (c >> vec3<u32>(2u)));
-}
+// Fraction of the luma variance the flip preselect treats as absorbed.
+const KAPPA = 0.9;
+const ONE3 = vec3<f32>(1.0);
+const ONE4 = vec4<f32>(1.0);
 
 fn signed3(bits: u32) -> i32 {
   return select(i32(bits), i32(bits) - 8, bits > 3u);
@@ -125,133 +109,163 @@ fn bswap(x: u32) -> u32 {
   return ((x & 0xffu) << 24u) | ((x & 0xff00u) << 8u) | ((x >> 8u) & 0xff00u) | (x >> 24u);
 }
 
-struct BasePair {
-  codes0: vec3<u32>,
-  codes1: vec3<u32>,
-  ok: bool,
+fn max4(v: vec4<f16>) -> f16 {
+  return max(max(v.x, v.y), max(v.z, v.w));
+}
+
+// Base colours from subblock SUMS (8 texels each): codes (as floats) and
+// their 8-bit expansions. Differential mode when the 5-bit codes are within
+// the 3-bit delta range, else individual 4-bit. Expansions in float:
+// (q<<3)|(q>>2) = floor(8.25·q) for 5 bits, (q<<4)|q = 17·q for 4 bits.
+struct Bases {
+  c0: vec3<f32>,
+  c1: vec3<f32>,
+  b0: vec3<f32>,
+  b1: vec3<f32>,
+  diff: bool,
 };
-fn quantise_bases(avg0: vec3<f32>, avg1: vec3<f32>, diff: bool, clamp_delta: bool) -> BasePair {
-  var out: BasePair;
-  out.ok = true;
-  if (!diff) {
-    out.codes0 = quant_codes(avg0, vec3<f32>(15.0));
-    out.codes1 = quant_codes(avg1, vec3<f32>(15.0));
-    return out;
-  }
-  let q0 = vec3<i32>(quant_codes(avg0, vec3<f32>(31.0)));
-  let q1 = vec3<i32>(quant_codes(avg1, vec3<f32>(31.0)));
+fn quantise_bases(sum0: vec3<f32>, sum1: vec3<f32>) -> Bases {
+  let q0 = floor(sum0 * (31.0 / 2040.0) + 0.5);
+  let q1 = floor(sum1 * (31.0 / 2040.0) + 0.5);
   let d = q1 - q0;
-  if (any(d < vec3<i32>(-4)) || any(d > vec3<i32>(3))) {
-    if (!clamp_delta) {
-      out.ok = false;
-      return out;
-    }
-  }
-  out.codes0 = vec3<u32>(q0);
-  out.codes1 = vec3<u32>(q0 + clamp(d, vec3<i32>(-4), vec3<i32>(3)));
-  return out;
+  var o: Bases;
+  o.diff = all(d >= vec3<f32>(-4.0)) && all(d <= vec3<f32>(3.0));
+  let i0 = floor(sum0 * (15.0 / 2040.0) + 0.5);
+  let i1 = floor(sum1 * (15.0 / 2040.0) + 0.5);
+  o.c0 = select(i0, q0, o.diff);
+  o.c1 = select(i1, q1, o.diff);
+  o.b0 = select(i0 * 17.0, floor(q0 * 8.25), o.diff);
+  o.b1 = select(i1 * 17.0, floor(q1 * 8.25), o.diff);
+  return o;
+}
+
+// Subblock error (×3) of table t under the threshold rule, in min form:
+// per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) = (a3² − 2·a3·ad) +
+// min(0, (b3² − a3²) − 2·(b3 − a3)·ad); the a3 part sums in closed form
+// from sad = Σ ad.
+fn table_score(au: vec4<f32>, av: vec4<f32>, sad: f32, t: u32) -> f32 {
+  let a3 = A3[t];
+  let b3 = B3[t];
+  let dk = b3 * b3 - a3 * a3;
+  let dm = -2.0 * (b3 - a3);
+  let eu = min(vec4<f32>(0.0), au * dm + dk);
+  let ev = min(vec4<f32>(0.0), av * dm + dk);
+  return 8.0 * a3 * a3 - 2.0 * a3 * sad + dot(eu + ev, ONE4);
 }
 
 struct SearchOut {
   table: u32,
   acc: f32,
 };
-// D-domain values (|D| <= 765, thresholds <= 549) are exact in f16; the
-// score PRODUCTS reach +-5e5 and must be f32.
-fn sb_table_score(luma: ptr<function, array<f16, 16>>, flip: u32, sb: u32, lb: f16, t: u32) -> f32 {
-  let a3 = f16(A3[t]);
-  let b3 = f16(B3[t]);
-  let thr = f16(THR[t]);
-  var acc = 0.0;
-  for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-    let ad = abs((*luma)[texel_of(flip, sb, i)] - lb);
-    let m3 = f32(select(a3, b3, ad > thr));
-    acc = acc + m3 * (m3 - 2.0 * f32(ad));
-  }
-  return acc;
-}
-fn sb_search(luma: ptr<function, array<f16, 16>>, flip: u32, sb: u32, lb: f16) -> SearchOut {
-  var mx: f16 = 0.0;
-  for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-    mx = max(mx, abs((*luma)[texel_of(flip, sb, i)] - lb));
-  }
-  let mxf = f32(mx);
-  let cover = min(
-    u32(mxf > 24.0) + u32(mxf > 51.0) + u32(mxf > 87.0) + u32(mxf > 126.0) +
-    u32(mxf > 180.0) + u32(mxf > 240.0) + u32(mxf > 318.0),
-    7u,
-  );
-  let t_lo = select(cover - 1u, 0u, cover == 0u);
-  let acc_lo = sb_table_score(luma, flip, sb, lb, t_lo);
-  let acc_hi = sb_table_score(luma, flip, sb, lb, cover);
-  var out: SearchOut;
+// One subblock (lumas u, v) against base luma lb. |D| is exact in f16; the
+// scores need f32.
+fn sb_search(u: vec4<f16>, v: vec4<f16>, lbf: f32) -> SearchOut {
+  let lb = f16(lbf);
+  let ah = abs(u - lb);
+  let bh = abs(v - lb);
+  let mx = max(max4(ah), max4(bh));
+  let au = vec4<f32>(ah);
+  let av = vec4<f32>(bh);
+  let sad = dot(au + av, ONE4);
+  // cover = #{B3[k] < mx : k < 7}, the first table whose large modifier
+  // reaches mx — a binary search over the 7 thresholds.
+  let s1 = mx > 126.0h;
+  let s2 = mx > select(51.0h, 240.0h, s1);
+  let s3 = mx > select(select(24.0h, 87.0h, s2), select(180.0h, 318.0h, s2), s1);
+  let cover = select(0u, 4u, s1) + select(0u, 2u, s2) + select(0u, 1u, s3);
+  let t_lo = max(cover, 1u) - 1u;
+  let acc_lo = table_score(au, av, sad, t_lo);
+  let acc_hi = table_score(au, av, sad, cover);
   let lo_wins = acc_lo <= acc_hi;
+  var out: SearchOut;
   out.table = select(cover, t_lo, lo_wins);
   out.acc = select(acc_hi, acc_lo, lo_wins);
   return out;
 }
 
-// One flip's base quantisation + table search: everything the flip contest
-// and the index derivation need.
+// One flip's fit: base quantisation + table search, and its estimate
+// (Σ||p||² omitted).
 struct FlipFit {
   est: f32,
-  diff: bool,
-  bases: BasePair,
+  bases: Bases,
   lb0: f32,
   lb1: f32,
   t0: u32,
   t1: u32,
 };
-fn eval_flip(
-  luma: ptr<function, array<f16, 16>>,
-  flip: u32,
+fn fit_flip(
+  s0u: vec4<f16>,
+  s0v: vec4<f16>,
+  s1u: vec4<f16>,
+  s1v: vec4<f16>,
   sum0: vec3<f32>,
-  sq0: f32,
   sum1: vec3<f32>,
-  sq1: f32,
 ) -> FlipFit {
-  let avg0 = sum0 * 0.125;
-  let avg1 = sum1 * 0.125;
-  let try_diff = quantise_bases(avg0, avg1, true, false);
   var out: FlipFit;
-  out.diff = try_diff.ok;
-  if (out.diff) {
-    out.bases = try_diff;
-  } else {
-    out.bases = quantise_bases(avg0, avg1, false, false);
-  }
-  var b0: vec3<f32>;
-  var b1: vec3<f32>;
-  if (out.diff) {
-    b0 = extend5(out.bases.codes0);
-    b1 = extend5(out.bases.codes1);
-  } else {
-    b0 = extend4(out.bases.codes0);
-    b1 = extend4(out.bases.codes1);
-  }
+  out.bases = quantise_bases(sum0, sum1);
+  let b0 = out.bases.b0;
+  let b1 = out.bases.b1;
   out.lb0 = b0.r + b0.g + b0.b;
   out.lb1 = b1.r + b1.g + b1.b;
-  let s0 = sb_search(luma, flip, 0u, f16(out.lb0));
-  let s1 = sb_search(luma, flip, 1u, f16(out.lb1));
-  out.t0 = s0.table;
-  out.t1 = s1.table;
-  out.est = (sq0 - 2.0 * dot(b0, sum0) + 8.0 * dot(b0, b0)) +
-            (sq1 - 2.0 * dot(b1, sum1) + 8.0 * dot(b1, b1)) +
-            (s0.acc + s1.acc) * (1.0 / 3.0);
+  let p0 = sb_search(s0u, s0v, out.lb0);
+  let p1 = sb_search(s1u, s1v, out.lb1);
+  out.t0 = p0.table;
+  out.t1 = p1.table;
+  out.est = dot(b0, 8.0 * b0 - 2.0 * sum0) + dot(b1, 8.0 * b1 - 2.0 * sum1) + (p0.acc + p1.acc) * (1.0 / 3.0);
   return out;
 }
 
-// Wire indices for a chosen table — computed ONCE, from the final base.
-fn sb_indices(luma: ptr<function, array<f16, 16>>, flip: u32, sb: u32, lb: f16, t: u32) -> u32 {
-  let thr = f16(THR[t]);
-  var indices = 0u;
-  for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-    let d = (*luma)[texel_of(flip, sb, i)] - lb;
-    let large = abs(d) > thr;
-    let neg = d < 0.0;
-    indices = indices | ((select(0u, 1u, large) | select(0u, 2u, neg)) << (i * 2u));
-  }
-  return indices;
+// fit_flip for exactly-gray blocks (r = g = b): the same arithmetic on one
+// channel; sum0/sum1 are one channel's subblock sums.
+fn fit_gray(
+  s0u: vec4<f16>,
+  s0v: vec4<f16>,
+  s1u: vec4<f16>,
+  s1v: vec4<f16>,
+  sum0: f32,
+  sum1: f32,
+) -> FlipFit {
+  var out: FlipFit;
+  let q0 = floor(sum0 * (31.0 / 2040.0) + 0.5);
+  let q1 = floor(sum1 * (31.0 / 2040.0) + 0.5);
+  let d = q1 - q0;
+  let diff = d >= -4.0 && d <= 3.0;
+  let i0 = floor(sum0 * (15.0 / 2040.0) + 0.5);
+  let i1 = floor(sum1 * (15.0 / 2040.0) + 0.5);
+  out.bases.diff = diff;
+  out.bases.c0 = vec3<f32>(select(i0, q0, diff));
+  out.bases.c1 = vec3<f32>(select(i1, q1, diff));
+  let b0 = select(i0 * 17.0, floor(q0 * 8.25), diff);
+  let b1 = select(i1 * 17.0, floor(q1 * 8.25), diff);
+  out.lb0 = 3.0 * b0;
+  out.lb1 = 3.0 * b1;
+  let p0 = sb_search(s0u, s0v, out.lb0);
+  let p1 = sb_search(s1u, s1v, out.lb1);
+  out.t0 = p0.table;
+  out.t1 = p1.table;
+  out.est = 3.0 * (b0 * (8.0 * b0 - 2.0 * sum0) + b1 * (8.0 * b1 - 2.0 * sum1)) + (p0.acc + p1.acc) * (1.0 / 3.0);
+  return out;
+}
+
+// One gathered 2×2 quad: per-texel luma (gather order), channel sums, and
+// the sums of its right column and bottom row (the planar moments' local
+// parts). Gather order: w=(0,0) z=(1,0) x=(0,1) y=(1,1).
+struct Quad {
+  l: vec4<f16>,
+  s: vec3<f32>,
+  right: vec3<f32>,
+  bottom: vec3<f32>,
+};
+fn gather_quad(cc: vec2<f32>) -> Quad {
+  let r = textureGather(0, src_tex, smp, cc) * 255.0;
+  let g = textureGather(1, src_tex, smp, cc) * 255.0;
+  let b = textureGather(2, src_tex, smp, cc) * 255.0;
+  var o: Quad;
+  o.l = vec4<f16>(r + g + b);
+  o.right = vec3<f32>(r.z + r.y, g.z + g.y, b.z + b.y);
+  o.s = o.right + vec3<f32>(r.w + r.x, g.w + g.x, b.w + b.x);
+  o.bottom = vec3<f32>(r.x + r.y, g.x + g.y, b.x + b.y);
+  return o;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -264,100 +278,51 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
 
   let block_index = gid.y * params.blocks_x + gid.x;
   let base_xy = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
-  let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  // Luma lives in f16: every value is an integer <= 765, exact in f16.
-  var luma: array<f16, 16>;
+  // Luma by column: col[x][y]. Quadrant q = (x >= 2) | (y >= 2) << 1.
+  var col: array<vec4<f16>, 4>;
   var qsum: array<vec3<f32>, 4>;
-  var qsq: array<f32, 4>;
-  var qlsq: array<f32, 4>;
-  // Planar right-hand sides, folded into the load: rB = Σ (x/4)·p and
-  // rC = Σ (y/4)·p accumulate unscaled; rA = Σp − rB − rC afterwards.
+  // Planar right-hand sides: Σ x·p and Σ y·p.
   var sxp = vec3<f32>(0.0);
   var syp = vec3<f32>(0.0);
-
-  for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let lx = i32(i & 3u);
-    let ly = i32(i >> 2u);
-    let p = clamp(base_xy + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
-    let c = round(textureLoad(src_tex, p, 0).rgb * 255.0);
-    let l = c.r + c.g + c.b;
-    luma[i] = f16(l);
-    let q = u32(lx >= 2) | (u32(ly >= 2) << 1u);
-    qsum[q] = qsum[q] + c;
-    qsq[q] = qsq[q] + dot(c, c);
-    qlsq[q] = qlsq[q] + l * l;
-    sxp = sxp + f32(lx) * c;
-    syp = syp + f32(ly) * c;
-  }
-
-  // ----------------------------------------------- flip + base selection --
-  // Flip preselect, O(1) from quadrant sums: per subblock the residual after
-  // PERFECT continuous luma modulation is (Σ||p||² − ||Σp||²/8) −
-  // (Σℓ² − (Σℓ)²/8)/3 — the within-variance minus the (1,1,1)-direction
-  // component the modifier tables can absorb. The flip minimising the summed
-  // residual wins and only it gets the table search — EXCEPT when the two
-  // residuals are indistinguishable: for exact-grayscale blocks (r=g=b) both
-  // are identically zero, so the contest falls back to scoring both flips
-  // (this recovered −1.25 dB on roughness/AO-style content).
-  let sum0a = qsum[0] + qsum[2];
-  let sum1a = qsum[1] + qsum[3];
-  let sq0a = qsq[0] + qsq[2];
-  let sq1a = qsq[1] + qsq[3];
-  let sum0b = qsum[0] + qsum[1];
-  let sum1b = qsum[2] + qsum[3];
-  let sq0b = qsq[0] + qsq[1];
-  let sq1b = qsq[2] + qsq[3];
-  let lsq0a = qlsq[0] + qlsq[2];
-  let lsq1a = qlsq[1] + qlsq[3];
-  let lsq0b = qlsq[0] + qlsq[1];
-  let lsq1b = qlsq[2] + qlsq[3];
-  let res_a = (sq0a - dot(sum0a, sum0a) * 0.125) - (lsq0a - dot(sum0a, vec3<f32>(1.0)) * dot(sum0a, vec3<f32>(1.0)) * 0.125) * (1.0 / 3.0)
-            + (sq1a - dot(sum1a, sum1a) * 0.125) - (lsq1a - dot(sum1a, vec3<f32>(1.0)) * dot(sum1a, vec3<f32>(1.0)) * 0.125) * (1.0 / 3.0);
-  let res_b = (sq0b - dot(sum0b, sum0b) * 0.125) - (lsq0b - dot(sum0b, vec3<f32>(1.0)) * dot(sum0b, vec3<f32>(1.0)) * 0.125) * (1.0 / 3.0)
-            + (sq1b - dot(sum1b, sum1b) * 0.125) - (lsq1b - dot(sum1b, vec3<f32>(1.0)) * dot(sum1b, vec3<f32>(1.0)) * 0.125) * (1.0 / 3.0);
-
-  // Single eval_flip call site (a second inlined copy measured +50% GPU):
-  // attempt 0 scores the primary flip, attempt 1 runs only in the dual
-  // (indistinguishable-residuals) case and scores the other flip.
-  let dual = abs(res_a - res_b) < 1.0;
-  let primary = select(select(0u, 1u, res_b < res_a), 0u, dual);
-  var bflip = primary;
-  var sel: FlipFit;
-  for (var attempt = 0u; attempt < 2u; attempt = attempt + 1u) {
-    if (attempt == 1u && !dual) {
-      break;
-    }
-    let f = select(primary, 1u, attempt == 1u);
-    let cand = eval_flip(
-      &luma,
-      f,
-      select(sum0a, sum0b, f == 1u),
-      select(sq0a, sq0b, f == 1u),
-      select(sum1a, sum1b, f == 1u),
-      select(sq1a, sq1b, f == 1u),
-    );
-    if (attempt == 0u || cand.est < sel.est) {
-      sel = cand;
-      bflip = f;
+  if (u32(base_xy.x) + 4u <= params.width && u32(base_xy.y) + 4u <= params.height) {
+    let inv = vec2<f32>(1.0) / vec2<f32>(textureDimensions(src_tex));
+    let c0 = (vec2<f32>(base_xy) + 1.0) * inv;
+    let q0 = gather_quad(c0);
+    let q1 = gather_quad(c0 + vec2<f32>(2.0, 0.0) * inv);
+    let q2 = gather_quad(c0 + vec2<f32>(0.0, 2.0) * inv);
+    let q3 = gather_quad(c0 + vec2<f32>(2.0, 2.0) * inv);
+    qsum[0] = q0.s;
+    qsum[1] = q1.s;
+    qsum[2] = q2.s;
+    qsum[3] = q3.s;
+    sxp = q0.right + q2.right + 2.0 * (q1.s + q3.s) + q1.right + q3.right;
+    syp = q0.bottom + q1.bottom + 2.0 * (q2.s + q3.s) + q2.bottom + q3.bottom;
+    col[0] = vec4<f16>(q0.l.w, q0.l.x, q2.l.w, q2.l.x);
+    col[1] = vec4<f16>(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
+    col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
+    col[3] = vec4<f16>(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
+  } else {
+    let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
+    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
+      let lx = i & 3u;
+      let ly = i >> 2u;
+      let p = clamp(base_xy + vec2<i32>(i32(lx), i32(ly)), vec2<i32>(0, 0), max_xy);
+      let c = round(textureLoad(src_tex, p, 0).rgb * 255.0);
+      col[lx][ly] = f16(c.r + c.g + c.b);
+      let q = u32(lx >= 2u) | (u32(ly >= 2u) << 1u);
+      qsum[q] = qsum[q] + c;
+      sxp = sxp + f32(lx) * c;
+      syp = syp + f32(ly) * c;
     }
   }
-  let bdiff = sel.diff;
-
-  let best_est = sel.est;
-  let codes0 = sel.bases.codes0;
-  let codes1 = sel.bases.codes1;
-  let t0 = sel.t0;
-  let t1 = sel.t1;
-  let fit0 = sb_indices(&luma, bflip, 0u, f16(sel.lb0), t0);
-  let fit1 = sb_indices(&luma, bflip, 1u, f16(sel.lb1), t1);
 
   // ------------------------------------------------------------ planar --
-  // Always evaluated: with the rhs folded into the load loop this is O(1),
-  // and gating it on the ETC1 estimate measured −0.31 dB on smooth content
-  // for zero speed.
+  // LSQ plane in closed form: rhs rA = Σ(1 − x/4 − y/4)·p, rB = Σ(x/4)·p,
+  // rC = Σ(y/4)·p times the constant inverse Gram matrix (the same
+  // coefficient form as the CPU mirror, so rounding ties resolve alike);
+  // estimate with the quantised, clamped corners: −2·θ·rhs + θᵀGθ.
   let total = qsum[0] + qsum[1] + qsum[2] + qsum[3];
-  let sqtotal = qsq[0] + qsq[1] + qsq[2] + qsq[3];
   let rB = sxp * 0.25;
   let rC = syp * 0.25;
   let rA = total - rB - rC;
@@ -365,30 +330,72 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let ph = -0.0125 * rA + 0.4875 * rB - 0.3125 * rC;
   let pv = -0.0125 * rA - 0.3125 * rB + 0.4875 * rC;
   let pmax = vec3<f32>(63.0, 127.0, 63.0);
-  let qo = quant_codes(po, pmax);
-  let qh = quant_codes(ph, pmax);
-  let qv = quant_codes(pv, pmax);
-  // Residual of the plane the hardware will ACTUALLY decode — the
-  // quantised, clamped corners — via the normal-equation identity
-  // Σ||p − f||² = Σ||p||² − 2·θ·rhs + θᵀGθ (G is the constant Gram matrix
-  // of the fixed sample positions). Estimating with the CONTINUOUS corners
-  // instead is blind to corner clamping and mis-picks planar on steep
-  // gradients (a 1.4-normalised-SSE easy-block artifact on the colour
-  // card). Only decode's floor-rounding stays unmodelled (≤ ~12 SSE).
-  let shl = vec3<u32>(2u, 1u, 2u);
-  let shr = vec3<u32>(4u, 6u, 4u);
-  let eo = vec3<f32>((qo << shl) | (qo >> shr));
-  let eh = vec3<f32>((qh << shl) | (qh >> shr));
-  let ev = vec3<f32>((qv << shl) | (qv >> shr));
-  let gram = 3.5 * (eo * eo + eh * eh + ev * ev) + 0.5 * eo * eh + 0.5 * eo * ev + 4.5 * eh * ev;
-  let planar_est = sqtotal - 2.0 * (dot(eo, rA) + dot(eh, rB) + dot(ev, rC)) +
-                   dot(gram, vec3<f32>(1.0)) + PLANAR_FUDGE;
+  let qo = clamp(floor(po * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+  let qh = clamp(floor(ph * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+  let qv = clamp(floor(pv * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+  // 6-bit expand (q<<2)|(q>>4) = floor(4.0625·q); 7-bit (q<<1)|(q>>6) = floor(2.015625·q).
+  let xk = vec3<f32>(4.0625, 2.015625, 4.0625);
+  let eo = floor(qo * xk);
+  let eh = floor(qh * xk);
+  let ev = floor(qv * xk);
+  let gram = 3.5 * (eo * eo + eh * eh + ev * ev) + 0.5 * eo * (eh + ev) + 4.5 * eh * ev;
+  let planar_est = dot(gram - 2.0 * (eo * rA + eh * rB + ev * rC), ONE3) + PLANAR_FUDGE;
+
+  // ------------------------------------------------ flip + base selection --
+  // Flip 0 splits columns (sum0a = left half), flip 1 splits rows (sum0b =
+  // top half). Per flip, the preselect residual minus the flip-independent
+  // Σ||p||² and Σℓ² terms: −Σ||s||²/8 + κ·(Σℓ)²/24 over its two subblocks.
+  let sum0a = qsum[0] + qsum[2];
+  let sum1a = qsum[1] + qsum[3];
+  let sum0b = qsum[0] + qsum[1];
+  let sum1b = qsum[2] + qsum[3];
+  let l0a = dot(sum0a, ONE3);
+  let l1a = dot(sum1a, ONE3);
+  let l0b = dot(sum0b, ONE3);
+  let l1b = dot(sum1b, ONE3);
+  let res_a = KAPPA / 24.0 * (l0a * l0a + l1a * l1a) - 0.125 * (dot(sum0a, sum0a) + dot(sum1a, sum1a));
+  let res_b = KAPPA / 24.0 * (l0b * l0b + l1b * l1b) - 0.125 * (dot(sum0b, sum0b) + dot(sum1b, sum1b));
+  let gray = all(qsum[0].rg == qsum[0].gb) && all(qsum[1].rg == qsum[1].gb) &&
+             all(qsum[2].rg == qsum[2].gb) && all(qsum[3].rg == qsum[3].gb);
+
+  var bflip = 0u;
+  var sel: FlipFit;
+  if (gray) {
+    sel = fit_gray(col[0], col[1], col[2], col[3], sum0a.r, sum1a.r);
+    let alt = fit_gray(
+      vec4<f16>(col[0].xy, col[1].xy),
+      vec4<f16>(col[2].xy, col[3].xy),
+      vec4<f16>(col[0].zw, col[1].zw),
+      vec4<f16>(col[2].zw, col[3].zw),
+      sum0b.r,
+      sum1b.r,
+    );
+    if (alt.est < sel.est) {
+      sel = alt;
+      bflip = 1u;
+    }
+  } else {
+    let fb = res_b < res_a;
+    bflip = select(0u, 1u, fb);
+    sel = fit_flip(
+      select(col[0], vec4<f16>(col[0].xy, col[1].xy), fb),
+      select(col[1], vec4<f16>(col[2].xy, col[3].xy), fb),
+      select(col[2], vec4<f16>(col[0].zw, col[1].zw), fb),
+      select(col[3], vec4<f16>(col[2].zw, col[3].zw), fb),
+      select(sum0a, sum0b, fb),
+      select(sum1a, sum1b, fb),
+    );
+  }
 
   // ------------------------------------------------------------ packing --
   var hi: u32;
   var lo: u32;
-  if (best_est <= planar_est) {
-    if (bdiff) {
+  if (sel.est <= planar_est) {
+    let codes0 = vec3<u32>(sel.bases.c0);
+    let codes1 = vec3<u32>(sel.bases.c1);
+    let t0 = sel.t0;
+    let t1 = sel.t1;
+    if (sel.bases.diff) {
       let d = vec3<u32>(vec3<i32>(codes1) - vec3<i32>(codes0)) & vec3<u32>(7u);
       hi = (codes0.r << 27u) | (d.r << 24u) | (codes0.g << 19u) | (d.g << 16u) | (codes0.b << 11u) | (d.b << 8u)
          | (t0 << 5u) | (t1 << 2u) | 2u | bflip;
@@ -396,20 +403,35 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
       hi = (codes0.r << 28u) | (codes1.r << 24u) | (codes0.g << 20u) | (codes1.g << 16u) | (codes0.b << 12u) | (codes1.b << 8u)
          | (t0 << 5u) | (t1 << 2u) | bflip;
     }
-    lo = 0u;
-    for (var sb: u32 = 0u; sb < 2u; sb = sb + 1u) {
-      let indices = select(fit0, fit1, sb == 1u);
-      for (var i: u32 = 0u; i < 8u; i = i + 1u) {
-        let k = texel_of(bflip, sb, i);
-        let wire = (k & 3u) * 4u + (k >> 2u);
-        let idx = (indices >> (i * 2u)) & 3u;
-        lo = lo | ((idx & 1u) << wire) | ((idx >> 1u) << (16u + wire));
-      }
+    // Wire indices, column by column (bit x·4 + y): flip 0 gives columns
+    // 0,1 subblock 0; flip 1 gives rows 0,1 (lanes x, y) subblock 0.
+    // LSB = large modifier, MSB = negative.
+    let fb = bflip == 1u;
+    let lb0 = f16(sel.lb0);
+    let lb1 = f16(sel.lb1);
+    let th0 = f16(THR[t0]);
+    let th1 = f16(THR[t1]);
+    let lb_rows = vec4<f16>(lb0, lb0, lb1, lb1);
+    let th_rows = vec4<f16>(th0, th0, th1, th1);
+    let lb_l = select(vec4<f16>(lb0), lb_rows, fb);
+    let lb_r = select(vec4<f16>(lb1), lb_rows, fb);
+    let th_l = select(vec4<f16>(th0), th_rows, fb);
+    let th_r = select(vec4<f16>(th1), th_rows, fb);
+    let bitv = vec4<u32>(1u, 2u, 4u, 8u);
+    var lsb = 0u;
+    var msb = 0u;
+    for (var c: u32 = 0u; c < 4u; c = c + 1u) {
+      let d = col[c] - select(lb_l, lb_r, c >= 2u);
+      let large = select(vec4<u32>(0u), bitv, abs(d) > select(th_l, th_r, c >= 2u));
+      let neg = select(vec4<u32>(0u), bitv, d < vec4<f16>(0.0));
+      lsb = lsb | ((large.x | large.y | large.z | large.w) << (c * 4u));
+      msb = msb | ((neg.x | neg.y | neg.z | neg.w) << (c * 4u));
     }
+    lo = lsb | (msb << 16u);
   } else {
-    let ro = qo.r; let go = qo.g; let bo = qo.b;
-    let rh = qh.r; let gh = qh.g; let bh = qh.b;
-    let rv = qv.r; let gv = qv.g; let bv = qv.b;
+    let ro = u32(qo.r); let go = u32(qo.g); let bo = u32(qo.b);
+    let rh = u32(qh.r); let gh = u32(qh.g); let bh = u32(qh.b);
+    let rv = u32(qv.r); let gv = u32(qv.g); let bv = u32(qv.b);
     let r_sum = i32(ro >> 2u) + signed3(((ro & 3u) << 1u) | (go >> 6u));
     let r_fix = select(0u, 1u, r_sum < 0);
     let g_sum = i32((go >> 2u) & 15u) + signed3(((go & 3u) << 1u) | (bo >> 5u));

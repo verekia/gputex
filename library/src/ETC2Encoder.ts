@@ -6,12 +6,13 @@
 //
 // Single-pass: the shader emits ETC1 individual/differential blocks and
 // ETC2 planar blocks; T and H modes are never emitted. See `etc2.wgsl` /
-// `etc2_ref.ts` for the algorithm and layout. The f16 variant is EXACT-
-// VALUE (every f16 quantity is an integer f16 represents exactly; the
-// big sums stay f32) so its output is byte-identical to the f32 module —
-// it exists for register pressure on mobile GPUs, not arithmetic rate.
-// (A two-pass prepared-source variant lives in git history — its prep
-// pass is also bandwidth-bound and made the per-texture total slower.)
+// `etc2_ref.ts` for the algorithm and layout. Both modules read the source
+// through textureGather, so they declare the @binding(3) clamp sampler the
+// shared pipeline binds for such shaders. The f16 variant is EXACT-VALUE
+// (every f16 quantity is an integer or half f16 represents exactly; the
+// sums stay f32), so its output matches the f32 module byte for byte
+// wherever the sampler's unorm conversion is exact — it buys register
+// space, not different results.
 //
 // See `Encoder.ts` for the shared encode pipeline. This file only declares
 // the format metadata and loads the WGSL sources.

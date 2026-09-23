@@ -103,17 +103,19 @@ algebra of that scalar shift — table and index selection depend only on each
 texel's luma-sum difference from the base, exactly (modulo decode clamping) —
 so the whole 8-table × 4-modifier search collapses to a handful of scalar
 threshold tests against a two-candidate table shortlist, with subblock error
-constants and the flip preselect computed O(1) from quadrant sums. A gated
-base-colour refit and a closed-form least-squares fit of ETC2's planar mode
-(which rescues the smooth gradients ETC1-style blocks band on) complete the
-block, all driven by the same estimates. The rewrite took the GPU pass
-from 6.0 ms to ~0.2 ms at 2048² (30×, within ~0.2 dB of the exhaustive
-search on photographic content — only the base refit was traded for
-speed). Its f16 module is EXACT-VALUE: lumas, D values and thresholds
-are integers f16 represents exactly, while the sums-of-squares estimates
-stay f32 (they overflow f16), so the two modules produce byte-identical
-output — f16 buys register pressure on mobile GPUs, not different
-results.
+constants and the flip preselect computed O(1) from quadrant sums (exactly
+gray blocks, which give the preselect nothing to go on, score both flips on
+a one-channel path). A closed-form least-squares fit of ETC2's planar mode
+(which rescues the smooth gradients ETC1-style blocks band on) completes
+the block, driven by the same estimates. There is no base-colour refit
+(~0.2 dB on photographic content for ≥13% GPU). The kernel reads the source
+through `textureGather` and keeps every per-texel quantity in registers
+with constant indexing (numbers below). Its f16 module is EXACT-VALUE: lumas,
+D values and thresholds are integers (or halves) f16 represents exactly,
+while the sums and estimates stay f32 (they overflow f16), so the two
+modules produce byte-identical output wherever the sampler's unorm
+conversion is exact (verified on Apple) — f16 buys register space, not
+different results.
 
 On the repo's test textures this lands within a few tenths of a dB of the
 per-block CPU reference encoders (`gputex/testing`) and above them on
@@ -353,7 +355,8 @@ shader alone.
 | BC7      | f32           | 0.52 ms     |
 | ASTC 4×4 | f16 (default) | **0.17 ms** |
 | ASTC 4×4 | f32           | 0.28 ms     |
-| ETC2     | f16 + f32     | 0.20 ms     |
+| ETC2     | f16 (default) | **0.14 ms** |
+| ETC2     | f32           | 0.15 ms     |
 
 End-to-end `encodeToBytes()` wall time adds the upload and the readback.
 Each encoder caches its GPU resources (source texture, output/staging
@@ -366,13 +369,15 @@ readback this cuts wall time by 23–33% at 4096² and 5–25% at 2048²
 (bytes identical); a fresh 4096² encode is then dominated by the ~8 ms
 `copyExternalImageToTexture` upload.
 
-On a 100 GB/s part just reading the 2048² RGBA8 source costs ~0.15 ms, so
-BC5/BC7/ASTC/ETC2 sit within ~1.3× of simply touching the bytes; BC1's
-refit rounds keep it ALU-bound. Two faster ETC2 variants live in git
-history and were deliberately not shipped: a two-pass 2 B/px prepared source (encode pass
-0.115 ms, but the prep pass is also bandwidth-bound and cannot overlap, so
-the per-texture total regressed) and an O(1) hedged table pick (−3% for
-−0.5 dB — a poor trade against the scored search).
+On a 100 GB/s part just reading the 2048² RGBA8 source costs ~0.14 ms, so
+BC5/BC7/ASTC sit within ~1.3× of simply touching the bytes and ETC2 at it;
+BC1's refit rounds keep it ALU-bound. On real textures (which Apple's
+lossless framebuffer compression makes cheaper to read) and at 1024², where
+the source stays cached, the ETC2 kernel is ALU-exposed again: 0.035–0.04 ms
+at 1024², 0.13–0.15 ms at 2048² and 0.49–0.57 ms at 4096² across the corpus.
+A two-pass 2 B/px prepared-source ETC2 variant lives in git history and was
+not shipped: its prep pass is also bandwidth-bound and cannot overlap, so
+the per-texture total regressed.
 
 Single-dispatch timestamps are coarse and Apple GPU clock states swing
 timings by up to ~2× across page loads, so compare variants only within a
