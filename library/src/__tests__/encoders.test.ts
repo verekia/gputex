@@ -33,7 +33,7 @@ describe('BC1Encoder metadata', () => {
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
     // Sanity: the shader exposes the BC1-specific helpers by name.
-    expect(src).toContain('fn project_stats')
+    expect(src).toContain('fn moments')
     expect(src).toContain('fn principal_axis')
   })
 })

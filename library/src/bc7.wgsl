@@ -39,6 +39,7 @@ struct Params {
   blocks_y: u32,
   width:    u32,
   height:   u32,
+  y0:       u32, // first block row of this dispatch (row-band encodes)
 };
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
@@ -106,7 +107,9 @@ fn principal_axis4(
 // ------------------------------- Entry --------------------------------- //
 
 @compute @workgroup_size(8, 8, 1)
-fn encode(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
+  // Row-band encodes dispatch a slice of the block grid starting at row y0.
+  let gid = vec3<u32>(gid_raw.x, gid_raw.y + params.y0, gid_raw.z);
   if (gid.x >= params.blocks_x || gid.y >= params.blocks_y) {
     return;
   }

@@ -61,8 +61,16 @@ describe('ASTC 4×4 block class selection', () => {
     expect(blockCem(block)).toBe(_internal.CEM_LUM_DIRECT)
   })
 
-  it('encodes coloured opaque blocks as CEM 8 with 3-bit weights (mode 0x053)', () => {
+  it('encodes wide-span coloured opaque blocks as CEM 8 with 4-bit weights + QUANT_192 (mode 0x242)', () => {
     const block = encodeASTC4x4Block(colorPixels)
+    expect(blockMode(block)).toBe(_internal.BLOCK_MODE_4x4_4BIT)
+    expect(blockMode(block)).toBe(0x242)
+    expect(blockCem(block)).toBe(_internal.CEM_RGB_DIRECT)
+  })
+
+  it('encodes small-span coloured opaque blocks as CEM 8 with 3-bit weights + 8-bit endpoints (mode 0x053)', () => {
+    // A 4-level-wide ramp: exact endpoints beat finer weights here.
+    const block = encodeASTC4x4Block(makePixels(k => [(100 + (k & 3)) / 255, 150 / 255, (50 + (k >> 2)) / 255, 1]))
     expect(blockMode(block)).toBe(_internal.BLOCK_MODE_4x4_3BIT)
     expect(blockMode(block)).toBe(0x053)
     expect(blockCem(block)).toBe(_internal.CEM_RGB_DIRECT)
@@ -171,13 +179,29 @@ describe('ASTC 4×4 encode/decode round-trip', () => {
     }
   })
 
-  it('round-trips a 16-step RGB gradient with small error (CEM 8, 8 levels)', () => {
+  it('round-trips a 16-step RGB gradient with small error (CEM 8, 16 levels)', () => {
     const block = encodeASTC4x4Block(colorPixels)
     const decoded = decodeASTC4x4Block(block)
-    // 8 palette entries for 16 targets — half the stride the old 2-bit
-    // RGBA class had on the same content.
-    expect(rmse(decoded, colorPixels)).toBeLessThan(0.05)
-    expect(maxAbs(decoded, colorPixels)).toBeLessThan(0.1)
+    // 16 palette entries for 16 targets; the residual is the QUANT_192
+    // endpoint rounding plus the non-uniform QUANT_16 weight grid.
+    expect(rmse(decoded, colorPixels)).toBeLessThan(0.01)
+    expect(maxAbs(decoded, colorPixels)).toBeLessThan(0.025)
+  })
+
+  it('round-trips random wide-span opaque colour blocks through both CEM 8 budgets', () => {
+    const rand = seededRand(0xc0ffee)
+    const modes = new Set<number>()
+    for (let trial = 0; trial < 200; trial++) {
+      const span = trial % 2 ? 0.02 : 0.6
+      const base = [rand() * (1 - span), rand() * (1 - span), rand() * (1 - span)]
+      const pixels = makePixels(() => [base[0]! + rand() * span, base[1]! + rand() * span, base[2]! + rand() * span, 1])
+      const block = encodeASTC4x4Block(pixels)
+      modes.add(blockMode(block))
+      const decoded = decodeASTC4x4Block(block)
+      for (let k = 0; k < 16; k++) expect(decoded[k * 4 + 3]).toBe(1)
+      expect(rmse(decoded, pixels)).toBeLessThan(span * 0.5)
+    }
+    expect(modes).toEqual(new Set([0x053, 0x242]))
   })
 
   it('round-trips a block with non-trivial alpha variation (CEM 12)', () => {
@@ -273,6 +297,63 @@ describe('ASTC 4×4 input validation', () => {
     block[1] = (block[1]! & ~(0xf << 5)) | ((12 & 0x7) << 5)
     block[2] = (block[2]! & ~1) | (12 >> 3)
     expect(() => decodeASTC4x4Block(block)).toThrow(/CEM/)
+  })
+})
+
+describe('ASTC 4×4 QUANT_192 endpoint range', () => {
+  it('trit blocks round-trip for all 243 trit tuples', () => {
+    for (let i = 0; i < 243; i++) {
+      const t = [
+        i % 3,
+        Math.floor(i / 3) % 3,
+        Math.floor(i / 9) % 3,
+        Math.floor(i / 27) % 3,
+        Math.floor(i / 81) % 3,
+      ] as const
+      const T = _internal.encodeTrits(t[0], t[1], t[2], t[3], t[4])
+      expect(T).toBeGreaterThanOrEqual(0)
+      expect(T).toBeLessThan(256)
+      expect(_internal.decodeTrits(T)).toEqual([...t])
+    }
+  })
+
+  it('unquantises to 192 distinct levels: u ≤ 127 with u mod 4 ≠ 3, and their mirrors 255 − u', () => {
+    const levels = new Set<number>()
+    for (let v = 0; v < 192; v++) levels.add(_internal.unq192(v))
+    expect(levels.size).toBe(192)
+    for (let x = 0; x < 256; x++) {
+      const u = x <= 127 ? x : 255 - x
+      expect(levels.has(x)).toBe(u % 4 !== 3)
+    }
+  })
+
+  it('nearest192 returns the nearest representable level', () => {
+    const levels = Array.from({ length: 192 }, (_, v) => _internal.unq192(v))
+    for (let i = 0; i <= 2550; i++) {
+      const x = i / 10
+      const got = _internal.nearest192(x)
+      const bestDist = Math.min(...levels.map(l => Math.abs(l - x)))
+      expect(levels).toContain(got)
+      expect(Math.abs(got - x)).toBeCloseTo(bestDist, 9)
+    }
+  })
+
+  it('uses the spec 4-bit weight unquantisation (bit replication + bump above 32)', () => {
+    expect(_internal.WEIGHT_UNQ_16).toEqual([0, 4, 8, 12, 17, 21, 25, 29, 35, 39, 43, 47, 52, 56, 60, 64])
+  })
+
+  it('keeps sum(e0.rgb) ≤ sum(e1.rgb) on unquantised levels in mode 0x242', () => {
+    // Bright first pixel, dark rest; a wide span selects the QUANT_192
+    // budget. A wrong ordering would trigger blue contraction on decode.
+    // Colinear: pixel 0 bright, the rest a dark ramp along the same line.
+    const pixels = makePixels(k => {
+      const t = k === 0 ? 1 : (k - 1) / 30
+      return [0.05 + 0.9 * t, 0.1 + 0.8 * t, 0.05 + 0.95 * t, 1]
+    })
+    const block = encodeASTC4x4Block(pixels)
+    expect(blockMode(block)).toBe(0x242)
+    const decoded = decodeASTC4x4Block(block)
+    expect(maxAbs(decoded, pixels)).toBeLessThan(0.04)
   })
 })
 

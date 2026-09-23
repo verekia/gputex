@@ -104,6 +104,46 @@ interface GpuTiming {
 // for both the storage and uniform limits.
 const CHAIN_ALIGN = 256
 
+// Every shader's Params: { blocks_x, blocks_y, width, height, y0 } — 20
+// bytes, bound as a 32-byte slot. y0 is the first block row a dispatch
+// covers (row-band encodes); whole-grid dispatches pass 0.
+const PARAMS_SIZE = 32
+const PARAMS_ALIGN = 256
+const MAX_BANDS = 8
+// Target output bytes per band. Interleaved A/B on Apple M3 (16 MB BC7/ASTC
+// 4096² outputs): 4 bands −25%, 8 bands (2 MB) a further −22%, 16 bands
+// (1 MB) +13% back — per-submission/map overhead takes over.
+const BAND_BYTES = 2 << 20
+
+/**
+ * Split a block grid into row bands for a banded encode: about one band per
+ * BAND_BYTES of output (1 below 3 MB, at most MAX_BANDS). Band heights are
+ * multiples of the workgroup height, so a band's dispatch never spills
+ * into the next band's rows.
+ */
+function bandRows(blocksY: number, outByteLen: number, wgY: number): { y0: number; rows: number }[] {
+  const n = Math.min(MAX_BANDS, Math.max(1, Math.round(outByteLen / BAND_BYTES)))
+  const per = Math.ceil(blocksY / n / wgY) * wgY
+  const bands: { y0: number; rows: number }[] = []
+  for (let y0 = 0; y0 < blocksY; y0 += per) bands.push({ y0, rows: Math.min(per, blocksY - y0) })
+  return bands
+}
+
+/**
+ * Allocate a result array and touch every page of it. A fresh large
+ * ArrayBuffer is backed by untouched zero pages, so the first write to each
+ * 4 KB page faults — copying a mapped readback into it (or `slice()`-ing
+ * the mapped range, which allocates the same way) pays those faults inside
+ * the copy: at 16 MB about half of its ~1.3 ms. Called right after
+ * `queue.submit()`, the faults are taken while the GPU is still encoding
+ * and the copy afterwards runs at memcpy speed.
+ */
+function allocPrefaulted(byteLength: number): Uint8Array {
+  const out = new Uint8Array(byteLength)
+  for (let i = 0; i < byteLength; i += 4096) out[i] = 0
+  return out
+}
+
 /** Per-level geometry for a chain encode: block grid + the level's slice of
  *  the shared output buffer. */
 interface ChainGeom {
@@ -218,10 +258,11 @@ export abstract class Encoder {
   private _cachedSrcSource: ImageBitmap | null = null
   private _cachedSrcFlipY = false
   private _cachedDst: GPUBuffer | null = null
-  private _cachedStaging: GPUBuffer | null = null
+  // One MAP_READ staging buffer and bind group per row band (see bandRows).
+  private _cachedStagings: GPUBuffer[] = []
   private _cachedParams: GPUBuffer | null = null
-  private _lastParams: [number, number, number, number] | null = null
-  private _cachedBindGroup: GPUBindGroup | null = null
+  private _lastParamsKey: string | null = null
+  private _cachedBindGroups: GPUBindGroup[] = []
   private _cachedPrepPlanes: GPUTexture[] | null = null
   private _cachedPrepBindGroup: GPUBindGroup | null = null
   private _resourcesBusy = false
@@ -242,8 +283,11 @@ export abstract class Encoder {
   private _chainPrepBindGroups: GPUBindGroup[] = []
   private _chainParams: GPUBuffer | null = null
   private _chainBindGroups: GPUBindGroup[] = []
+  // Level-0 bind groups of the base-level row bands (see bandRows).
+  private _chainBandBindGroups: GPUBindGroup[] = []
   private _chainDst: GPUBuffer | null = null
-  private _chainStaging: GPUBuffer | null = null
+  // One MAP_READ staging buffer per chain submission (base-level band).
+  private _chainStagings: GPUBuffer[] = []
   private _chainBusy = false
 
   constructor({ device, adapter, ownsDevice = false, disableF16 = false }: EncoderOptions) {
@@ -293,14 +337,14 @@ export abstract class Encoder {
     this._cachedPrepPlanes = null
     this._cachedPrepBindGroup = null
     this._cachedDst?.destroy()
-    this._cachedStaging?.destroy()
+    for (const st of this._cachedStagings) st.destroy()
     this._cachedParams?.destroy()
     this._cachedSrcTex = null
     this._cachedSrcSource = null
     this._cachedDst = null
-    this._cachedStaging = null
+    this._cachedStagings = []
     this._cachedParams = null
-    this._cachedBindGroup = null
+    this._cachedBindGroups = []
     for (const tex of this._chainTextures) tex.destroy()
     this._chainTextures = []
     for (const planes of this._chainPrepPlanes) for (const t of planes) t.destroy()
@@ -308,11 +352,12 @@ export abstract class Encoder {
     this._chainPrepBindGroups = []
     this._chainParams?.destroy()
     this._chainDst?.destroy()
-    this._chainStaging?.destroy()
+    for (const st of this._chainStagings) st.destroy()
     this._chainParams = null
     this._chainDst = null
-    this._chainStaging = null
+    this._chainStagings = []
     this._chainBindGroups = []
+    this._chainBandBindGroups = []
     this._chainSig = null
     if (this.ownsDevice) this.device.destroy()
   }
@@ -433,7 +478,7 @@ export abstract class Encoder {
       entries: [
         { binding: 0, resource: srcView },
         { binding: 1, resource: planes[0]!.createView() },
-        { binding: 2, resource: { buffer: params, offset: paramsOffset, size: 16 } },
+        { binding: 2, resource: { buffer: params, offset: paramsOffset, size: PARAMS_SIZE } },
         { binding: 3, resource: planes[1]!.createView() },
       ],
     })
@@ -500,7 +545,8 @@ export abstract class Encoder {
     let srcTex: GPUTexture | undefined
     let dstBuffer: GPUBuffer | undefined
     let paramsBuffer: GPUBuffer | undefined
-    let staging: GPUBuffer | undefined
+    const stagings: GPUBuffer[] = []
+    const transientStagings: GPUBuffer[] = []
     let transientPrepPlanes: GPUTexture[] | null = null
 
     try {
@@ -549,6 +595,8 @@ export abstract class Encoder {
         source instanceof ImageBitmap &&
         this._cachedSrcSource === source &&
         this._cachedSrcFlipY === flipY
+      // (Uploading band by band, interleaved with the band dispatches,
+      // measured −5..+8% at 2048–4096² — no clear win, not done.)
       if (!uploadSkippable) {
         uploadSourceTexture(device, srcTex, source, width, height, flipY)
       }
@@ -557,8 +605,8 @@ export abstract class Encoder {
         this._cachedSrcFlipY = flipY
       }
 
-      // 2. Output storage buffer + readback staging buffer (grow-only: a
-      //    larger cached buffer serves smaller encodes, e.g. mip levels).
+      // 2. Output storage buffer (grow-only: a larger cached buffer serves
+      //    smaller encodes, e.g. mip levels).
       let dstIsNew = true
       if (useCache && this._cachedDst && this._cachedDst.size >= outByteLen) {
         dstBuffer = this._cachedDst
@@ -574,77 +622,97 @@ export abstract class Encoder {
           this._cachedDst = dstBuffer
         }
       }
-      if (useCache && this._cachedStaging && this._cachedStaging.size >= outByteLen) {
-        staging = this._cachedStaging
-      } else {
-        staging = device.createBuffer({
-          label: `${this.label}-staging`,
-          size: outByteLen,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-        })
-        if (useCache) {
-          this._cachedStaging?.destroy()
-          this._cachedStaging = staging
+
+      // Large outputs are encoded in ROW BANDS: one submission + MAP_READ
+      // staging buffer per band, so the readback of band i (a GPU-process
+      // copy that dominates big encodes) overlaps the compute of band i+1.
+      const [wgX, wgY] = this.workgroupSize
+      const bands = bandRows(blocksY, outByteLen, wgY)
+      const rowBytes = blocksX * this.bytesPerBlock
+      for (let b = 0; b < bands.length; b++) {
+        const len = bands[b]!.rows * rowBytes
+        let st = useCache ? this._cachedStagings[b] : undefined
+        if (!st || st.size < len) {
+          st = device.createBuffer({
+            label: `${this.label}-staging-${b}`,
+            size: len,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+          })
+          if (useCache) {
+            this._cachedStagings[b]?.destroy()
+            this._cachedStagings[b] = st
+          } else {
+            transientStagings.push(st)
+          }
         }
+        stagings.push(st)
       }
 
-      // 3. Uniform params buffer — 4 × u32 canonical header.
-      // width/height are the SOURCE dimensions, not the padded ones: the
-      // shaders clamp texel reads to (width-1, height-1), which must be the
-      // last real texel. Clamping to the padded size would read the zero-
-      // initialized padding strip and bleed black into the edge blocks'
-      // palettes.
+      // 3. Uniform params — one 32-byte slot per band at PARAMS_ALIGN
+      // offsets: { blocksX, blocksY, width, height, y0 }. width/height are
+      // the SOURCE dimensions, not the padded ones: the shaders clamp texel
+      // reads to (width-1, height-1), which must be the last real texel.
+      // Clamping to the padded size would read the zero-initialized padding
+      // strip and bleed black into the edge blocks' palettes.
+      const paramsData = new Uint32Array((MAX_BANDS * PARAMS_ALIGN) / 4)
+      bands.forEach((band, b) => {
+        paramsData.set([blocksX, blocksY, width, height, band.y0], (b * PARAMS_ALIGN) / 4)
+      })
+      const paramsKey = `${blocksX},${blocksY},${width},${height},${bands.length}`
       if (useCache) {
         if (!this._cachedParams) {
           this._cachedParams = device.createBuffer({
             label: `${this.label}-params`,
-            size: 16,
+            size: MAX_BANDS * PARAMS_ALIGN,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           })
-          this._lastParams = null
+          this._lastParamsKey = null
         }
         paramsBuffer = this._cachedParams
-        const lp = this._lastParams
-        if (!lp || lp[0] !== blocksX || lp[1] !== blocksY || lp[2] !== width || lp[3] !== height) {
-          device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
-          this._lastParams = [blocksX, blocksY, width, height]
+        if (this._lastParamsKey !== paramsKey) {
+          device.queue.writeBuffer(paramsBuffer, 0, paramsData)
+          this._lastParamsKey = paramsKey
         }
       } else {
         paramsBuffer = device.createBuffer({
           label: `${this.label}-params`,
-          size: 16,
+          size: MAX_BANDS * PARAMS_ALIGN,
           usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         })
-        device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([blocksX, blocksY, width, height]))
+        device.queue.writeBuffer(paramsBuffer, 0, paramsData)
       }
 
-      // 4. Bind groups, kept until a bound resource is recreated. With a
-      //    prep pass the encode pass reads the prepared planes; without one
-      //    it reads the source texture directly.
-      if (useCache && (srcTexIsNew || dstIsNew || prepPlanesNew)) this._cachedBindGroup = null
-      let bindGroup = useCache ? this._cachedBindGroup : null
-      if (!bindGroup) {
-        const entries: GPUBindGroupEntry[] = [
-          { binding: 0, resource: prepPlanes ? prepPlanes[0]!.createView() : srcTex.createView() },
-          { binding: 1, resource: { buffer: dstBuffer } },
-          { binding: 2, resource: { buffer: paramsBuffer } },
-        ]
-        if (prepPlanes) {
-          entries.push({ binding: 3, resource: prepPlanes[1]!.createView() })
-        } else if (this._usesSampler) {
-          this._sampler ??= device.createSampler({
-            label: `${this.label}-clamp-sampler`,
-            addressModeU: 'clamp-to-edge',
-            addressModeV: 'clamp-to-edge',
+      // 4. Bind groups (one per band slot), kept until a bound resource is
+      //    recreated. With a prep pass the encode pass reads the prepared
+      //    planes; without one it reads the source texture directly.
+      if (useCache && (srcTexIsNew || dstIsNew || prepPlanesNew)) this._cachedBindGroups = []
+      const bindGroups: GPUBindGroup[] = []
+      for (let b = 0; b < bands.length; b++) {
+        let bg = useCache ? this._cachedBindGroups[b] : undefined
+        if (!bg) {
+          const entries: GPUBindGroupEntry[] = [
+            { binding: 0, resource: prepPlanes ? prepPlanes[0]!.createView() : srcTex.createView() },
+            { binding: 1, resource: { buffer: dstBuffer } },
+            { binding: 2, resource: { buffer: paramsBuffer, offset: b * PARAMS_ALIGN, size: PARAMS_SIZE } },
+          ]
+          if (prepPlanes) {
+            entries.push({ binding: 3, resource: prepPlanes[1]!.createView() })
+          } else if (this._usesSampler) {
+            this._sampler ??= device.createSampler({
+              label: `${this.label}-clamp-sampler`,
+              addressModeU: 'clamp-to-edge',
+              addressModeV: 'clamp-to-edge',
+            })
+            entries.push({ binding: 3, resource: this._sampler })
+          }
+          bg = device.createBindGroup({
+            label: `${this.label}-bg-${b}`,
+            layout: pipeline.getBindGroupLayout(0),
+            entries,
           })
-          entries.push({ binding: 3, resource: this._sampler })
+          if (useCache) this._cachedBindGroups[b] = bg
         }
-        bindGroup = device.createBindGroup({
-          label: `${this.label}-bg`,
-          layout: pipeline.getBindGroupLayout(0),
-          entries,
-        })
-        if (useCache) this._cachedBindGroup = bindGroup
+        bindGroups.push(bg)
       }
       let prepBindGroup = useCache && !prepPlanesNew && !srcTexIsNew ? this._cachedPrepBindGroup : null
       if (prepPipeline && prepPlanes && !prepBindGroup) {
@@ -652,58 +720,65 @@ export abstract class Encoder {
         if (useCache) this._cachedPrepBindGroup = prepBindGroup
       }
 
-      // 5. Dispatch — one workgroup tile per (workgroupSize) blocks. When
-      //    asked (and the device has 'timestamp-query'), bracket the pass
-      //    with timestamps so the caller gets shader-only GPU time.
+      // 5. Dispatch + readback, one submission per band. When asked (and
+      //    the device has 'timestamp-query'), the first pass's start and the
+      //    last pass's end are timestamped: shader-only GPU time across all
+      //    bands. The readback goes through MAP_READ staging buffers rather
+      //    than copyBufferToTexture: the encoder may run on its own device,
+      //    separate from the renderer's, so the compressed bytes transit the
+      //    CPU anyway before the renderer uploads them.
       const timing = withGpuTime ? this._createTiming() : null
-
-      const [wgX, wgY] = this.workgroupSize
       const t0 = performance.now()
-      const enc = device.createCommandEncoder({ label: `${this.label}-encode` })
-      // The prep pass writes storage textures the encode pass samples, so
-      // they cannot share a compute pass; timestamps span both.
-      if (prepPipeline && prepBindGroup) {
-        const prepPass = enc.beginComputePass(
-          timing ? { timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: 0 } } : undefined,
-        )
-        prepPass.setPipeline(prepPipeline)
-        prepPass.setBindGroup(0, prepBindGroup)
-        const [px, py] = this.prepDispatch(blocksX, blocksY)
-        prepPass.dispatchWorkgroups(Math.ceil(px / wgX), Math.ceil(py / wgY), 1)
-        prepPass.end()
-      }
-      const pass = enc.beginComputePass(
-        timing
-          ? {
-              timestampWrites: {
+      const maps: Promise<void>[] = []
+      for (let b = 0; b < bands.length; b++) {
+        const { y0, rows } = bands[b]!
+        const first = b === 0
+        const last = b === bands.length - 1
+        const enc = device.createCommandEncoder({ label: `${this.label}-encode-${b}` })
+        // The prep pass writes storage textures the encode pass samples, so
+        // they cannot share a compute pass; it runs once, before band 0.
+        if (first && prepPipeline && prepBindGroup) {
+          const prepPass = enc.beginComputePass(
+            timing ? { timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: 0 } } : undefined,
+          )
+          prepPass.setPipeline(prepPipeline)
+          prepPass.setBindGroup(0, prepBindGroup)
+          const [px, py] = this.prepDispatch(blocksX, blocksY)
+          prepPass.dispatchWorkgroups(Math.ceil(px / wgX), Math.ceil(py / wgY), 1)
+          prepPass.end()
+        }
+        const tsw: GPUComputePassTimestampWrites | undefined =
+          timing && (first || last)
+            ? {
                 querySet: timing.querySet,
-                ...(prepPipeline ? {} : { beginningOfPassWriteIndex: 0 }),
-                endOfPassWriteIndex: 1,
-              },
-            }
-          : undefined,
-      )
-      pass.setPipeline(pipeline)
-      pass.setBindGroup(0, bindGroup)
-      pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(blocksY / wgY), 1)
-      pass.end()
-
-      // 6. Buffer readback. We go through a MAP_READ staging buffer rather
-      //    than copyBufferToTexture: the encoder owns its own adapter/device,
-      //    separate from the Three.js renderer's, so the compressed bytes
-      //    have to transit CPU anyway before the renderer uploads them.
-      enc.copyBufferToBuffer(dstBuffer, 0, staging, 0, outByteLen)
-      if (timing) {
-        enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
-        enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
+                ...(first && !prepPipeline ? { beginningOfPassWriteIndex: 0 } : {}),
+                ...(last ? { endOfPassWriteIndex: 1 } : {}),
+              }
+            : undefined
+        const pass = enc.beginComputePass(tsw ? { timestampWrites: tsw } : undefined)
+        pass.setPipeline(pipeline)
+        pass.setBindGroup(0, bindGroups[b]!)
+        pass.dispatchWorkgroups(Math.ceil(blocksX / wgX), Math.ceil(rows / wgY), 1)
+        pass.end()
+        enc.copyBufferToBuffer(dstBuffer, y0 * rowBytes, stagings[b]!, 0, rows * rowBytes)
+        if (timing && last) {
+          enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
+          enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
+        }
+        device.queue.submit([enc.finish()])
+        maps.push(stagings[b]!.mapAsync(GPUMapMode.READ, 0, rows * rowBytes))
       }
-      device.queue.submit([enc.finish()])
 
-      // Map only the bytes this encode produced — the cached staging buffer
-      // may be larger.
-      await staging.mapAsync(GPUMapMode.READ, 0, outByteLen)
-      const data = new Uint8Array(staging.getMappedRange(0, outByteLen).slice(0))
-      staging.unmap()
+      // 6. Readback. Map only the bytes each band produced — the cached
+      //    staging buffers may be larger. The result array is allocated and
+      //    pre-faulted while the GPU works (see allocPrefaulted).
+      const data = allocPrefaulted(outByteLen)
+      for (let b = 0; b < bands.length; b++) {
+        const { y0, rows } = bands[b]!
+        await maps[b]
+        data.set(new Uint8Array(stagings[b]!.getMappedRange(0, rows * rowBytes)), y0 * rowBytes)
+        stagings[b]!.unmap()
+      }
       const encodeMs = performance.now() - t0
 
       const gpuMs = timing ? await this._readTimingMs(timing) : undefined
@@ -715,7 +790,7 @@ export abstract class Encoder {
       } else {
         srcTex?.destroy()
         dstBuffer?.destroy()
-        staging?.destroy()
+        for (const st of transientStagings) st.destroy()
         paramsBuffer?.destroy()
         if (transientPrepPlanes) for (const t of transientPrepPlanes) t.destroy()
       }
@@ -765,7 +840,7 @@ export abstract class Encoder {
         )
       }
     })
-    const { geoms, byteSpan } = this._chainGeometry(levels)
+    const { geoms, byteSpan, bands } = this._chainGeometry(levels)
     const sig = geoms.map(g => `${g.width}x${g.height}`).join()
 
     const useCache = !this._chainBusy
@@ -776,8 +851,9 @@ export abstract class Encoder {
     let prepBindGroups: GPUBindGroup[] | undefined
     let params: GPUBuffer | undefined
     let bindGroups: GPUBindGroup[] | undefined
+    let bandBindGroups: GPUBindGroup[] | undefined
     let dst: GPUBuffer | undefined
-    let staging: GPUBuffer | undefined
+    const transientStagings: GPUBuffer[] = []
     // Set when this call built the level-set resources without caching them
     // (another chain encode was in flight) — destroy them on the way out.
     let transientLevelSet = false
@@ -808,6 +884,7 @@ export abstract class Encoder {
         textures = this._chainTextures
         params = this._chainParams
         bindGroups = this._chainBindGroups
+        bandBindGroups = this._chainBandBindGroups
         prepPlaneSets = this._chainPrepPlanes
         prepBindGroups = this._chainPrepBindGroups
       } else {
@@ -823,18 +900,7 @@ export abstract class Encoder {
         )
         textures = texs
 
-        // One uniform buffer, one write: every level's { blocksX, blocksY,
-        // width, height } header at its ALIGN-ed offset.
-        params = device.createBuffer({
-          label: `${this.label}-chain-params`,
-          size: geoms.length * CHAIN_ALIGN,
-          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        })
-        const paramsData = new Uint32Array((geoms.length * CHAIN_ALIGN) / 4)
-        geoms.forEach((g, i) => {
-          paramsData.set([g.blocksX, g.blocksY, g.width, g.height], (i * CHAIN_ALIGN) / 4)
-        })
-        device.queue.writeBuffer(params, 0, paramsData)
+        params = this._createChainParams(geoms, bands)
 
         if (this._usesSampler) {
           this._sampler ??= device.createSampler({
@@ -852,14 +918,15 @@ export abstract class Encoder {
               this._createPrepBindGroup(prepPipeline, texs[i]!.createView(), planeSets[i]!, paramsBuf, i * CHAIN_ALIGN),
             )
           : []
-        bindGroups = geoms.map((g, i) => {
+        const makeBg = (i: number, slot: number): GPUBindGroup => {
+          const g = geoms[i]!
           const entries: GPUBindGroupEntry[] = [
             {
               binding: 0,
               resource: prepPipeline ? planeSets[i]![0]!.createView() : texs[i]!.createView(),
             },
             { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
-            { binding: 2, resource: { buffer: paramsBuf, offset: i * CHAIN_ALIGN, size: 16 } },
+            { binding: 2, resource: { buffer: paramsBuf, offset: slot * CHAIN_ALIGN, size: PARAMS_SIZE } },
           ]
           if (prepPipeline) {
             entries.push({ binding: 3, resource: planeSets[i]![1]!.createView() })
@@ -871,7 +938,9 @@ export abstract class Encoder {
             layout: pipeline.getBindGroupLayout(0),
             entries,
           })
-        })
+        }
+        bindGroups = geoms.map((_, i) => makeBg(i, i))
+        bandBindGroups = bands.map((_, b) => makeBg(0, geoms.length + b))
 
         if (useCache) {
           for (const tex of this._chainTextures) tex.destroy()
@@ -882,24 +951,10 @@ export abstract class Encoder {
           this._chainPrepBindGroups = prepBindGroups
           this._chainParams = params
           this._chainBindGroups = bindGroups
+          this._chainBandBindGroups = bandBindGroups
           this._chainSig = sig
         } else {
           transientLevelSet = true
-        }
-      }
-
-      // Staging buffer, grow-only (not part of any bind group).
-      if (useCache && this._chainStaging && this._chainStaging.size >= byteSpan) {
-        staging = this._chainStaging
-      } else {
-        staging = device.createBuffer({
-          label: `${this.label}-chain-staging`,
-          size: byteSpan,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-        })
-        if (useCache) {
-          this._chainStaging?.destroy()
-          this._chainStaging = staging
         }
       }
 
@@ -913,15 +968,18 @@ export abstract class Encoder {
         ])
       }
 
-      // One submission: a prep pass (when the encoder has one), the encode
-      // pass with one dispatch per level, one readback.
+      // One submission per base-level band (a prep pass first, when the
+      // encoder has one; the tail levels ride with the last band).
       return await this._submitChainAndRead(
         pipeline,
         geoms,
         byteSpan,
+        bands,
         bindGroups,
+        bandBindGroups,
         dst,
-        staging,
+        useCache,
+        transientStagings,
         withGpuTime,
         t0,
         prepPipeline && prepBindGroups ? { pipeline: prepPipeline, bindGroups: prepBindGroups } : null,
@@ -931,8 +989,8 @@ export abstract class Encoder {
         this._chainBusy = false
       } else {
         dst?.destroy()
-        staging?.destroy()
       }
+      for (const st of transientStagings) st.destroy()
       if (transientLevelSet) {
         if (textures) for (const tex of textures) tex.destroy()
         if (prepPlaneSets) for (const planes of prepPlaneSets) for (const t of planes) t.destroy()
@@ -967,19 +1025,20 @@ export abstract class Encoder {
     for (let i = 0; i < srcTex.mipLevelCount; i++) {
       dims.push({ width: Math.max(1, srcTex.width >> i), height: Math.max(1, srcTex.height >> i) })
     }
-    const { geoms, byteSpan } = this._chainGeometry(dims)
+    const { geoms, byteSpan, bands } = this._chainGeometry(dims)
 
     const useCache = !this._chainBusy
     if (useCache) this._chainBusy = true
 
     let dst: GPUBuffer | undefined
-    let staging: GPUBuffer | undefined
+    const transientStagings: GPUBuffer[] = []
     let params: GPUBuffer | undefined
     let planeSets: GPUTexture[][] | null = null
     try {
-      // Grow-only dst/staging, shared with encodeMipChainToBytes()'s cache
-      // slots. Recreating dst invalidates that path's cached bind groups
-      // (they bind slices of the old buffer), so drop its signature too.
+      // Grow-only dst (and staging buffers), shared with
+      // encodeMipChainToBytes()'s cache slots. Recreating dst invalidates
+      // that path's cached bind groups (they bind slices of the old
+      // buffer), so drop its signature too.
       if (useCache && this._chainDst && this._chainDst.size >= byteSpan) {
         dst = this._chainDst
       } else {
@@ -994,32 +1053,10 @@ export abstract class Encoder {
           this._chainSig = null
         }
       }
-      if (useCache && this._chainStaging && this._chainStaging.size >= byteSpan) {
-        staging = this._chainStaging
-      } else {
-        staging = device.createBuffer({
-          label: `${this.label}-chain-staging`,
-          size: byteSpan,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-        })
-        if (useCache) {
-          this._chainStaging?.destroy()
-          this._chainStaging = staging
-        }
-      }
 
       // Params + bind groups are transient: the source texture is new each
       // call, so nothing level-specific is reusable. (~0.1 ms per chain.)
-      params = device.createBuffer({
-        label: `${this.label}-chain-params`,
-        size: geoms.length * CHAIN_ALIGN,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      })
-      const paramsData = new Uint32Array((geoms.length * CHAIN_ALIGN) / 4)
-      geoms.forEach((g, i) => {
-        paramsData.set([g.blocksX, g.blocksY, g.width, g.height], (i * CHAIN_ALIGN) / 4)
-      })
-      device.queue.writeBuffer(params, 0, paramsData)
+      params = this._createChainParams(geoms, bands)
 
       if (this._usesSampler) {
         this._sampler ??= device.createSampler({
@@ -1044,14 +1081,15 @@ export abstract class Encoder {
               ),
             )
           : null
-      const bindGroups = geoms.map((g, i) => {
+      const makeBg = (i: number, slot: number): GPUBindGroup => {
+        const g = geoms[i]!
         const entries: GPUBindGroupEntry[] = [
           {
             binding: 0,
             resource: planes ? planes[i]![0]!.createView() : srcTex.createView({ baseMipLevel: i, mipLevelCount: 1 }),
           },
           { binding: 1, resource: { buffer: dstBuf, offset: g.dstOffset, size: g.byteLen } },
-          { binding: 2, resource: { buffer: paramsBuf, offset: i * CHAIN_ALIGN, size: 16 } },
+          { binding: 2, resource: { buffer: paramsBuf, offset: slot * CHAIN_ALIGN, size: PARAMS_SIZE } },
         ]
         if (planes) {
           entries.push({ binding: 3, resource: planes[i]![1]!.createView() })
@@ -1063,15 +1101,20 @@ export abstract class Encoder {
           layout: pipeline.getBindGroupLayout(0),
           entries,
         })
-      })
+      }
+      const bindGroups = geoms.map((_, i) => makeBg(i, i))
+      const bandBindGroups = bands.map((_, b) => makeBg(0, geoms.length + b))
 
       return await this._submitChainAndRead(
         pipeline,
         geoms,
         byteSpan,
+        bands,
         bindGroups,
+        bandBindGroups,
         dst,
-        staging,
+        useCache,
+        transientStagings,
         withGpuTime,
         t0,
         prepPipeline && prepBindGroups ? { pipeline: prepPipeline, bindGroups: prepBindGroups } : null,
@@ -1081,8 +1124,8 @@ export abstract class Encoder {
         this._chainBusy = false
       } else {
         dst?.destroy()
-        staging?.destroy()
       }
+      for (const st of transientStagings) st.destroy()
       // Safe immediately after submit: destruction is deferred until the
       // GPU is done with the buffer/textures.
       params?.destroy()
@@ -1093,10 +1136,11 @@ export abstract class Encoder {
   /** Block-grid geometry + packed output offsets for a chain of levels.
    *  `byteSpan` is both the dst buffer size and the readback copy size (a
    *  multiple of 4: byteLen is a multiple of bytesPerBlock ≥ 8, offsets are
-   *  CHAIN_ALIGN-ed). */
+   *  CHAIN_ALIGN-ed). `bands` splits the base level into row bands. */
   private _chainGeometry(dims: readonly { width: number; height: number }[]): {
     geoms: ChainGeom[]
     byteSpan: number
+    bands: { y0: number; rows: number }[]
   } {
     let dstCursor = 0
     const geoms = dims.map(({ width, height }) => {
@@ -1110,18 +1154,49 @@ export abstract class Encoder {
       return { width, height, paddedWidth, paddedHeight, blocksX, blocksY, byteLen, dstOffset }
     })
     const last = geoms[geoms.length - 1]!
-    return { geoms, byteSpan: last.dstOffset + last.byteLen }
+    const base = geoms[0]!
+    return {
+      geoms,
+      byteSpan: last.dstOffset + last.byteLen,
+      bands: bandRows(base.blocksY, base.byteLen, this.workgroupSize[1]),
+    }
   }
 
-  /** Shared chain-encode tail: one compute pass with a dispatch per level,
-   *  one submit, one staging readback sliced into per-level byte arrays. */
+  /** One uniform buffer, one write: level i's { blocksX, blocksY, width,
+   *  height, y0 = 0 } at slot i, then base-level band b at slot
+   *  levels + b (y0 = the band's first block row). Slots are CHAIN_ALIGN
+   *  apart. */
+  private _createChainParams(geoms: readonly ChainGeom[], bands: readonly { y0: number }[]): GPUBuffer {
+    const slots = geoms.length + bands.length
+    const params = this.device.createBuffer({
+      label: `${this.label}-chain-params`,
+      size: slots * CHAIN_ALIGN,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
+    const data = new Uint32Array((slots * CHAIN_ALIGN) / 4)
+    geoms.forEach((g, i) => data.set([g.blocksX, g.blocksY, g.width, g.height, 0], (i * CHAIN_ALIGN) / 4))
+    const g0 = geoms[0]!
+    bands.forEach((band, b) =>
+      data.set([g0.blocksX, g0.blocksY, g0.width, g0.height, band.y0], ((geoms.length + b) * CHAIN_ALIGN) / 4),
+    )
+    this.device.queue.writeBuffer(params, 0, data)
+    return params
+  }
+
+  /** Shared chain-encode tail: one submission per base-level row band —
+   *  band b dispatches its rows of level 0, the last band also every tail
+   *  level — each read back through its own staging buffer as it lands,
+   *  then sliced into per-level byte arrays. */
   private async _submitChainAndRead(
     pipeline: GPUComputePipeline,
     geoms: readonly ChainGeom[],
     byteSpan: number,
+    bands: readonly { y0: number; rows: number }[],
     bindGroups: readonly GPUBindGroup[],
+    bandBindGroups: readonly GPUBindGroup[],
     dst: GPUBuffer,
-    staging: GPUBuffer,
+    useCache: boolean,
+    transientStagings: GPUBuffer[],
     withGpuTime: boolean,
     t0: number,
     prep: { pipeline: GPUComputePipeline; bindGroups: readonly GPUBindGroup[] } | null = null,
@@ -1129,57 +1204,109 @@ export abstract class Encoder {
     const device = this.device
     const timing = withGpuTime ? this._createTiming() : null
     const [wgX, wgY] = this.workgroupSize
-    const enc = device.createCommandEncoder({ label: `${this.label}-encode-chain` })
-    // Prep writes storage textures the encode pass samples — separate passes.
-    if (prep) {
-      const prepPass = enc.beginComputePass(
-        timing ? { timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: 0 } } : undefined,
-      )
-      prepPass.setPipeline(prep.pipeline)
-      for (let i = 0; i < geoms.length; i++) {
-        const g = geoms[i]!
-        prepPass.setBindGroup(0, prep.bindGroups[i]!)
-        const [px, py] = this.prepDispatch(g.blocksX, g.blocksY)
-        prepPass.dispatchWorkgroups(Math.ceil(px / wgX), Math.ceil(py / wgY), 1)
-      }
-      prepPass.end()
-    }
-    const pass = enc.beginComputePass(
-      timing
-        ? {
-            timestampWrites: {
-              querySet: timing.querySet,
-              ...(prep ? {} : { beginningOfPassWriteIndex: 0 }),
-              endOfPassWriteIndex: 1,
-            },
-          }
-        : undefined,
-    )
-    pass.setPipeline(pipeline)
-    for (let i = 0; i < geoms.length; i++) {
-      const g = geoms[i]!
-      pass.setBindGroup(0, bindGroups[i]!)
-      pass.dispatchWorkgroups(Math.ceil(g.blocksX / wgX), Math.ceil(g.blocksY / wgY), 1)
-    }
-    pass.end()
-    enc.copyBufferToBuffer(dst, 0, staging, 0, byteSpan)
-    if (timing) {
-      enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
-      enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
-    }
-    device.queue.submit([enc.finish()])
+    const base = geoms[0]!
+    const rowBytes = base.blocksX * this.bytesPerBlock
 
-    // Single readback for the whole chain.
-    await staging.mapAsync(GPUMapMode.READ, 0, byteSpan)
-    const mapped = staging.getMappedRange(0, byteSpan)
+    // Readback ranges of dst: band b's rows of level 0; the last band runs
+    // on to the end of the chain (the tail levels follow level 0 in dst).
+    const ranges = bands.map((band, b) => {
+      const start = base.dstOffset + band.y0 * rowBytes
+      const end = b === bands.length - 1 ? byteSpan : start + band.rows * rowBytes
+      return { start, len: end - start }
+    })
+    const stagings = ranges.map(({ len }, b) => {
+      let st = useCache ? this._chainStagings[b] : undefined
+      if (!st || st.size < len) {
+        st = device.createBuffer({
+          label: `${this.label}-chain-staging-${b}`,
+          size: len,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        })
+        if (useCache) {
+          this._chainStagings[b]?.destroy()
+          this._chainStagings[b] = st
+        } else {
+          transientStagings.push(st)
+        }
+      }
+      return st
+    })
+
+    const maps: Promise<void>[] = []
+    for (let b = 0; b < bands.length; b++) {
+      const first = b === 0
+      const last = b === bands.length - 1
+      const enc = device.createCommandEncoder({ label: `${this.label}-encode-chain-${b}` })
+      // Prep writes storage textures the encode pass samples — separate
+      // passes; it covers every level, before band 0.
+      if (first && prep) {
+        const prepPass = enc.beginComputePass(
+          timing ? { timestampWrites: { querySet: timing.querySet, beginningOfPassWriteIndex: 0 } } : undefined,
+        )
+        prepPass.setPipeline(prep.pipeline)
+        for (let i = 0; i < geoms.length; i++) {
+          const g = geoms[i]!
+          prepPass.setBindGroup(0, prep.bindGroups[i]!)
+          const [px, py] = this.prepDispatch(g.blocksX, g.blocksY)
+          prepPass.dispatchWorkgroups(Math.ceil(px / wgX), Math.ceil(py / wgY), 1)
+        }
+        prepPass.end()
+      }
+      const tsw: GPUComputePassTimestampWrites | undefined =
+        timing && (first || last)
+          ? {
+              querySet: timing.querySet,
+              ...(first && !prep ? { beginningOfPassWriteIndex: 0 } : {}),
+              ...(last ? { endOfPassWriteIndex: 1 } : {}),
+            }
+          : undefined
+      const pass = enc.beginComputePass(tsw ? { timestampWrites: tsw } : undefined)
+      pass.setPipeline(pipeline)
+      pass.setBindGroup(0, bandBindGroups[b]!)
+      pass.dispatchWorkgroups(Math.ceil(base.blocksX / wgX), Math.ceil(bands[b]!.rows / wgY), 1)
+      if (last) {
+        for (let i = 1; i < geoms.length; i++) {
+          const g = geoms[i]!
+          pass.setBindGroup(0, bindGroups[i]!)
+          pass.dispatchWorkgroups(Math.ceil(g.blocksX / wgX), Math.ceil(g.blocksY / wgY), 1)
+        }
+      }
+      pass.end()
+      enc.copyBufferToBuffer(dst, ranges[b]!.start, stagings[b]!, 0, ranges[b]!.len)
+      if (timing && last) {
+        enc.resolveQuerySet(timing.querySet, 0, 2, timing.resolve, 0)
+        enc.copyBufferToBuffer(timing.resolve, 0, timing.staging, 0, 16)
+      }
+      device.queue.submit([enc.finish()])
+      maps.push(stagings[b]!.mapAsync(GPUMapMode.READ, 0, ranges[b]!.len))
+    }
+
+    // The per-level result arrays are allocated and pre-faulted while the
+    // GPU works (see allocPrefaulted).
     const out: EncodedLevelBytes[] = geoms.map(g => ({
       width: g.width,
       height: g.height,
       paddedWidth: g.paddedWidth,
       paddedHeight: g.paddedHeight,
-      data: new Uint8Array(mapped.slice(g.dstOffset, g.dstOffset + g.byteLen)),
+      data: allocPrefaulted(g.byteLen),
     }))
-    staging.unmap()
+    for (let b = 0; b < bands.length; b++) {
+      const { start, len } = ranges[b]!
+      await maps[b]
+      const mapped = stagings[b]!.getMappedRange(0, len)
+      if (b < bands.length - 1) {
+        out[0]!.data.set(new Uint8Array(mapped), start - base.dstOffset)
+      } else {
+        // Rest of level 0, then every tail level.
+        const lvl0Rest = base.dstOffset + base.byteLen - start
+        out[0]!.data.set(new Uint8Array(mapped, 0, lvl0Rest), start - base.dstOffset)
+        for (let i = 1; i < geoms.length; i++) {
+          const g = geoms[i]!
+          out[i]!.data.set(new Uint8Array(mapped, g.dstOffset - start, g.byteLen))
+        }
+      }
+      stagings[b]!.unmap()
+    }
     const encodeMs = performance.now() - t0
     const gpuMs = timing ? await this._readTimingMs(timing) : undefined
 

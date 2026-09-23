@@ -112,10 +112,18 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   // lifted them ~+1.3 dB was dropped for speed (see bc7_fast_f16.wgsl).
   // Unlisted rows and the `:normal` colour-format cross-card entries are
   // record-only.
-  'bc1:color': 29.05,
+  // BC1 rows re-pinned 2026-09 (solid-colour path for near-flat blocks +
+  // moment-form refit passes): measured color 29.32, rock-ao 41.63, rock-
+  // displacement 45.85, wood-roughness 40.64, wood-displacement 43.36 (min
+  // f16/f32).
+  'bc1:color': 29.17,
   'bc5:normal': 53.0,
   'bc7:color': 31.9,
-  'astc:color': 31.75,
+  // ASTC colour rows re-pinned 2026-09 for the opaque CEM 8 bit budgets
+  // (QUANT_192 endpoints + 4-bit weights on wide blocks): measured
+  // 32.03 / 37.83 / 38.16 / 50.88 (color / packed / rock / wood, min
+  // f16/f32), up from 31.97 / 37.59 / 37.52 / 49.60.
+  'astc:color': 31.88,
   // 1024² committed alpha card (2026-07): bc7 38.43/38.38 f16/f32, astc
   // 37.28/37.27 — both above the exhaustive reference on this content.
   'bc7:alpha': 38.2,
@@ -128,16 +136,16 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc7:packed-512': 35.0,
   'bc1:packed-1024': 34.75,
   'bc7:packed-1024': 37.65,
-  'astc:packed-1024': 37.4,
+  'astc:packed-1024': 37.68,
   'bc7:packed-2048': 45.15,
   'bc7:packed-4096': 49.95,
   'bc1:rock-color-1k': 33.9,
   'bc7:rock-color-1k': 38.1,
-  'astc:rock-color-1k': 37.35,
+  'astc:rock-color-1k': 38.0,
   'bc5:rock-normal-1k': 46.35,
   'bc1:rock-roughness-1k': 39.1,
-  'bc1:rock-ao-1k': 41.35,
-  'bc1:rock-displacement-1k': 45.05,
+  'bc1:rock-ao-1k': 41.48,
+  'bc1:rock-displacement-1k': 45.7,
   // BC7 on exact-grayscale maps (analytic luma axis) — measured
   // 51.62 / 53.63 / 56.68 / 52.10 / 55.09 (2026-07, min f16/f32).
   'bc7:rock-roughness-1k': 51.45,
@@ -158,7 +166,7 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc5:rock-normal-4k': 43.75,
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
-  'astc:wood-color-1k': 49.45,
+  'astc:wood-color-1k': 50.7,
   // ETC2 (2026-07, minus ~0.15 dB; SETTLED at the two-candidate scored
   // search + planar + no refit — the hedged O(1) table pick saved ~3% GPU
   // for −0.5 dB and was reverted, the two-pass prepared source lost
@@ -173,8 +181,8 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'etc2:rock-roughness-1k': 39.99,
   'etc2:wood-color-1k': 39.06,
   'bc5:wood-normal-1k': 48.0,
-  'bc1:wood-roughness-1k': 40.4,
-  'bc1:wood-displacement-1k': 43.1,
+  'bc1:wood-roughness-1k': 40.49,
+  'bc1:wood-displacement-1k': 43.21,
   'bc7:wood-color-2k': 50.65,
   'bc5:wood-normal-2k': 48.95,
   'bc7:wood-color-4k': 51.7,

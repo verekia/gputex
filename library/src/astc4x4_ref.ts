@@ -8,16 +8,23 @@
 //
 //   • Single partition (no multi-subset fitting).
 //   • No dual-plane.
-//   • 8-bit endpoints (QUANT_256) — bit-replication is a no-op, so the
-//     stored byte equals the unquantised byte.
-//   • Weight grid 4×4 (one weight per footprint texel, no upsampling).
-//   • THREE block classes, chosen per block by content — the ASTC bit
-//     budget trades endpoint bits against weight bits, so a block should
-//     only pay for the endpoint channels it actually uses:
+//   • Endpoints either 8-bit (QUANT_256 — bit-replication is a no-op, so
+//     the stored byte equals the unquantised byte) or QUANT_192 (one trit
+//     + 6 bits per value, integer-sequence encoded — see below).
+//   • Plain-bit weights; weight grid 4×4 (one weight per footprint texel,
+//     no upsampling).
+//   • Block classes chosen per block by content — the ASTC bit budget
+//     trades endpoint bits against weight bits, so a block should only pay
+//     for the endpoint channels it actually uses:
 //       gray + opaque   → CEM 0  (LDR luminance direct), 5-bit weights
 //                         (QUANT_32): 2×8 endpoint bits + 80 weight bits
-//       opaque          → CEM 8  (LDR RGB direct), 3-bit weights
-//                         (QUANT_8): 6×8 endpoint bits + 48 weight bits
+//       opaque          → CEM 8  (LDR RGB direct), one of two budgets:
+//                         3-bit weights (QUANT_8) + 6×8 endpoint bits, or
+//                         4-bit weights (QUANT_16) + 6 QUANT_192 values
+//                         (46 bits). The encoder below tries both and keeps
+//                         the lower error; the GPU encoders pick by the
+//                         block's colour span (exact endpoints win on
+//                         small spans, finer weights on wide ones).
 //       translucent     → CEM 12 (LDR RGBA direct), 2-bit weights
 //                         (QUANT_4): 8×8 endpoint bits + 32 weight bits
 //     "gray" means every texel has R == G == B exactly in 8-bit;
@@ -34,20 +41,40 @@
 // -----------------------------------------------------------------------
 // BLOCK LAYOUT (128 bits total, LSB-first, bit 0 = byte 0's bit 0)
 //
-//   bits [10:0]   block mode: 0x042 (QUANT_4), 0x053 (QUANT_8) or
-//                 0x253 (QUANT_32) — all decode to a 4×4 single-plane
-//                 weight grid, see derivation below
+//   bits [10:0]   block mode: 0x042 (QUANT_4), 0x053 (QUANT_8), 0x242
+//                 (QUANT_16) or 0x253 (QUANT_32) — all decode to a 4×4
+//                 single-plane weight grid, see derivation below
 //   bits [12:11]  partition_count − 1 = 0 (one partition)
 //   bits [16:13]  CEM = 0, 8 or 12
-//   bits [17+]    endpoint data, 8 bits per value, v0 first:
-//                 CEM 0:  L0 L1                          (ends at bit 33)
-//                 CEM 8:  R0 R1 G0 G1 B0 B1              (ends at bit 65)
-//                 CEM 12: R0 R1 G0 G1 B0 B1 A0 A1        (ends at bit 81)
+//   bits [17+]    endpoint data, v0 first:
+//                 CEM 0:  L0 L1, 8 bits each                   (ends at 33)
+//                 CEM 8:  R0 R1 G0 G1 B0 B1, 8 bits each       (ends at 65)
+//                         or QUANT_192 ISE (mode 0x242)        (ends at 63)
+//                 CEM 12: R0 R1 G0 G1 B0 B1 A0 A1, 8 bits each (ends at 81)
 //   bits [..]     unused, zero
 //   top bits      weight data, growing DOWN from bit 127: bit j (LSB=0)
 //                 of weight k lives at block bit (127 − nBits·k − j).
 //                 QUANT_4: 32 bits (down to 96), QUANT_8: 48 (down to
-//                 80), QUANT_32: 80 (down to 48).
+//                 80), QUANT_16: 64 (down to 64), QUANT_32: 80 (down to
+//                 48).
+//
+// The endpoint range is not stored: the decoder derives it as the largest
+// range whose ISE encoding of the CEM's values fits the bits left after
+// the weights. 128 − 17 − 48 (QUANT_8) = 63 → QUANT_256 for 6 values;
+// 128 − 17 − 64 (QUANT_16) = 47 → QUANT_192 (46 bits — QUANT_256 would
+// need 48).
+//
+// QUANT_192 ENDPOINTS (ISE, one trit + 6 bits per value)
+//   Values are coded in groups of five: v0 bits, T[1:0], v1 bits, T[3:2],
+//   v2 bits, T[4], v3 bits, T[6:5], v4 bits, T[7], where T packs the five
+//   trits (spec trit-block table; `encodeTrits` is its inverse). A partial
+//   last group stops after its last value's T bits — CEM 8's sixth value
+//   is followed by T[1:0] only. Unquantisation (spec, trit ranges): with a
+//   = bit 0 of the 6 bits and b..f the rest, A = a ? 0x1FF : 0,
+//   B = fedcb000f (9 bits), C = 5, D = the trit:
+//     T = D·C + B;  T ^= A;  unq = (A & 0x80) | (T >> 2)
+//   which yields every value ≤ 127 not ≡ 3 (mod 4) plus their mirror
+//   images 255 − u — 192 levels, hardware-verified on Apple M3.
 //
 // BLOCK MODE DERIVATION
 //   Using the decode formulas in Khronos DF spec §22.11 / ARM astc-encoder
@@ -56,9 +83,11 @@
 //     (block_mode >> 2) & 3 = 0 selects case 0: W = B+4, H = A+2
 //     where B = bits[8:7], A = bits[6:5]; H-flag = bit 9, D-flag = bit 10.
 //   For W = H = 4: B = 0, A = 2 (bit 6 set). The weight range comes from
-//   (R, H-flag): (4, 0) → QUANT_4, (7, 0) → QUANT_8, (7, 1) → QUANT_32.
+//   (R, H-flag): (4, 0) → QUANT_4, (7, 0) → QUANT_8, (4, 1) → QUANT_16,
+//   (7, 1) → QUANT_32.
 //     0x042 = 0b000_0100_0010: R = 100₂ = 4, H = 0 → QUANT_4
 //     0x053 = 0b000_0101_0011: R = 111₂ = 7, H = 0 → QUANT_8
+//     0x242 = 0b010_0100_0010: R = 100₂ = 4, H = 1 → QUANT_16
 //     0x253 = 0b010_0101_0011: R = 111₂ = 7, H = 1 → QUANT_32
 //
 // ENDPOINT ORDERING (avoiding blue contraction)
@@ -77,6 +106,8 @@
 //   every value greater than 32 — mapping 0..63 onto 0..64 with 32 fixed.
 //     QUANT_4  (2-bit): [0, 21, 43, 64]
 //     QUANT_8  (3-bit): [0, 9, 18, 27, 37, 46, 55, 64]
+//     QUANT_16 (4-bit): [0, 4, 8, 12, 17, 21, 25, 29, 35, 39, 43, 47, 52,
+//                        56, 60, 64]
 //     QUANT_32 (5-bit): w ≤ 15 → 2w; w ≥ 16 → 2w + 2   (0..30, 34..64)
 //   Decode interpolation follows the spec's LDR rule exactly: endpoints
 //   are first expanded to 16 bits by byte replication (e16 = e8 · 257),
@@ -103,6 +134,7 @@ export type ASTC4x4Block = Uint8Array
 /** Block modes: 4×4 grid, single plane, LDR. See header derivation. */
 const BLOCK_MODE_4x4_2BIT = 0x042
 const BLOCK_MODE_4x4_3BIT = 0x053
+const BLOCK_MODE_4x4_4BIT = 0x242
 const BLOCK_MODE_4x4_5BIT = 0x253
 
 /** Color endpoint modes we emit (all "LDR, direct"). */
@@ -113,6 +145,10 @@ const CEM_RGBA_DIRECT = 12
 /** Weight unquantisation tables (spec bit-replicate-then-bump rule). */
 const WEIGHT_UNQ_4: readonly number[] = [0, 21, 43, 64]
 const WEIGHT_UNQ_8: readonly number[] = [0, 9, 18, 27, 37, 46, 55, 64]
+const WEIGHT_UNQ_16: readonly number[] = Array.from({ length: 16 }, (_, w) => {
+  const u = (w << 2) | (w >> 2)
+  return u > 32 ? u + 1 : u
+})
 const WEIGHT_UNQ_32: readonly number[] = Array.from({ length: 32 }, (_, w) => (w <= 15 ? 2 * w : 2 * w + 2))
 
 /** Per-class packing description, keyed by CEM. */
@@ -123,6 +159,8 @@ interface BlockClass {
   channels: readonly number[]
   weightBits: number
   unq: readonly number[]
+  /** Endpoint range: plain bytes (256) or trit-ISE QUANT_192. */
+  endpointRange: 256 | 192
 }
 
 const CLASS_LUM: BlockClass = {
@@ -131,6 +169,7 @@ const CLASS_LUM: BlockClass = {
   channels: [0],
   weightBits: 5,
   unq: WEIGHT_UNQ_32,
+  endpointRange: 256,
 }
 const CLASS_RGB: BlockClass = {
   cem: CEM_RGB_DIRECT,
@@ -138,6 +177,15 @@ const CLASS_RGB: BlockClass = {
   channels: [0, 1, 2],
   weightBits: 3,
   unq: WEIGHT_UNQ_8,
+  endpointRange: 256,
+}
+const CLASS_RGB_Q192: BlockClass = {
+  cem: CEM_RGB_DIRECT,
+  blockMode: BLOCK_MODE_4x4_4BIT,
+  channels: [0, 1, 2],
+  weightBits: 4,
+  unq: WEIGHT_UNQ_16,
+  endpointRange: 192,
 }
 const CLASS_RGBA: BlockClass = {
   cem: CEM_RGBA_DIRECT,
@@ -145,6 +193,7 @@ const CLASS_RGBA: BlockClass = {
   channels: [0, 1, 2, 3],
   weightBits: 2,
   unq: WEIGHT_UNQ_4,
+  endpointRange: 256,
 }
 
 // --- Scalar helpers ---------------------------------------------------------
@@ -168,6 +217,101 @@ function to8(v: number): number {
 function interp16(e0: number, e1: number, w: number): number {
   return ((64 - w) * e0 * 257 + w * e1 * 257 + 32) >> 6
 }
+
+// --- QUANT_192 endpoint range (trit ISE) ------------------------------------
+
+/** QUANT_192 ISE value (trit·64 + 6 bits) → unquantised byte (spec rule). */
+function unq192(value: number): number {
+  const trit = value >> 6
+  const bits = value & 63
+  const A = bits & 1 ? 0x1ff : 0
+  const f = (bits >> 5) & 1
+  // B = f e d c b 0 0 0 f
+  const B = (((bits >> 1) & 31) << 4) | f
+  const T = ((trit * 5 + B) ^ A) & 0x1ff
+  return ((A & 0x80) | (T >> 2)) & 0xff
+}
+
+/** unquantised byte → ISE value, −1 for the 64 unrepresentable bytes. */
+const Q192_VALUE_OF: Int16Array = (() => {
+  const t = new Int16Array(256).fill(-1)
+  for (let v = 0; v < 192; v++) t[unq192(v)] = v
+  return t
+})()
+
+/** Nearest representable QUANT_192 byte to x (ties go down). */
+function nearest192(x: number): number {
+  const v = clamp(Math.round(x), 0, 255)
+  if (Q192_VALUE_OF[v]! >= 0) return v
+  const lo = v - 1
+  const hi = v + 1
+  const loOk = lo >= 0 && Q192_VALUE_OF[lo]! >= 0
+  const hiOk = hi <= 255 && Q192_VALUE_OF[hi]! >= 0
+  if (loOk && hiOk) return x - lo <= hi - x ? lo : hi
+  if (loOk) return x - lo <= 2 ? lo : v + 2
+  return hiOk ? hi : v - 2
+}
+
+/** Spec trit-block decode: 8-bit T → five trits. */
+function decodeTrits(T: number): [number, number, number, number, number] {
+  const bit = (x: number, i: number): number => (x >> i) & 1
+  let C: number
+  let t3: number
+  let t4: number
+  if (((T >> 2) & 7) === 7) {
+    C = (((T >> 5) & 7) << 2) | (T & 3)
+    t4 = 2
+    t3 = 2
+  } else {
+    C = T & 31
+    if (((T >> 5) & 3) === 3) {
+      t4 = 2
+      t3 = bit(T, 7)
+    } else {
+      t4 = bit(T, 7)
+      t3 = (T >> 5) & 3
+    }
+  }
+  let t0: number
+  let t1: number
+  let t2: number
+  if ((C & 3) === 3) {
+    t2 = 2
+    t1 = bit(C, 4)
+    t0 = (bit(C, 3) << 1) | (bit(C, 2) & ~bit(C, 3) & 1)
+  } else if (((C >> 2) & 3) === 3) {
+    t2 = 2
+    t1 = 2
+    t0 = C & 3
+  } else {
+    t2 = bit(C, 4)
+    t1 = (C >> 2) & 3
+    t0 = (bit(C, 1) << 1) | (bit(C, 0) & ~bit(C, 1) & 1)
+  }
+  return [t0, t1, t2, t3, t4]
+}
+
+/** Five trits → 8-bit T: the inverse of `decodeTrits` (the GPU shaders
+ *  carry the same branch structure as selects). */
+function encodeTrits(t0: number, t1: number, t2: number, t3: number, t4: number): number {
+  let C: number
+  if (t2 === 2 && t1 === 2) C = 0b01100 | t0
+  else if (t2 === 2) C = (t1 << 4) | (t0 << 2) | 3
+  else C = (t2 << 4) | (t1 << 2) | t0
+  if (t3 === 2 && t4 === 2) return ((C >> 2) << 5) | (7 << 2) | (C & 3)
+  if (t4 === 2) return (t3 << 7) | (3 << 5) | C
+  return (t4 << 7) | (t3 << 5) | C
+}
+
+// Bit positions of each trit-field slice inside a 5-value group: after
+// value i come T bits [start, start + count).
+const TRIT_SLICES: readonly (readonly [number, number])[] = [
+  [0, 2],
+  [2, 2],
+  [4, 1],
+  [5, 2],
+  [7, 1],
+]
 
 // --- 128-bit positioned bit writer / reader ---------------------------------
 //
@@ -346,6 +490,50 @@ function refitEndpoints(
 
 // --- Encode -----------------------------------------------------------------
 
+/** Quantise an endpoint to the class's range (identity for QUANT_256). */
+function quantEndpoint(cls: BlockClass, e: readonly number[]): number[] {
+  return cls.endpointRange === 192 ? e.map(nearest192) : e.map(v => clamp(Math.round(v), 0, 255))
+}
+
+/**
+ * Steps 2–4 for one class: farthest-pair seed, nearest-palette indices,
+ * one least-squares refit accepted only if the error drops. Endpoints are
+ * quantised to the class's range before every error evaluation.
+ */
+function fitClass(
+  cls: BlockClass,
+  pixels8: Uint8Array,
+): { e0: number[]; e1: number[]; indices: Uint8Array; err: number } {
+  const C = cls.channels.length
+  const vals = new Float64Array(16 * C)
+  for (let k = 0; k < 16; k++) {
+    for (let c = 0; c < C; c++) vals[k * C + c] = pixels8[k * 4 + cls.channels[c]!]!
+  }
+  const fp = farthestPair(vals, C)
+  let e0 = quantEndpoint(
+    cls,
+    Array.from({ length: C }, (_, c) => vals[fp.i0 * C + c]!),
+  )
+  let e1 = quantEndpoint(
+    cls,
+    Array.from({ length: C }, (_, c) => vals[fp.i1 * C + c]!),
+  )
+  let { indices, err } = totalSqError(vals, C, e0, e1, cls.unq)
+  const refit = refitEndpoints(vals, C, indices, cls.unq)
+  if (refit) {
+    const r0 = quantEndpoint(cls, refit.e0)
+    const r1 = quantEndpoint(cls, refit.e1)
+    const second = totalSqError(vals, C, r0, r1, cls.unq)
+    if (second.err < err) {
+      e0 = r0
+      e1 = r1
+      indices = second.indices
+      err = second.err
+    }
+  }
+  return { e0, e1, indices, err }
+}
+
 /**
  * Encode 16 RGBA pixels (64 floats in [0, 1]) as a single ASTC 4×4 LDR
  * block using the narrow subset described at the top of this file. The
@@ -353,8 +541,10 @@ function refitEndpoints(
  * grayscale + opaque → luminance, opaque → RGB, otherwise RGBA.
  *
  * Algorithm per class:
- *   1. Quantise input to 8-bit; classify.
- *   2. Farthest-pair over the class's channels → initial (e0, e1).
+ *   1. Quantise input to 8-bit; classify (opaque colour tries both CEM 8
+ *      bit budgets and keeps the lower-error one).
+ *   2. Farthest-pair over the class's channels → initial (e0, e1),
+ *      quantised to the class's endpoint range.
  *   3. Assign per-texel indices by nearest palette entry.
  *   4. One LSQ refit pass; accept only if total error strictly decreases.
  *   5. CEM 8/12: flip endpoints (and reflect weights) if
@@ -377,34 +567,17 @@ export function encodeASTC4x4Block(pixels: ASTC4x4Pixels): ASTC4x4Block {
     if (pixels8[k * 4 + 1] !== r || pixels8[k * 4 + 2] !== r) gray = false
     if (pixels8[k * 4 + 3] !== 255) opaque = false
   }
-  const cls = opaque ? (gray ? CLASS_LUM : CLASS_RGB) : CLASS_RGBA
-
-  // Gather the class's channels.
+  // Opaque colour has two bit budgets for CEM 8 — encode both, keep the
+  // lower error (ties keep exact 8-bit endpoints).
+  const classes = opaque ? (gray ? [CLASS_LUM] : [CLASS_RGB, CLASS_RGB_Q192]) : [CLASS_RGBA]
+  let best: { cls: BlockClass; e0: number[]; e1: number[]; indices: Uint8Array; err: number } | null = null
+  for (const cls of classes) {
+    const fit = fitClass(cls, pixels8)
+    if (!best || fit.err < best.err) best = { cls, ...fit }
+  }
+  const { cls } = best!
+  let { e0, e1, indices } = best!
   const C = cls.channels.length
-  const vals = new Float64Array(16 * C)
-  for (let k = 0; k < 16; k++) {
-    for (let c = 0; c < C; c++) vals[k * C + c] = pixels8[k * 4 + cls.channels[c]!]!
-  }
-
-  // Step 2.
-  const fp = farthestPair(vals, C)
-  let e0: number[] = Array.from({ length: C }, (_, c) => vals[fp.i0 * C + c]!)
-  let e1: number[] = Array.from({ length: C }, (_, c) => vals[fp.i1 * C + c]!)
-
-  // Step 3.
-  let { indices, err } = totalSqError(vals, C, e0, e1, cls.unq)
-
-  // Step 4.
-  const refit = refitEndpoints(vals, C, indices, cls.unq)
-  if (refit) {
-    const second = totalSqError(vals, C, refit.e0, refit.e1, cls.unq)
-    if (second.err < err) {
-      e0 = refit.e0
-      e1 = refit.e1
-      indices = second.indices
-      err = second.err
-    }
-  }
 
   // Step 5: endpoint ordering. For CEM 8/12 this dodges the decoder's
   // blue-contraction branch (RGB sums); for CEM 0 it is purely a
@@ -443,11 +616,33 @@ function packBlock(cls: BlockClass, e0: readonly number[], e1: readonly number[]
   bw.write(11, 2, 0) // partition_count − 1
   bw.write(13, 4, cls.cem)
 
-  // Endpoints, 8-bit values from bit 17, interleaved (v0, v1) per channel —
-  // matching the decoder's (v0, v1) = channel 0 lo/hi, (v2, v3) = channel 1…
-  for (let c = 0; c < e0.length; c++) {
-    bw.write(17 + c * 16, 8, e0[c]!)
-    bw.write(25 + c * 16, 8, e1[c]!)
+  // Endpoints from bit 17, interleaved (v0, v1) per channel — matching the
+  // decoder's (v0, v1) = channel 0 lo/hi, (v2, v3) = channel 1…
+  const values: number[] = []
+  for (let c = 0; c < e0.length; c++) values.push(e0[c]!, e1[c]!)
+  if (cls.endpointRange === 192) {
+    // Trit ISE: groups of five, each value's 6 bits followed by its slice of
+    // the group's trit field.
+    let pos = 17
+    for (let g = 0; g < values.length; g += 5) {
+      const grp = values.slice(g, g + 5).map(v => {
+        const q = Q192_VALUE_OF[v]!
+        if (q < 0) throw new Error(`packBlock: ${v} is not a QUANT_192 level`)
+        return q
+      })
+      const t = [0, 0, 0, 0, 0]
+      grp.forEach((q, i) => (t[i] = q >> 6))
+      const T = encodeTrits(t[0]!, t[1]!, t[2]!, t[3]!, t[4]!)
+      grp.forEach((q, i) => {
+        bw.write(pos, 6, q & 63)
+        pos += 6
+        const [start, count] = TRIT_SLICES[i]!
+        bw.write(pos, count, (T >> start) & ((1 << count) - 1))
+        pos += count
+      })
+    }
+  } else {
+    values.forEach((v, i) => bw.write(17 + i * 8, 8, v))
   }
 
   // Weights: bit j (LSB = 0) of weight k at block bit (127 − nBits·k − j).
@@ -465,21 +660,25 @@ function packBlock(cls: BlockClass, e0: readonly number[], e1: readonly number[]
 
 // --- Decode -----------------------------------------------------------------
 
-const CLASS_BY_MODE: Record<number, BlockClass> = {
-  [BLOCK_MODE_4x4_2BIT]: CLASS_RGBA,
-  [BLOCK_MODE_4x4_3BIT]: CLASS_RGB,
-  [BLOCK_MODE_4x4_5BIT]: CLASS_LUM,
+/** The (block mode, CEM) pairs we accept, keyed `mode:cem`. */
+const CLASS_BY_MODE_CEM: Record<string, BlockClass> = {
+  [`${BLOCK_MODE_4x4_2BIT}:${CEM_RGBA_DIRECT}`]: CLASS_RGBA,
+  [`${BLOCK_MODE_4x4_3BIT}:${CEM_RGB_DIRECT}`]: CLASS_RGB,
+  [`${BLOCK_MODE_4x4_4BIT}:${CEM_RGB_DIRECT}`]: CLASS_RGB_Q192,
+  [`${BLOCK_MODE_4x4_5BIT}:${CEM_LUM_DIRECT}`]: CLASS_LUM,
 }
+const SUPPORTED_MODES = new Set([BLOCK_MODE_4x4_2BIT, BLOCK_MODE_4x4_3BIT, BLOCK_MODE_4x4_4BIT, BLOCK_MODE_4x4_5BIT])
 
 /**
  * Decode an ASTC 4×4 block produced by this encoder (or by any other
- * encoder that respects our narrow subset: block modes 0x042/0x053/0x253,
- * single partition, CEM 0/8/12 with 8-bit endpoints). Handles the
+ * encoder that respects our narrow subset: block modes 0x042/0x053/0x242/
+ * 0x253, single partition, CEM 0/8/12 — QUANT_192 endpoints with 0x242,
+ * 8-bit endpoints otherwise). Handles the
  * blue-contraction branch even though our encoder doesn't produce it, so
  * externally-supplied blocks round-trip predictably.
  *
  * The CEM is validated against the block mode's expected pairing (we only
- * ever emit the three fixed combinations above).
+ * ever emit the four fixed combinations above).
  *
  * Output: 16 RGBA pixels as 64 floats in [0, 1].
  */
@@ -490,8 +689,7 @@ export function decodeASTC4x4Block(block: ASTC4x4Block): Float32Array {
   const br = new BitReader128(block)
 
   const mode = br.read(0, 11)
-  const cls = CLASS_BY_MODE[mode]
-  if (!cls) {
+  if (!SUPPORTED_MODES.has(mode)) {
     throw new Error(`decodeASTC4x4Block: unsupported block mode 0x${mode.toString(16)}`)
   }
   const partCount = br.read(11, 2)
@@ -499,14 +697,33 @@ export function decodeASTC4x4Block(block: ASTC4x4Block): Float32Array {
     throw new Error(`decodeASTC4x4Block: multi-partition blocks not supported (count=${partCount + 1})`)
   }
   const cem = br.read(13, 4)
-  if (cem !== cls.cem) {
-    throw new Error(`decodeASTC4x4Block: expected CEM ${cls.cem} with block mode 0x${mode.toString(16)}, got ${cem}`)
+  const cls = CLASS_BY_MODE_CEM[`${mode}:${cem}`]
+  if (!cls) {
+    throw new Error(`decodeASTC4x4Block: unsupported CEM ${cem} with block mode 0x${mode.toString(16)}`)
   }
 
-  // Endpoint values as stored.
+  // Endpoint values, unquantised.
   const nVals = cls.channels.length * 2
   const v: number[] = []
-  for (let i = 0; i < nVals; i++) v.push(br.read(17 + i * 8, 8))
+  if (cls.endpointRange === 192) {
+    let pos = 17
+    for (let g = 0; g < nVals; g += 5) {
+      const n = Math.min(5, nVals - g)
+      const bits: number[] = []
+      let T = 0
+      for (let i = 0; i < n; i++) {
+        bits.push(br.read(pos, 6))
+        pos += 6
+        const [start, count] = TRIT_SLICES[i]!
+        T |= br.read(pos, count) << start
+        pos += count
+      }
+      const t = decodeTrits(T)
+      for (let i = 0; i < n; i++) v.push(unq192((t[i]! << 6) | bits[i]!))
+    }
+  } else {
+    for (let i = 0; i < nVals; i++) v.push(br.read(17 + i * 8, 8))
+  }
 
   // Reconstruct RGBA endpoints per CEM.
   let e0: [number, number, number, number]
@@ -557,13 +774,19 @@ export function decodeASTC4x4Block(block: ASTC4x4Block): Float32Array {
 export const _internal = {
   BLOCK_MODE_4x4_2BIT,
   BLOCK_MODE_4x4_3BIT,
+  BLOCK_MODE_4x4_4BIT,
   BLOCK_MODE_4x4_5BIT,
   CEM_LUM_DIRECT,
   CEM_RGB_DIRECT,
   CEM_RGBA_DIRECT,
   WEIGHT_UNQ_4,
   WEIGHT_UNQ_8,
+  WEIGHT_UNQ_16,
   WEIGHT_UNQ_32,
+  unq192,
+  nearest192,
+  encodeTrits,
+  decodeTrits,
   BitWriter128,
   BitReader128,
   buildPalette,
