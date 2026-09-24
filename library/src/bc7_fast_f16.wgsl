@@ -32,11 +32,25 @@
 //     first cut with separate per-mode passes measured 1.77× on normal maps
 //     from exactly that divergence; the only mode-4-extra 16-pixel work is
 //     the cheap scalar-plane pass.
-//   • GRAY + opaque blocks (every texel R == G == B, A == 1) have their
-//     principal axis analytically: (1,1,1,0)/√3, with projection extents at
-//     the luma min/max. They skip the power iteration AND the extents pass
-//     (−34% GPU on roughness/AO/displacement content) and always take
-//     mode 6 — a gray single line fits gray data exactly.
+//   • GRAY + opaque blocks (every texel R == G == B, A == 1) are a 1-D
+//     problem and take their own tail in the integer domain (no power
+//     iteration, no extents pass, no covariance — −34% GPU on roughness/
+//     AO/displacement content vs the generic path):
+//       – span ≤ 15: LOSSLESS. With integer endpoints ≤ 15 apart, mode 6's
+//         rounded palette covers every integer between them and
+//         round(15·(v − e0)/d) selects it (exhaustively verified, either
+//         tie rounding). Even endpoints step outward while the span stays
+//         ≤ 15 so both p-bits are 1 and alpha decodes to exactly 255 —
+//         free for RGB (alpha = 254 + p is otherwise wrong on up to half
+//         the texels, which capped RGBA PSNR at ~51 dB on smooth maps).
+//       – span > 15: closed-form scalar LSQ refit off BC5-style moments
+//         (ΣL, ΣL², Σv, ΣL·v of the seed levels), with all four p-bit
+//         combinations priced INCLUDING the alpha term, accept-if-better.
+//     RGBA PSNR vs the previous analytic-axis tail (/eval 2026-09): rock
+//     displacement 4K +19.3 dB, wood displacement +3.6, AO +2.0,
+//     roughness +0.8..+1.7; RGB alone improves too. GPU cost ≈ 0: the
+//     covariance moved out of the load loop into the colour path pays for
+//     the refit, and the index pass packs levels as float nibble fields.
 //   • NO least-squares refit, unlike the BC1/BC5/ASTC fast paths: with the
 //     seed already on the principal axis at the exact projection extents,
 //     mode 6's fine 16-level palette leaves the refit ≤0.05 dB on the colour
@@ -119,12 +133,8 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
   let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  // Load pass, with the covariance moments FUSED in (no separate 16-pixel
-  // pass): d = (px − pixel0)·16, relative to the block's first pixel so the
-  // accumulators scale with the block's span — raw Σv·vᵀ moments would
-  // cancel catastrophically in f16 — and pre-scaled ×16 so shallow blocks
-  // (span ~1/255 → d² ≈ 1e-3) clear the subnormal floor while full-range
-  // sums stay ≤4096. C = Σddᵀ − (Σd)(Σd)ᵀ/16 is the ×256-scaled covariance.
+  // Load pass: texels, bbox and the gray test. The covariance moments are
+  // accumulated only on the colour path below (gray blocks never use them).
   var pix: array<h4, 16>;
   var lo = h4(1.0);
   var hi = h4(0.0);
@@ -140,8 +150,131 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     let px = h4(textureLoad(src_tex, p, 0));
     pix[i] = px; lo = min(lo, px); hi = max(hi, px);
     gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
-    if (i == 0u) { p0v = px; }
-    let d = (px - p0v) * h(16.0);
+  }
+
+  // Seed endpoints + per-block mode decision (see header).
+  var seed_lo = lo;
+  var seed_hi = hi;
+  var use4 = false;
+  var cmask = h4(1.0);
+  var ch = 0u;
+  if (lo.w == h(1.0) && gd == h(0.0)) {
+    // GRAY + opaque: always mode 6, fully specialised tail (see header) —
+    // gray textures are warp-uniform, and routing them through the
+    // parametric shared loop below (runtime index width/split) measured
+    // +28% on displacement content purely from the lost constant-shift
+    // codegen. Integer domain: f16 holds k/255 to ±0.06 levels, so the
+    // rounding recovers the exact 8-bit value. 8-bit endpoints E = 2q + p;
+    // RGB share q, alpha is 254 + p.
+    var gv: array<f32, 16>;
+    for (var k: u32 = 0u; k < 16u; k = k + 1u) { gv[k] = floor(f32(pix[k].x) * 255.0 + 0.5); }
+    let vmin = floor(f32(lo.x) * 255.0 + 0.5);
+    let vmax = floor(f32(hi.x) * 255.0 + 0.5);
+    var e0 = vmin;
+    var e1 = vmax;
+    if (vmax - vmin <= 15.0) {
+      // LOSSLESS: with integer endpoints ≤ 15 apart, the rounded palette
+      // covers every integer in [e0, e1] and round(15·(v − e0)/d) picks it
+      // (exhaustively verified, either tie rounding). Odd endpoints keep
+      // alpha exactly 255 (p = 1), so even ones step outward while the
+      // span stays ≤ 15 — free for RGB.
+      if (fract(e0 * 0.5) == 0.0 && e0 > 0.0 && e1 - e0 < 15.0) { e0 = e0 - 1.0; }
+      if (fract(e1 * 0.5) == 0.0 && e1 < 255.0 && e1 - e0 < 15.0) { e1 = e1 + 1.0; }
+    } else {
+      // Closed-form scalar LSQ refit (BC5-style moments): seed levels
+      // L = round(15·(v − vmin)/d) against the exact extremes, then the
+      // endpoint pair minimising Σ(v − (1−t)e0 − t·e1)² (t = L/15), priced
+      // for all four p-bit combinations INCLUDING the alpha channel
+      // (254 + p vs 255) and accepted only if it beats the seed.
+      let k1 = 15.0 / (vmax - vmin);
+      let k0 = 0.5 - vmin * k1;
+      var sL = 0.0;
+      var sLL = 0.0;
+      var sv = 0.0;
+      var sLv = 0.0;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let v = gv[k];
+        let L = floor(v * k1 + k0);
+        sL = sL + L;
+        sLL = sLL + L * L;
+        sv = sv + v;
+        sLv = sLv + L * v;
+      }
+      let C = sLL * (1.0 / 225.0);
+      let B = sL * (1.0 / 15.0) - C;
+      let A = 16.0 - sL * (2.0 / 15.0) + C;
+      let Y = sLv * (1.0 / 15.0);
+      let X = sv - Y;
+      let det = A * C - B * B;
+      if (det > 1e-3) {
+        let s0 = clamp((C * X - B * Y) / det, 0.0, 255.0);
+        let s1 = clamp((A * Y - B * X) / det, 0.0, 255.0);
+        // price(e0, e1, p0, p1) − Σv²·3, RGB ×3 plus alpha.
+        let ps0 = vmin - 2.0 * floor(vmin * 0.5);
+        let ps1 = vmax - 2.0 * floor(vmax * 0.5);
+        var best = 3.0 * (A * vmin * vmin + 2.0 * B * vmin * vmax + C * vmax * vmax - 2.0 * (X * vmin + Y * vmax))
+          + A * (1.0 - ps0) + 2.0 * B * (1.0 - ps0) * (1.0 - ps1) + C * (1.0 - ps1);
+        for (var pc: u32 = 0u; pc < 4u; pc = pc + 1u) {
+          let p0 = f32(pc & 1u);
+          let p1 = f32(pc >> 1u);
+          let c0 = 2.0 * clamp(floor((s0 - p0) * 0.5 + 0.5), 0.0, 127.0) + p0;
+          let c1 = 2.0 * clamp(floor((s1 - p1) * 0.5 + 0.5), 0.0, 127.0) + p1;
+          let pr = 3.0 * (A * c0 * c0 + 2.0 * B * c0 * c1 + C * c1 * c1 - 2.0 * (X * c0 + Y * c1))
+            + A * (1.0 - p0) + 2.0 * B * (1.0 - p0) * (1.0 - p1) + C * (1.0 - p1);
+          if (pr < best) {
+            best = pr;
+            e0 = c0;
+            e1 = c1;
+          }
+        }
+      }
+    }
+    // Index pass against the final endpoints: levels accumulate as float
+    // nibble fields (≤ 2^24, exact), 6 + 6 + 4 pixels per accumulator.
+    var ilo = 0u;
+    var ihi = 0u;
+    if (e1 != e0) {
+      let k1 = 15.0 / (e1 - e0);
+      let k0 = 0.5 - e0 * k1;
+      var fa = 0.0;
+      var fb = 0.0;
+      var fc = 0.0;
+      var w = 1.0;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let sg = clamp(floor(gv[k] * k1 + k0), 0.0, 15.0);
+        if (k < 6u) { fa = fa + sg * w; } else if (k < 12u) { fb = fb + sg * w; } else { fc = fc + sg * w; }
+        w = select(w * 16.0, 1.0, k == 5u || k == 11u);
+      }
+      let ua = u32(fa);
+      let ub = u32(fb);
+      let uc = u32(fc);
+      ilo = ua | (ub << 24u);
+      ihi = (ub >> 8u) | (uc << 16u);
+    }
+    var u0 = u32(e0);
+    var u1 = u32(e1);
+    if ((ilo & 0x8u) != 0u) {
+      let t = u0; u0 = u1; u1 = t;
+      ilo = ~ilo; ihi = ~ihi;
+    }
+    let q0 = u0 >> 1u;
+    let q1 = u1 >> 1u;
+    let og = bi * 4u;
+    dst[og] = 0x40u | (q0 << 7u) | (q1 << 14u) | (q0 << 21u) | (q1 << 28u);
+    dst[og + 1u] = (q1 >> 4u) | (q0 << 3u) | (q1 << 10u) | (127u << 17u) | (127u << 24u) | ((u0 & 1u) << 31u);
+    dst[og + 2u] = (u1 & 1u) | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
+    dst[og + 3u] = ihi;
+    return;
+  }
+  // Covariance moments: d = (px − pixel0)·16, relative to the block's first
+  // pixel so the accumulators scale with the block's span — raw Σv·vᵀ
+  // moments would cancel catastrophically in f16 — and pre-scaled ×16 so
+  // shallow blocks (span ~1/255 → d² ≈ 1e-3) clear the subnormal floor
+  // while full-range sums stay ≤4096. C = Σddᵀ − (Σd)(Σd)ᵀ/16 is the
+  // ×256-scaled covariance.
+  p0v = pix[0];
+  for (var i: u32 = 1u; i < 16u; i = i + 1u) {
+    let d = (pix[i] - p0v) * h(16.0);
     sd = sd + d;
     c0v = c0v + d.x * d;
     c1v = c1v + d.y * d;
@@ -156,49 +289,6 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   c1v = c1v - sd4.y * sd4;
   c2v = c2v - sd4.z * sd4;
   c3v = c3v - sd4.w * sd4;
-
-  // Seed endpoints + per-block mode decision (see header).
-  var seed_lo = lo;
-  var seed_hi = hi;
-  var use4 = false;
-  var cmask = h4(1.0);
-  var ch = 0u;
-  if (lo.w == h(1.0) && gd == h(0.0)) {
-    // GRAY + opaque: analytic axis (1,1,1,0)/√3, extents at luma min/max,
-    // always mode 6 — and a fully specialised tail: gray textures are
-    // warp-uniform, and routing them through the parametric shared loop
-    // below (runtime index width/split) measured +28% on displacement
-    // content purely from the lost constant-shift codegen.
-    var ep0g = pick_ep(h4(lo.x, lo.x, lo.x, h(1.0)));
-    var ep1g = pick_ep(h4(hi.x, hi.x, hi.x, h(1.0)));
-    var ilo = 0u;
-    var ihi = 0u;
-    let dirg = (ep1g.eight - ep0g.eight) * h(32.0);
-    let ddg = dot(dirg, dirg);
-    if (ddg >= h(0.008)) {
-      let invg = h(480.0) / ddg;
-      for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-        let sg = clamp(floor(dot(pix[k] - ep0g.eight, dirg) * invg + h(0.5)), h(0.0), h(15.0));
-        ilo = ilo | (u32(sg) << (k * 4u));
-      }
-      for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-        let sg = clamp(floor(dot(pix[k] - ep0g.eight, dirg) * invg + h(0.5)), h(0.0), h(15.0));
-        ihi = ihi | (u32(sg) << ((k - 8u) * 4u));
-      }
-    }
-    if ((ilo & 0x8u) != 0u) {
-      let t = ep0g; ep0g = ep1g; ep1g = t;
-      ilo = ~ilo; ihi = ~ihi;
-    }
-    let e0g = ep0g.seven;
-    let e1g = ep1g.seven;
-    let og = bi * 4u;
-    dst[og] = 0x40u | (e0g.x << 7u) | (e1g.x << 14u) | (e0g.y << 21u) | (e1g.y << 28u);
-    dst[og + 1u] = (e1g.y >> 4u) | (e0g.z << 3u) | (e1g.z << 10u) | (e0g.w << 17u) | (e1g.w << 24u) | (ep0g.p << 31u);
-    dst[og + 2u] = ep1g.p | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
-    dst[og + 3u] = ihi;
-    return;
-  }
   {
     var axis = hi - lo;
     var axis_ok = true;

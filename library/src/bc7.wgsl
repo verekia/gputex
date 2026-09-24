@@ -12,7 +12,12 @@
 // encoders which keep theirs — then one pass that projects each pixel onto
 // the endpoint line (the 16 palette entries are colinear, so the nearest
 // index is the rounded projection — no palette build, no 16-entry search),
-// packed on the fly into two nibble words.
+// packed on the fly into two nibble words. Gray + opaque blocks take an
+// integer 1-D tail (see bc7_fast_f16.wgsl): lossless for spans ≤ 15 with
+// odd endpoints (alpha exactly 255), alpha-aware scalar LSQ refit above.
+// The covariance moments are accumulated after the load loop, on the colour
+// path only — fused into the loads they cost this module ~30% GPU on colour
+// content (register pressure).
 //
 // A MODE 1 (2-subset) candidate was built and evaluated (2026-07) and
 // dropped: ~+1.3 dB on multi-modal content but up to ~3× the pass cost on
@@ -121,20 +126,12 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let base   = vec2<i32>(i32(bx) * 4, i32(by) * 4);
   let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  // Load 16 RGBA pixels (8-bit integer domain) and the per-channel bbox,
-  // with the covariance moments FUSED in: d = px − pixel0 (first-pixel-
-  // relative, so the sums scale with the block's span; d is integer-valued
-  // and ≤255, exact in f32).
+  // Load 16 RGBA pixels (8-bit integer domain), the per-channel bbox and
+  // the gray test.
   var pixels: array<vec4<i32>, 16>;
   var lo = vec4<i32>(255);
   var hi = vec4<i32>(0);
   var gd = 0;
-  var p0f = vec4<f32>(0.0);
-  var sd = vec4<f32>(0.0);
-  var c0v = vec4<f32>(0.0);
-  var c1v = vec4<f32>(0.0);
-  var c2v = vec4<f32>(0.0);
-  var c3v = vec4<f32>(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
@@ -144,8 +141,104 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     lo = min(lo, px);
     hi = max(hi, px);
     gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
-    if (i == 0u) { p0f = vec4<f32>(px); }
-    let d = vec4<f32>(px) - p0f;
+  }
+
+  // Gray + opaque blocks: 1-D, own tail (see bc7_fast_f16.wgsl) — lossless
+  // for spans ≤ 15 with odd endpoints (alpha exactly 255), closed-form
+  // scalar LSQ refit with alpha-aware p-bit pricing above that.
+  if (lo.w == 255 && gd == 0) {
+    let vmin = f32(lo.x);
+    let vmax = f32(hi.x);
+    var e0 = vmin;
+    var e1 = vmax;
+    if (vmax - vmin <= 15.0) {
+      if (fract(e0 * 0.5) == 0.0 && e0 > 0.0 && e1 - e0 < 15.0) { e0 = e0 - 1.0; }
+      if (fract(e1 * 0.5) == 0.0 && e1 < 255.0 && e1 - e0 < 15.0) { e1 = e1 + 1.0; }
+    } else {
+      let k1 = 15.0 / (vmax - vmin);
+      let k0 = 0.5 - vmin * k1;
+      var sL = 0.0;
+      var sLL = 0.0;
+      var sv = 0.0;
+      var sLv = 0.0;
+      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+        let v = f32(pixels[k].x);
+        let L = floor(v * k1 + k0);
+        sL = sL + L;
+        sLL = sLL + L * L;
+        sv = sv + v;
+        sLv = sLv + L * v;
+      }
+      let C = sLL * (1.0 / 225.0);
+      let B = sL * (1.0 / 15.0) - C;
+      let A = 16.0 - sL * (2.0 / 15.0) + C;
+      let Y = sLv * (1.0 / 15.0);
+      let X = sv - Y;
+      let det = A * C - B * B;
+      if (det > 1e-3) {
+        let s0 = clamp((C * X - B * Y) / det, 0.0, 255.0);
+        let s1 = clamp((A * Y - B * X) / det, 0.0, 255.0);
+        // price(e0, e1, p0, p1) up to the block constant: RGB ×3 + alpha.
+        let ps0 = vmin - 2.0 * floor(vmin * 0.5);
+        let ps1 = vmax - 2.0 * floor(vmax * 0.5);
+        var best = 3.0 * (A * vmin * vmin + 2.0 * B * vmin * vmax + C * vmax * vmax - 2.0 * (X * vmin + Y * vmax))
+          + A * (1.0 - ps0) + 2.0 * B * (1.0 - ps0) * (1.0 - ps1) + C * (1.0 - ps1);
+        for (var pc: u32 = 0u; pc < 4u; pc = pc + 1u) {
+          let p0 = f32(pc & 1u);
+          let p1 = f32(pc >> 1u);
+          let c0 = 2.0 * clamp(floor((s0 - p0) * 0.5 + 0.5), 0.0, 127.0) + p0;
+          let c1 = 2.0 * clamp(floor((s1 - p1) * 0.5 + 0.5), 0.0, 127.0) + p1;
+          let pr = 3.0 * (A * c0 * c0 + 2.0 * B * c0 * c1 + C * c1 * c1 - 2.0 * (X * c0 + Y * c1))
+            + A * (1.0 - p0) + 2.0 * B * (1.0 - p0) * (1.0 - p1) + C * (1.0 - p1);
+          if (pr < best) {
+            best = pr;
+            e0 = c0;
+            e1 = c1;
+          }
+        }
+      }
+    }
+    var glo = 0u;
+    var ghi = 0u;
+    if (e1 != e0) {
+      let k1 = 15.0 / (e1 - e0);
+      let k0 = 0.5 - e0 * k1;
+      for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+        let sg = clamp(floor(f32(pixels[k].x) * k1 + k0), 0.0, 15.0);
+        glo = glo | (u32(sg) << (k * 4u));
+      }
+      for (var k: u32 = 8u; k < 16u; k = k + 1u) {
+        let sg = clamp(floor(f32(pixels[k].x) * k1 + k0), 0.0, 15.0);
+        ghi = ghi | (u32(sg) << ((k - 8u) * 4u));
+      }
+    }
+    var u0 = u32(e0);
+    var u1 = u32(e1);
+    if ((glo & 0x8u) != 0u) {
+      let t = u0; u0 = u1; u1 = t;
+      glo = ~glo; ghi = ~ghi;
+    }
+    let q0 = u0 >> 1u;
+    let q1 = u1 >> 1u;
+    let og = block_index * 4u;
+    dst[og] = 0x40u | (q0 << 7u) | (q1 << 14u) | (q0 << 21u) | (q1 << 28u);
+    dst[og + 1u] = (q1 >> 4u) | (q0 << 3u) | (q1 << 10u) | (127u << 17u) | (127u << 24u) | ((u0 & 1u) << 31u);
+    dst[og + 2u] = (u1 & 1u) | ((glo & 0x7u) << 1u) | (glo & 0xFFFFFFF0u);
+    dst[og + 3u] = ghi;
+    return;
+  }
+
+  // Covariance moments: d = px − pixel0 (first-pixel-relative, so the sums
+  // scale with the block's span; d is integer-valued and ≤255, exact in
+  // f32).
+  let p0f = vec4<f32>(pixels[0]);
+  var sd = vec4<f32>(0.0);
+  var c0v = vec4<f32>(0.0);
+  var c1v = vec4<f32>(0.0);
+  var c2v = vec4<f32>(0.0);
+  var c3v = vec4<f32>(0.0);
+  for (var i: u32 = 1u; i < 16u; i = i + 1u) {
+    let d = vec4<f32>(pixels[i]) - p0f;
     sd = sd + d;
     c0v = c0v + d.x * d;
     c1v = c1v + d.y * d;
@@ -165,14 +258,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let r3v = c3v - sd.w * sd16;
   var seed0 = lo;
   var seed1 = hi;
-  // Gray + opaque blocks: the axis is analytically (1,1,1,0)/√3 with
-  // extents at the luma min/max — skip iteration + extents pass entirely
-  // (see bc7_fast_f16.wgsl).
-  let gray = lo.w == 255 && gd == 0;
-  if (gray) {
-    seed0 = vec4<i32>(lo.x, lo.x, lo.x, 255);
-    seed1 = vec4<i32>(hi.x, hi.x, hi.x, 255);
-  } else {
+  {
     let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
     if (dot(axis, axis) > 0.0) {
       // Exact projection extents along the axis. (A Rayleigh-quotient span

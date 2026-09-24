@@ -124,7 +124,7 @@ describe('ETC2Encoder', () => {
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
     // Sanity: the shader exposes the ETC2-specific helpers by name.
-    expect(src).toContain('fn sb_search')
+    expect(src).toContain('fn sb_pair')
     expect(src).toContain('fn quantise_bases')
     expect(src).toMatch(/planar/i)
   })

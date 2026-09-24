@@ -32,6 +32,8 @@
 //                                        format's standard corpus)
 //   batch=N  samples=15                  timing (samples=0 skips timing;
 //                                        batch defaults to ~10 4K-equivalents)
+//   src=rgba8                            bind bc5 shaders to the rgba8 source
+//                                        (default: rg8, like BC5Encoder)
 //   easy=16                              easy-block threshold: block SSE in
 //                                        8-bit units² summed over its pixels
 //                                        and stored channels
@@ -58,6 +60,8 @@ interface Row {
   betterBlocks: number
   maxBlockWorse: number
   maxEasyWorse: number
+  /** The block behind maxEasyWorse: source RGBA bytes (row-major) and both encodings. */
+  maxEasyBlock?: { index: number; bx: number; by: number; src: number[]; base: number[]; mine: number[] }
   identicalPct: number
 }
 
@@ -331,7 +335,7 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
       wgX: Number(wg[1]),
       wgY: Number(wg[2]),
       usesSampler: /:\s*sampler\s*;/.test(code),
-      rg8: fmt === 'bc5',
+      rg8: fmt === 'bc5' && q.get('src') !== 'rgba8',
     })
   }
 
@@ -523,6 +527,7 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
       let better = 0
       let maxWorse = 0
       let maxEasyWorse = 0
+      let maxEasyIdx = -1
       let identical = 0
       const base = blockSse[0]!
       const mine = blockSse[i]!
@@ -533,7 +538,10 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
         if (d > 1e-3) worse++
         else if (d < -1e-3) better++
         if (d > maxWorse) maxWorse = d
-        if (base[b]! <= easy && d > maxEasyWorse) maxEasyWorse = d
+        if (base[b]! <= easy && d > maxEasyWorse) {
+          maxEasyWorse = d
+          maxEasyIdx = b
+        }
         let same = true
         for (let k = 0; k < info.bpb; k++) {
           if (b0[b * info.bpb + k] !== bi[b * info.bpb + k]) {
@@ -557,6 +565,24 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
         betterBlocks: better,
         maxBlockWorse: maxWorse,
         maxEasyWorse,
+        maxEasyBlock:
+          maxEasyIdx < 0
+            ? undefined
+            : (() => {
+                const bxi = maxEasyIdx % bx
+                const byi = Math.floor(maxEasyIdx / bx)
+                const src: number[] = []
+                for (let y = 0; y < 4; y++)
+                  for (let x = 0; x < 4; x++) {
+                    const px = Math.min(bxi * 4 + x, w - 1)
+                    const py = Math.min(byi * 4 + y, h - 1)
+                    for (let c = 0; c < 4; c++) src.push(img.data[(py * w + px) * 4 + c]!)
+                  }
+                const slice = (u: Uint8Array): number[] => [
+                  ...u.subarray(maxEasyIdx * info.bpb, (maxEasyIdx + 1) * info.bpb),
+                ]
+                return { index: maxEasyIdx, bx: bxi, by: byi, src, base: slice(b0), mine: slice(bi) }
+              })(),
         identicalPct: (100 * identical) / blocks,
       }
     })

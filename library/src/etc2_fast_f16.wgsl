@@ -40,13 +40,17 @@
 //     prefers the split with less luma spread for the 4-level tables to
 //     cover (+0.07-0.10 dB on photo colour vs κ = 1, free). Only the chosen
 //     flip is searched.
-//   • Exactly-gray blocks (every quadrant's R, G and B sums equal) have no
-//     chroma to steer the preselect, so both flips are scored — worth
-//     ~0.3 dB on roughness/AO content over any O(1) proxy tried (luma
-//     variance, luma range, squared range all land at −0.30 dB). They use
-//     a one-channel copy of the fit (fit_gray) and the second flip is a
-//     separate straight-line call: the older single-call-site loop cost
-//     7-9% even on colour content that never ran its second iteration.
+//   • Exactly-gray blocks (every quadrant's R, G and B sums AND both planar
+//     moments equal) have no chroma to steer the preselect, so both flips
+//     are scored — worth ~0.3 dB on roughness/AO content over any O(1)
+//     proxy tried (luma variance, luma range, squared range all land at
+//     −0.30 dB; deciding the flip on the cover table's score alone loses
+//     0.3-0.5 dB). They use a one-channel copy of the fit (fit_gray), the
+//     second flip is a separate straight-line call (the older
+//     single-call-site loop cost 7-9% even on colour content that never ran
+//     its second iteration), and their planar solve runs on two channels:
+//     R and B share the 6-bit code, G takes the 7-bit one (−4..5% on gray
+//     maps).
 //     Widening the second evaluation to chroma near-ties (the previous
 //     rule) cost 12-25% on colour textures through warp divergence for
 //     ≤ 0.015 dB.
@@ -54,7 +58,12 @@
 //     magnitude covers max|D| and its lower neighbour (outlier hedge).
 //     One candidate loses ~0.7-2.9 dB; all eight gain ≤ 0.05 dB. Scores use
 //     the min form: per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) is the
-//     threshold rule exactly, and its a3 part sums in closed form.
+//     threshold rule exactly, and its a3 part sums in closed form. A flip's
+//     two subblocks are searched together (sb_pair): the lower-neighbour
+//     scores sit behind ONE branch, skipped when both covers are table 0 —
+//     then the lower neighbour IS the cover table. Smooth content skips it
+//     wholesale (−9..16% on displacement maps at 2K/4K); a per-subblock
+//     branch cost 2-4% on noisy content by splitting the score pair.
 //   • NO base refit (worth ~0.2 dB on photo colour for ≥ 13% GPU).
 //   • PLANAR runs unconditionally: the LSQ solve is O(1) from the block sum
 //     and the first moments Σx·p, Σy·p (the Gram inverse of the fixed
@@ -143,43 +152,66 @@ fn quantise_bases(sum0: vec3<f32>, sum1: vec3<f32>) -> Bases {
 // per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) = (a3² − 2·a3·ad) +
 // min(0, (b3² − a3²) − 2·(b3 − a3)·ad); the a3 part sums in closed form
 // from sad = Σ ad.
+// Per-table score constants: DK = b3² − a3², DM = −2(b3 − a3), A8 = 8·a3²,
+// AM = −2·a3 (precomputed: −1.5% GPU over deriving them per call).
+const DK = array<f32, 8>(540.0, 2376.0, 6840.0, 14355.0, 29484.0, 52416.0, 91323.0, 281520.0);
+const DM = array<f32, 8>(-36.0, -72.0, -120.0, -174.0, -252.0, -336.0, -438.0, -816.0);
+const A8 = array<f32, 8>(288.0, 1800.0, 5832.0, 12168.0, 23328.0, 41472.0, 78408.0, 159048.0);
+const AM = array<f32, 8>(-12.0, -30.0, -54.0, -78.0, -108.0, -144.0, -198.0, -282.0);
 fn table_score(au: vec4<f32>, av: vec4<f32>, sad: f32, t: u32) -> f32 {
-  let a3 = A3[t];
-  let b3 = B3[t];
-  let dk = b3 * b3 - a3 * a3;
-  let dm = -2.0 * (b3 - a3);
+  let dk = DK[t];
+  let dm = DM[t];
   let eu = min(vec4<f32>(0.0), au * dm + dk);
   let ev = min(vec4<f32>(0.0), av * dm + dk);
-  return 8.0 * a3 * a3 - 2.0 * a3 * sad + dot(eu + ev, ONE4);
+  return A8[t] + AM[t] * sad + dot(eu + ev, ONE4);
 }
 
-struct SearchOut {
-  table: u32,
+// Both subblocks of one flip (lumas u, v against base luma lb): cover
+// tables and their scores, then the lower neighbours behind ONE branch —
+// skipped when both covers are table 0 (the lower neighbour IS the cover
+// table; smooth content), branch-free inside so the two scores interleave.
+// |D| is exact in f16; the scores need f32.
+struct PairOut {
+  t0: u32,
+  t1: u32,
   acc: f32,
 };
-// One subblock (lumas u, v) against base luma lb. |D| is exact in f16; the
-// scores need f32.
-fn sb_search(u: vec4<f16>, v: vec4<f16>, lbf: f32) -> SearchOut {
-  let lb = f16(lbf);
-  let ah = abs(u - lb);
-  let bh = abs(v - lb);
-  let mx = max(max4(ah), max4(bh));
-  let au = vec4<f32>(ah);
-  let av = vec4<f32>(bh);
-  let sad = dot(au + av, ONE4);
+fn sb_pair(u0: vec4<f16>, v0: vec4<f16>, lbf0: f32, u1: vec4<f16>, v1: vec4<f16>, lbf1: f32) -> PairOut {
+  let lb0 = f16(lbf0);
+  let lb1 = f16(lbf1);
+  let ah0 = abs(u0 - lb0);
+  let bh0 = abs(v0 - lb0);
+  let ah1 = abs(u1 - lb1);
+  let bh1 = abs(v1 - lb1);
+  let mx = vec2<f16>(max(max4(ah0), max4(bh0)), max(max4(ah1), max4(bh1)));
+  let au0 = vec4<f32>(ah0);
+  let av0 = vec4<f32>(bh0);
+  let au1 = vec4<f32>(ah1);
+  let av1 = vec4<f32>(bh1);
+  let sad0 = dot(au0 + av0, ONE4);
+  let sad1 = dot(au1 + av1, ONE4);
   // cover = #{B3[k] < mx : k < 7}, the first table whose large modifier
   // reaches mx — a binary search over the 7 thresholds.
-  let s1 = mx > 126.0h;
-  let s2 = mx > select(51.0h, 240.0h, s1);
-  let s3 = mx > select(select(24.0h, 87.0h, s2), select(180.0h, 318.0h, s2), s1);
-  let cover = select(0u, 4u, s1) + select(0u, 2u, s2) + select(0u, 1u, s3);
-  let t_lo = max(cover, 1u) - 1u;
-  let acc_lo = table_score(au, av, sad, t_lo);
-  let acc_hi = table_score(au, av, sad, cover);
-  let lo_wins = acc_lo <= acc_hi;
-  var out: SearchOut;
-  out.table = select(cover, t_lo, lo_wins);
-  out.acc = select(acc_hi, acc_lo, lo_wins);
+  let s1 = mx > vec2<f16>(126.0h);
+  let s2 = mx > select(vec2<f16>(51.0h), vec2<f16>(240.0h), s1);
+  let s3 = mx > select(select(vec2<f16>(24.0h), vec2<f16>(87.0h), s2), select(vec2<f16>(180.0h), vec2<f16>(318.0h), s2), s1);
+  let cover = select(vec2<u32>(0u), vec2<u32>(4u), s1) + select(vec2<u32>(0u), vec2<u32>(2u), s2) + select(vec2<u32>(0u), vec2<u32>(1u), s3);
+  let hi0 = table_score(au0, av0, sad0, cover.x);
+  let hi1 = table_score(au1, av1, sad1, cover.y);
+  var out: PairOut;
+  out.t0 = cover.x;
+  out.t1 = cover.y;
+  out.acc = hi0 + hi1;
+  if (any(cover != vec2<u32>(0u))) {
+    let t_lo = max(cover, vec2<u32>(1u)) - vec2<u32>(1u);
+    let lo0 = table_score(au0, av0, sad0, t_lo.x);
+    let lo1 = table_score(au1, av1, sad1, t_lo.y);
+    let w0 = lo0 <= hi0;
+    let w1 = lo1 <= hi1;
+    out.t0 = select(cover.x, t_lo.x, w0);
+    out.t1 = select(cover.y, t_lo.y, w1);
+    out.acc = select(hi0, lo0, w0) + select(hi1, lo1, w1);
+  }
   return out;
 }
 
@@ -207,11 +239,10 @@ fn fit_flip(
   let b1 = out.bases.b1;
   out.lb0 = b0.r + b0.g + b0.b;
   out.lb1 = b1.r + b1.g + b1.b;
-  let p0 = sb_search(s0u, s0v, out.lb0);
-  let p1 = sb_search(s1u, s1v, out.lb1);
-  out.t0 = p0.table;
-  out.t1 = p1.table;
-  out.est = dot(b0, 8.0 * b0 - 2.0 * sum0) + dot(b1, 8.0 * b1 - 2.0 * sum1) + (p0.acc + p1.acc) * (1.0 / 3.0);
+  let pp = sb_pair(s0u, s0v, out.lb0, s1u, s1v, out.lb1);
+  out.t0 = pp.t0;
+  out.t1 = pp.t1;
+  out.est = dot(b0, 8.0 * b0 - 2.0 * sum0) + dot(b1, 8.0 * b1 - 2.0 * sum1) + pp.acc * (1.0 / 3.0);
   return out;
 }
 
@@ -239,11 +270,10 @@ fn fit_gray(
   let b1 = select(i1 * 17.0, floor(q1 * 8.25), diff);
   out.lb0 = 3.0 * b0;
   out.lb1 = 3.0 * b1;
-  let p0 = sb_search(s0u, s0v, out.lb0);
-  let p1 = sb_search(s1u, s1v, out.lb1);
-  out.t0 = p0.table;
-  out.t1 = p1.table;
-  out.est = 3.0 * (b0 * (8.0 * b0 - 2.0 * sum0) + b1 * (8.0 * b1 - 2.0 * sum1)) + (p0.acc + p1.acc) * (1.0 / 3.0);
+  let pp = sb_pair(s0u, s0v, out.lb0, s1u, s1v, out.lb1);
+  out.t0 = pp.t0;
+  out.t1 = pp.t1;
+  out.est = 3.0 * (b0 * (8.0 * b0 - 2.0 * sum0) + b1 * (8.0 * b1 - 2.0 * sum1)) + pp.acc * (1.0 / 3.0);
   return out;
 }
 
@@ -317,64 +347,96 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     }
   }
 
-  // ------------------------------------------------------------ planar --
-  // LSQ plane in closed form: rhs rA = Σ(1 − x/4 − y/4)·p, rB = Σ(x/4)·p,
-  // rC = Σ(y/4)·p times the constant inverse Gram matrix (the same
-  // coefficient form as the CPU mirror, so rounding ties resolve alike);
-  // estimate with the quantised, clamped corners: −2·θ·rhs + θᵀGθ.
   let total = qsum[0] + qsum[1] + qsum[2] + qsum[3];
-  let rB = sxp * 0.25;
-  let rC = syp * 0.25;
-  let rA = total - rB - rC;
-  let po = 0.2875 * rA - 0.0125 * rB - 0.0125 * rC;
-  let ph = -0.0125 * rA + 0.4875 * rB - 0.3125 * rC;
-  let pv = -0.0125 * rA - 0.3125 * rB + 0.4875 * rC;
-  let pmax = vec3<f32>(63.0, 127.0, 63.0);
-  let qo = clamp(floor(po * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
-  let qh = clamp(floor(ph * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
-  let qv = clamp(floor(pv * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
-  // 6-bit expand (q<<2)|(q>>4) = floor(4.0625·q); 7-bit (q<<1)|(q>>6) = floor(2.015625·q).
-  let xk = vec3<f32>(4.0625, 2.015625, 4.0625);
-  let eo = floor(qo * xk);
-  let eh = floor(qh * xk);
-  let ev = floor(qv * xk);
-  let gram = 3.5 * (eo * eo + eh * eh + ev * ev) + 0.5 * eo * (eh + ev) + 4.5 * eh * ev;
-  let planar_est = dot(gram - 2.0 * (eo * rA + eh * rB + ev * rC), ONE3) + PLANAR_FUDGE;
-
-  // ------------------------------------------------ flip + base selection --
-  // Flip 0 splits columns (sum0a = left half), flip 1 splits rows (sum0b =
-  // top half). Per flip, the preselect residual minus the flip-independent
-  // Σ||p||² and Σℓ² terms: −Σ||s||²/8 + κ·(Σℓ)²/24 over its two subblocks.
-  let sum0a = qsum[0] + qsum[2];
-  let sum1a = qsum[1] + qsum[3];
-  let sum0b = qsum[0] + qsum[1];
-  let sum1b = qsum[2] + qsum[3];
-  let l0a = dot(sum0a, ONE3);
-  let l1a = dot(sum1a, ONE3);
-  let l0b = dot(sum0b, ONE3);
-  let l1b = dot(sum1b, ONE3);
-  let res_a = KAPPA / 24.0 * (l0a * l0a + l1a * l1a) - 0.125 * (dot(sum0a, sum0a) + dot(sum1a, sum1a));
-  let res_b = KAPPA / 24.0 * (l0b * l0b + l1b * l1b) - 0.125 * (dot(sum0b, sum0b) + dot(sum1b, sum1b));
+  // Exactly gray: every quadrant sum AND both planar moments equal across
+  // R, G, B — then R and B planar corners coincide (same 6-bit code) and
+  // only R (6-bit) and G (7-bit) need solving.
   let gray = all(qsum[0].rg == qsum[0].gb) && all(qsum[1].rg == qsum[1].gb) &&
-             all(qsum[2].rg == qsum[2].gb) && all(qsum[3].rg == qsum[3].gb);
+             all(qsum[2].rg == qsum[2].gb) && all(qsum[3].rg == qsum[3].gb) &&
+             all(sxp.rg == sxp.gb) && all(syp.rg == syp.gb);
 
+  var planar_est: f32;
+  var qo: vec3<f32>;
+  var qh: vec3<f32>;
+  var qv: vec3<f32>;
   var bflip = 0u;
   var sel: FlipFit;
   if (gray) {
-    sel = fit_gray(col[0], col[1], col[2], col[3], sum0a.r, sum1a.r);
+    // Planar on two channels: R and B share the 6-bit solve.
+    let rB = sxp.r * 0.25;
+    let rC = syp.r * 0.25;
+    let rA = total.r - rB - rC;
+    let po = 0.2875 * rA - 0.0125 * rB - 0.0125 * rC;
+    let ph = -0.0125 * rA + 0.4875 * rB - 0.3125 * rC;
+    let pv = -0.0125 * rA - 0.3125 * rB + 0.4875 * rC;
+    let pmax = vec2<f32>(63.0, 127.0);
+    let qo2 = clamp(floor(po * (pmax / 255.0) + 0.5), vec2<f32>(0.0), pmax);
+    let qh2 = clamp(floor(ph * (pmax / 255.0) + 0.5), vec2<f32>(0.0), pmax);
+    let qv2 = clamp(floor(pv * (pmax / 255.0) + 0.5), vec2<f32>(0.0), pmax);
+    let xk = vec2<f32>(4.0625, 2.015625);
+    let eo = floor(qo2 * xk);
+    let eh = floor(qh2 * xk);
+    let ev = floor(qv2 * xk);
+    let gram = 3.5 * (eo * eo + eh * eh + ev * ev) + 0.5 * eo * (eh + ev) + 4.5 * eh * ev;
+    let pe = gram - 2.0 * (eo * rA + eh * rB + ev * rC);
+    planar_est = 2.0 * pe.x + pe.y + PLANAR_FUDGE;
+    qo = qo2.xyx;
+    qh = qh2.xyx;
+    qv = qv2.xyx;
+
+    let sum0a = qsum[0].r + qsum[2].r;
+    let sum1a = qsum[1].r + qsum[3].r;
+    let sum0b = qsum[0].r + qsum[1].r;
+    let sum1b = qsum[2].r + qsum[3].r;
+    sel = fit_gray(col[0], col[1], col[2], col[3], sum0a, sum1a);
     let alt = fit_gray(
       vec4<f16>(col[0].xy, col[1].xy),
       vec4<f16>(col[2].xy, col[3].xy),
       vec4<f16>(col[0].zw, col[1].zw),
       vec4<f16>(col[2].zw, col[3].zw),
-      sum0b.r,
-      sum1b.r,
+      sum0b,
+      sum1b,
     );
     if (alt.est < sel.est) {
       sel = alt;
       bflip = 1u;
     }
   } else {
+    // LSQ plane in closed form: rhs rA = Σ(1 − x/4 − y/4)·p, rB = Σ(x/4)·p,
+    // rC = Σ(y/4)·p times the constant inverse Gram matrix (the same
+    // coefficient form as the CPU mirror, so rounding ties resolve alike);
+    // estimate with the quantised, clamped corners: −2·θ·rhs + θᵀGθ.
+    let rB = sxp * 0.25;
+    let rC = syp * 0.25;
+    let rA = total - rB - rC;
+    let po = 0.2875 * rA - 0.0125 * rB - 0.0125 * rC;
+    let ph = -0.0125 * rA + 0.4875 * rB - 0.3125 * rC;
+    let pv = -0.0125 * rA - 0.3125 * rB + 0.4875 * rC;
+    let pmax = vec3<f32>(63.0, 127.0, 63.0);
+    qo = clamp(floor(po * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+    qh = clamp(floor(ph * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+    qv = clamp(floor(pv * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+    // 6-bit expand (q<<2)|(q>>4) = floor(4.0625·q); 7-bit (q<<1)|(q>>6) = floor(2.015625·q).
+    let xk = vec3<f32>(4.0625, 2.015625, 4.0625);
+    let eo = floor(qo * xk);
+    let eh = floor(qh * xk);
+    let ev = floor(qv * xk);
+    let gram = 3.5 * (eo * eo + eh * eh + ev * ev) + 0.5 * eo * (eh + ev) + 4.5 * eh * ev;
+    planar_est = dot(gram - 2.0 * (eo * rA + eh * rB + ev * rC), ONE3) + PLANAR_FUDGE;
+
+    // Flip 0 splits columns (sum0a = left half), flip 1 splits rows (sum0b =
+    // top half). Per flip, the preselect residual minus the flip-independent
+    // Σ||p||² and Σℓ² terms: −Σ||s||²/8 + κ·(Σℓ)²/24 over its two subblocks.
+    let sum0a = qsum[0] + qsum[2];
+    let sum1a = qsum[1] + qsum[3];
+    let sum0b = qsum[0] + qsum[1];
+    let sum1b = qsum[2] + qsum[3];
+    let l0a = dot(sum0a, ONE3);
+    let l1a = dot(sum1a, ONE3);
+    let l0b = dot(sum0b, ONE3);
+    let l1b = dot(sum1b, ONE3);
+    let res_a = KAPPA / 24.0 * (l0a * l0a + l1a * l1a) - 0.125 * (dot(sum0a, sum0a) + dot(sum1a, sum1a));
+    let res_b = KAPPA / 24.0 * (l0b * l0b + l1b * l1b) - 0.125 * (dot(sum0b, sum0b) + dot(sum1b, sum1b));
     let fb = res_b < res_a;
     bflip = select(0u, 1u, fb);
     sel = fit_flip(
