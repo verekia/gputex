@@ -5,12 +5,13 @@ import { ASTC4x4WebGLEncoder } from '../webgl/ASTC4x4WebGLEncoder.js'
 import { BC1WebGLEncoder } from '../webgl/BC1WebGLEncoder.js'
 import { BC5WebGLEncoder } from '../webgl/BC5WebGLEncoder.js'
 import { BC7WebGLEncoder } from '../webgl/BC7WebGLEncoder.js'
+import { ETC2WebGLEncoder } from '../webgl/ETC2WebGLEncoder.js'
 import { selectWebGLFormat } from '../webgl/selectWebGLFormat.js'
 
 import type { WebGLCapabilities } from '../webgl/webglCapabilities.js'
 
 function caps(partial: Partial<WebGLCapabilities>): WebGLCapabilities {
-  return { bptc: false, rgtc: false, s3tc: false, s3tcSrgb: false, astc: false, ...partial }
+  return { bptc: false, rgtc: false, s3tc: false, s3tcSrgb: false, astc: false, etc: false, ...partial }
 }
 
 describe('selectWebGLFormat: BPTC (BC7) path', () => {
@@ -159,10 +160,27 @@ describe('selectWebGLFormat: quality low', () => {
     expect(sel.encoderClass).toBe(BC1WebGLEncoder)
   })
 
-  it('keeps BC7 when the matching s3tc extension is missing', () => {
-    // There is no ETC2 encoder on the WebGL tier, so 'low' has only BC1.
+  it('keeps BC7 when the matching s3tc extension is missing and there is no ETC', () => {
     const sel = selectWebGLFormat(caps({ bptc: true, s3tc: true }), 'color', { quality: 'low' })
     expect(sel.format).toBe(TextureFormat.BC7_SRGB)
+  })
+
+  it('picks ETC2 RGB8 on ETC-class devices (no s3tc)', () => {
+    const sel = selectWebGLFormat(caps({ astc: true, etc: true }), 'color', { quality: 'low' })
+    expect(sel.format).toBe(TextureFormat.ETC2_RGB8_SRGB)
+    expect(sel.encoderClass).toBe(ETC2WebGLEncoder)
+    const lin = selectWebGLFormat(caps({ astc: true, etc: true }), 'color', { quality: 'low', colorSpace: 'linear' })
+    expect(lin.format).toBe(TextureFormat.ETC2_RGB8)
+  })
+
+  it('prefers BC1 over ETC2 when both are present', () => {
+    const sel = selectWebGLFormat(caps({ s3tc: true, s3tcSrgb: true, etc: true }), 'color', { quality: 'low' })
+    expect(sel.encoderClass).toBe(BC1WebGLEncoder)
+  })
+
+  it('keeps ASTC for colorWithAlpha on ETC-class devices', () => {
+    const sel = selectWebGLFormat(caps({ astc: true, etc: true }), 'colorWithAlpha', { quality: 'low' })
+    expect(sel.encoderClass).toBe(ASTC4x4WebGLEncoder)
   })
 
   it('keeps the high-quality selection for colorWithAlpha', () => {
@@ -177,6 +195,27 @@ describe('selectWebGLFormat: quality low', () => {
     const sel = selectWebGLFormat(caps({ rgtc: true, s3tc: true, s3tcSrgb: true }), 'normal', { quality: 'low' })
     expect(sel.format).toBe(TextureFormat.BC5)
     expect(sel.encoderClass).toBe(BC5WebGLEncoder)
+  })
+})
+
+describe('selectWebGLFormat: ETC2 last resort', () => {
+  it('uses ETC2 RGB8 for opaque colour when only ETC is present', () => {
+    const sel = selectWebGLFormat(caps({ etc: true }), 'color')
+    expect(sel.format).toBe(TextureFormat.ETC2_RGB8_SRGB)
+    expect(sel.encoderClass).toBe(ETC2WebGLEncoder)
+  })
+
+  it('ranks BPTC, ASTC and BC1 ahead of ETC2', () => {
+    expect(selectWebGLFormat(caps({ bptc: true, etc: true }), 'color').encoderClass).toBe(BC7WebGLEncoder)
+    expect(selectWebGLFormat(caps({ astc: true, etc: true }), 'color').encoderClass).toBe(ASTC4x4WebGLEncoder)
+    expect(selectWebGLFormat(caps({ s3tc: true, s3tcSrgb: true, etc: true }), 'color').encoderClass).toBe(
+      BC1WebGLEncoder,
+    )
+  })
+
+  it('never uses ETC2 for alpha or normals', () => {
+    expect(selectWebGLFormat(caps({ etc: true }), 'colorWithAlpha').format).toBe(null)
+    expect(selectWebGLFormat(caps({ etc: true }), 'normal').format).toBe(null)
   })
 })
 

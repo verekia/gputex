@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 
 import { compressTexture } from 'gputex/three'
 
+import { forceWebGL } from '../lib/forceWebGL'
+
 import type { CompressResult } from 'gputex/three'
 import type { Texture } from 'three'
 
@@ -24,7 +26,7 @@ export function useCompressedFile(file: File | null, onResult?: (info: EncodeInf
     let result: CompressResult | null = null
     setTexture(null)
 
-    compressTexture(file, { hint: 'color', colorSpace: 'srgb', svgSize: 1024, cache: true })
+    compressTexture(file, { hint: 'color', colorSpace: 'srgb', svgSize: 1024, cache: true, forceWebGL })
       .then(r => {
         if (cancelled) {
           r.destroy()

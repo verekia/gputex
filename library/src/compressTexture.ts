@@ -44,6 +44,7 @@ import { getSharedWebGLContext } from './webgl/webglContext.js'
 import { needsWriteTextureWorkaround } from './workarounds.js'
 
 import type { TextureFormat } from './TextureFormat.js'
+import type { WebGLBlockEncoder, WebGLEncoderConstructor } from './webgl/WebGLBlockEncoder.js'
 
 /**
  * Everything `compressTexture()` can take as an image source. A superset
@@ -82,8 +83,8 @@ export interface CompressOptions {
    * device has one — BC1 on desktop-class GPUs, ETC2 RGB8 on mobile-class
    * ones — halving GPU memory at visibly lower quality on smooth content.
    * Ignored for `hint: 'colorWithAlpha'` and `hint: 'normal'` (the 4-bpp
-   * formats can't carry them). On the WebGL fallback tier only BC1 is
-   * available at 'low'.
+   * formats can't carry them). The WebGL fallback tier makes the same
+   * choice (BC1 where s3tc is exposed, else ETC2 RGB8).
    */
   quality?: FormatQuality
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
@@ -105,6 +106,14 @@ export interface CompressOptions {
    *  never destroys it. */
   device?: GPUDevice
   adapter?: GPUAdapter
+  /**
+   * Skip the WebGPU tier and encode on the WebGL2 fallback even when WebGPU
+   * is available — for testing the fallback path on WebGPU-capable
+   * browsers (pair it with three's `new WebGPURenderer({ forceWebGL: true })`
+   * to render through WebGL2 as well). `device`/`adapter` are ignored.
+   * Default false.
+   */
+  forceWebGL?: boolean
   /**
    * Keep the compressed bytes in a session-scoped in-memory LRU and reuse
    * them on repeat calls, skipping BOTH the image decode and the encode —
@@ -257,14 +266,44 @@ function getSharedGpu(): Promise<SharedGpu | null> {
   return sharedGpuPromise
 }
 
+// One WebGL2 encoder per class on the shared context, reused across
+// `compressTexture()` calls like the WebGPU encoders above: creating one
+// compiles and links its fragment program (tens of ms), and a live encoder
+// keeps its source/target textures for the next same-sized encode. Rebuilt
+// when the shared context is replaced (context loss).
+let sharedGl: { gl: WebGL2RenderingContext; encoders: Map<unknown, WebGLBlockEncoder> } | null = null
+
+function sharedWebGLEncoder(gl: WebGL2RenderingContext, cls: WebGLEncoderConstructor): WebGLBlockEncoder {
+  if (!sharedGl || sharedGl.gl !== gl) {
+    sharedGl?.encoders.forEach(e => e.destroy())
+    sharedGl = { gl, encoders: new Map() }
+  }
+  let enc = sharedGl.encoders.get(cls)
+  if (!enc) {
+    enc = cls.create(gl)
+    sharedGl.encoders.set(cls, enc)
+  }
+  return enc
+}
+
+function dropSharedWebGLEncoder(cls: WebGLEncoderConstructor): void {
+  const enc = sharedGl?.encoders.get(cls)
+  if (!enc) return
+  enc.destroy()
+  sharedGl!.encoders.delete(cls)
+}
+
 /**
- * Destroy the WebGPU device and encoders that `compressTexture()` shares
- * across calls (created lazily when neither the `device` nor the `adapter`
- * option is passed). Safe to call at any time — in-flight encodes on the
- * shared device will fail, and the next `compressTexture()` call recreates
- * everything. No-op when nothing is cached.
+ * Destroy the WebGPU device and the WebGPU/WebGL2 encoders that
+ * `compressTexture()` shares across calls (the WebGPU ones are created
+ * lazily when neither the `device` nor the `adapter` option is passed).
+ * Safe to call at any time — in-flight encodes on the shared device will
+ * fail, and the next `compressTexture()` call recreates everything. No-op
+ * when nothing is cached.
  */
 export function releaseSharedGpuResources(): void {
+  sharedGl?.encoders.forEach(e => e.destroy())
+  sharedGl = null
   const p = sharedGpuPromise
   sharedGpuPromise = null
   void p
@@ -452,6 +491,7 @@ export async function compressTextureToBytes(
     cacheKey,
     device: providedDevice,
     adapter: providedAdapter,
+    forceWebGL = false,
   } = options
 
   const t0 = performance.now()
@@ -459,7 +499,7 @@ export async function compressTextureToBytes(
   // Resolve backend + format BEFORE touching pixels: format selection only
   // needs capabilities, and knowing it first lets a transcode-cache hit
   // skip the image decode and the encode entirely.
-  const gpu = await resolveWebGPU()
+  const gpu = forceWebGL ? null : await resolveWebGPU()
   const gl = gpu ? null : resolveWebGL()
 
   // Transcode cache lookup (opt-in). The key includes the selected format,
@@ -469,6 +509,7 @@ export async function compressTextureToBytes(
   if (cache && activeFormat) {
     transcodeKey = await buildTranscodeKey(source, cacheKey, {
       format: activeFormat,
+      backend: gpu ? 'webgpu' : 'webgl',
       colorSpace,
       flipY,
       mipmaps,
@@ -697,8 +738,9 @@ export async function compressTextureToBytes(
    * producing a working texture.
    */
   function encodeViaWebGL({ gl, selection }: GlTier): CompressResult | null {
-    const encoder = selection.encoderClass.create(gl)
+    let encoder: WebGLBlockEncoder | null = null
     try {
+      encoder = sharedWebGLEncoder(gl, selection.encoderClass)
       if (!mipmaps) {
         const bytes = encoder.encodeToBytes(bitmap, { flipY })
         if (transcodeKey) {
@@ -709,7 +751,6 @@ export async function compressTextureToBytes(
             levels: [bytes],
           })
         }
-        encoder.destroy()
         return {
           levels: [bytes],
           fallbackBitmap: null,
@@ -749,7 +790,6 @@ export async function compressTextureToBytes(
           levels: encodedLevels,
         })
       }
-      encoder.destroy()
       return {
         levels: encodedLevels,
         fallbackBitmap: null,
@@ -766,7 +806,8 @@ export async function compressTextureToBytes(
         cacheHit: false,
       }
     } catch (e) {
-      encoder.destroy()
+      // Don't keep an encoder whose program or state may be broken.
+      if (encoder) dropSharedWebGLEncoder(selection.encoderClass)
       console.warn('[compressTextureToBytes] WebGL fallback encode failed; returning uncompressed RGBA8.', e)
       return null
     }

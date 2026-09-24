@@ -61,6 +61,9 @@ export class GputexLoader extends Loader<Texture> {
    */
   device?: GPUDevice
   adapter?: GPUAdapter
+  /** Encode on the WebGL2 fallback even when WebGPU is available (testing).
+   *  See `CompressOptions.forceWebGL`. Default false. */
+  forceWebGL: boolean = false
 
   /**
    * Most recent full encode result. Useful when the caller wants format
@@ -94,6 +97,7 @@ export class GputexLoader extends Loader<Texture> {
       cache: this.cache,
       device: this.device,
       adapter: this.adapter,
+      forceWebGL: this.forceWebGL,
     }).then(
       result => {
         this.lastResult = result

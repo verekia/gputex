@@ -146,13 +146,16 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:rock-roughness-1k': 39.1,
   'bc1:rock-ao-1k': 41.48,
   'bc1:rock-displacement-1k': 45.7,
-  // BC7 on exact-grayscale maps (analytic luma axis) — measured
-  // 51.62 / 53.63 / 56.68 / 52.10 / 55.09 (2026-07, min f16/f32).
-  'bc7:rock-roughness-1k': 51.45,
-  'bc7:rock-ao-1k': 53.45,
-  'bc7:rock-displacement-1k': 56.5,
-  'bc7:wood-roughness-1k': 51.95,
-  'bc7:wood-displacement-1k': 54.9,
+  // BC7 on exact-grayscale maps — re-pinned 2026-09 for the integer gray
+  // tail (lossless for spans ≤ 15 with odd endpoints so alpha stays 255,
+  // alpha-aware scalar LSQ refit above): measured 52.42 / 55.68 / 65.16 /
+  // 53.78 / 58.69 (min f16/f32), up from 51.62 / 53.63 / 56.68 / 52.10 /
+  // 55.09; displacement now beats the exhaustive mode-6 reference.
+  'bc7:rock-roughness-1k': 52.25,
+  'bc7:rock-ao-1k': 55.5,
+  'bc7:rock-displacement-1k': 65.0,
+  'bc7:wood-roughness-1k': 53.6,
+  'bc7:wood-displacement-1k': 58.5,
   // ASTC luminance path (CEM 0, 5-bit weights) on exact-grayscale maps —
   // measured 59.73 / 62.45 / 70.59 / 60.04 / 65.27 (2026-07, f16 ≡ f32).
   'astc:rock-roughness-1k': 59.55,

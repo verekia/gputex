@@ -2,6 +2,7 @@ import { ASTC4x4WebGLEncoder } from '../webgl/ASTC4x4WebGLEncoder.js'
 import { BC1WebGLEncoder } from '../webgl/BC1WebGLEncoder.js'
 import { BC5WebGLEncoder } from '../webgl/BC5WebGLEncoder.js'
 import { BC7WebGLEncoder } from '../webgl/BC7WebGLEncoder.js'
+import { ETC2WebGLEncoder } from '../webgl/ETC2WebGLEncoder.js'
 
 // Inspect each encoder's metadata + GLSL source without constructing it
 // (construction needs a real WebGL2 context to compile the program). As in
@@ -38,7 +39,7 @@ describe('BC5WebGLEncoder', () => {
     expect(view.supportsSrgb).toBe(false)
     const src: string = view.fragSource()
     expectValidFragSource(src)
-    expect(src).toContain('encodeBC4')
+    expect(src).toContain('lvlToIdx')
   })
 })
 
@@ -59,6 +60,16 @@ describe('BC1WebGLEncoder', () => {
     expect(view.bytesPerBlock).toBe(8)
     expect(view.supportsSrgb).toBe(true)
     expectValidFragSource(view.fragSource())
+  })
+
+  it('ETC2: declares its metadata and loads etc2.frag.glsl', () => {
+    const view: AnyProto = Object.create(ETC2WebGLEncoder.prototype)
+    expect(view.label).toBe('etc2')
+    expect(view.bytesPerBlock).toBe(8)
+    expect(view.supportsSrgb).toBe(true)
+    const src: string = view.fragSource()
+    expectValidFragSource(src)
+    expect(src).toContain('sbPair')
   })
 
   it('uses 8 bytes per block; the others use 16', () => {

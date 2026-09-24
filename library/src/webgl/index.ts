@@ -17,6 +17,7 @@ export { BC1WebGLEncoder } from './BC1WebGLEncoder.js'
 export { BC5WebGLEncoder } from './BC5WebGLEncoder.js'
 export { BC7WebGLEncoder } from './BC7WebGLEncoder.js'
 export { ASTC4x4WebGLEncoder } from './ASTC4x4WebGLEncoder.js'
+export { ETC2WebGLEncoder } from './ETC2WebGLEncoder.js'
 
 export { createWebGLContext, getSharedWebGLContext, isWebGLAvailable } from './webglContext.js'
 export { detectWebGLCapabilities, type WebGLCapabilities, type ExtensionProvider } from './webglCapabilities.js'

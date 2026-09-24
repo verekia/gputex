@@ -18,24 +18,22 @@
 // for the reference this encoder is validated against.
 //
 // Same algorithm as bc5_fast_f16.wgsl (see that file for the full notes):
-//   • both channels processed as vec2 lanes of the fused passes;
-//   • pass 1 accumulates MOMENTS (ΣL, ΣL², Σρ, ΣLρ) from which every LSQ
-//     normal-equation sum is an O(1) per-block expression; the rank guard
+//   • both channels processed in the same fused passes, texels held as
+//     quad-major vec4s per channel (the gather layout);
+//   • pass 1 accumulates MOMENTS (ΣL, ΣL², Σd, ΣL·d with d = v − r0) from
+//     which every LSQ normal-equation sum is an O(1) per-block expression;
+//     the seed covers the data, so pass 1 needs no clamp; the rank guard
 //     is the exact 16·ΣL² == (ΣL)² test;
 //   • the closed-form refit prices the nearest rounding of the solve
 //     through E(δ) = err − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB
-//     + δ1²sBB, accept-if-better;
-//   • pass 2 packs the indices ONCE, against the FINAL endpoints — full
-//     reprojection quality at parity cost;
+//     + δ1²sBB, accept-if-better, both channels as branch-free vec2 lanes;
+//   • pass 2 derives the levels ONCE, against the FINAL endpoints — full
+//     reprojection quality;
 //   • the 16 texel reads are 8 textureGather fetches (4 quads × R,G)
 //     through a clamp-to-edge sampler, byte-identical to per-texel loads;
-//   • 3-bit indices accumulate branch-free into two 24-bit words (pixels
-//     0..7 and 8..15) recombined with constant shifts — no per-pixel
-//     straddle branches.
+//   • 3-bit levels pack as Σ L·8^k in f32 (exact below 2^24), then one
+//     SWAR level → BC4 index map (0→0, 7→1, L→L+1) per 24-bit word.
 // Values are kept in the [0,255] f32 domain throughout.
-//
-// Level → BC4 index LUT (0,2,3,4,5,6,7,1) packed as 3-bit entries in
-// 0x3F58D0.
 
 struct Params {
   blocks_x: u32,
@@ -50,36 +48,15 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var smp: sampler;
 
-const IDX_LUT: u32 = 0x3F58D0u;
-
-// Closed-form accept-if-better endpoint refinement for one channel — same
-// as the f16 module's `refine` (both run this per-block step in f32).
-// Endpoints clamp to [0,255], NOT the block's value range: for a scalar
-// channel, endpoints beyond the data range are often genuinely optimal and
-// there is no colour axis to bend.
-fn refine(sAA: f32, sBB: f32, sAB: f32, sAR: f32, sBR: f32, b0: u32, b1: u32, spread: bool) -> vec2<u32> {
-  var out = vec2<u32>(b0, b1);
-  let det = sAA * sBB - sAB * sAB;
-  if (!spread || abs(det) <= 1e-3) { return out; }
-  let b0f = f32(b0);
-  let b1f = f32(b1);
-  let e0 = clamp(b0f + (sBB * sAR - sAB * sBR) / det, 0.0, 255.0);
-  let e1 = clamp(b1f + (sAA * sBR - sAB * sAR) / det, 0.0, 255.0);
-  let q0f = floor(e0 + 0.5);
-  let q1f = floor(e1 + 0.5);
-  let q0 = u32(q0f);
-  let q1 = u32(q1f);
-  if (q0 > q1 && !(q0 == b0 && q1 == b1)) {
-    let dd0 = q0f - b0f;
-    let dd1 = q1f - b1f;
-    let eNew = -2.0 * (dd0 * sAR + dd1 * sBR)
-      + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
-    if (eNew < 0.0) {
-      out = vec2<u32>(q0, q1);
-    }
-  }
-  return out;
+// 8 packed 3-bit levels → BC4 indices (0→0, 7→1, L→L+1 otherwise).
+fn lvl_to_idx(x: u32) -> u32 {
+  let y = ((x & 0x6DB6DBu) + 0x249249u) ^ (x & 0x924924u);
+  return y ^ (~((y >> 1u) | (y >> 2u)) & 0x249249u);
 }
+
+// Per-quad pixel weights 8^k (gather order x,y,z,w = (0,1),(1,1),(1,0),(0,0)).
+const W0 = vec4<f32>(4096.0, 32768.0, 8.0, 1.0);
+const W1 = vec4<f32>(262144.0, 2097152.0, 512.0, 64.0);
 
 @compute @workgroup_size(8, 8, 1)
 fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
@@ -91,40 +68,40 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let bi = gid.y * params.blocks_x + gid.x;
   let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
 
-  // Load 4×4 R/G pairs (x = R, y = G throughout), min/max fused in.
-  // Interior blocks read via 8 gathers normalised by the PHYSICAL (padded)
-  // texture size; blocks straddling the source edge of a non-multiple-of-4
-  // image fall back to per-texel loads clamped to the last real texel (the
-  // padding strip is zero-initialised — see bc5_fast_f16.wgsl).
-  // Gather components: w=(0,0) z=(1,0) x=(0,1) y=(1,1) within each quad.
-  var v: array<vec2<f32>, 16>;
-  var vmin = vec2<f32>(255.0);
-  var vmax = vec2<f32>(0.0);
+  // Load 4×4 R and G as quad-major vec4s in gather order (w=(0,0) z=(1,0)
+  // x=(0,1) y=(1,1) of quad q = (x ≥ 2) + 2·(y ≥ 2)). Interior blocks read
+  // via 8 gathers normalised by the PHYSICAL (padded) texture size; blocks
+  // straddling the source edge of a non-multiple-of-4 image fall back to
+  // per-texel loads clamped to the last real texel (the padding strip is
+  // zero-initialised — see bc5_fast_f16.wgsl).
+  var vr: array<vec4<f32>, 4>;
+  var vg: array<vec4<f32>, 4>;
   if (u32(base.x) + 4u <= params.width && u32(base.y) + 4u <= params.height) {
     let inv_size = vec2<f32>(1.0, 1.0) / vec2<f32>(textureDimensions(src_tex));
     for (var q: u32 = 0u; q < 4u; q = q + 1u) {
       let qo = vec2<u32>((q & 1u) * 2u, (q >> 1u) * 2u);
       let cc = (vec2<f32>(base) + vec2<f32>(qo) + vec2<f32>(1.0, 1.0)) * inv_size;
-      let r4 = textureGather(0, src_tex, smp, cc) * 255.0;
-      let g4 = textureGather(1, src_tex, smp, cc) * 255.0;
-      let i = qo.y * 4u + qo.x;
-      let vw = vec2<f32>(r4.w, g4.w);
-      let vz = vec2<f32>(r4.z, g4.z);
-      let vx = vec2<f32>(r4.x, g4.x);
-      let vy = vec2<f32>(r4.y, g4.y);
-      v[i] = vw; v[i + 1u] = vz; v[i + 4u] = vx; v[i + 5u] = vy;
-      vmin = min(min(vmin, min(vw, vz)), min(vx, vy));
-      vmax = max(max(vmax, max(vw, vz)), max(vx, vy));
+      vr[q] = textureGather(0, src_tex, smp, cc) * 255.0;
+      vg[q] = textureGather(1, src_tex, smp, cc) * 255.0;
     }
   } else {
     let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
-    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-      let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
-      let c = textureLoad(src_tex, p, 0);
-      let val = vec2<f32>(c.r, c.g) * 255.0;
-      v[i] = val; vmin = min(vmin, val); vmax = max(vmax, val);
+    for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+      let qo = base + vec2<i32>(i32(q & 1u) * 2, i32(q >> 1u) * 2);
+      let cx = textureLoad(src_tex, clamp(qo + vec2<i32>(0, 1), vec2<i32>(0), mx), 0);
+      let cy = textureLoad(src_tex, clamp(qo + vec2<i32>(1, 1), vec2<i32>(0), mx), 0);
+      let cz = textureLoad(src_tex, clamp(qo + vec2<i32>(1, 0), vec2<i32>(0), mx), 0);
+      let cw = textureLoad(src_tex, clamp(qo, vec2<i32>(0), mx), 0);
+      vr[q] = vec4<f32>(cx.r, cy.r, cz.r, cw.r) * 255.0;
+      vg[q] = vec4<f32>(cx.g, cy.g, cz.g, cw.g) * 255.0;
     }
   }
+  let mnr = min(min(vr[0], vr[1]), min(vr[2], vr[3]));
+  let mxr = max(max(vr[0], vr[1]), max(vr[2], vr[3]));
+  let mng = min(min(vg[0], vg[1]), min(vg[2], vg[3]));
+  let mxg = max(max(vg[0], vg[1]), max(vg[2], vg[3]));
+  let vmin = vec2<f32>(min(min(mnr.x, mnr.y), min(mnr.z, mnr.w)), min(min(mng.x, mng.y), min(mng.z, mng.w)));
+  let vmax = vec2<f32>(max(max(mxr.x, mxr.y), max(mxr.z, mxr.w)), max(max(mxg.x, mxg.y), max(mxg.z, mxg.w)));
 
   // Seed endpoints at the exact per-channel extremes (round-to-nearest, the
   // same rule the CPU reference uses). Flat blocks get nudged apart to keep
@@ -139,20 +116,25 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let dir = r1f - r0f;
   let scale = vec2<f32>(7.0) / dir;
 
-  // Pass 1, both channels — MOMENTS only. t = 7(v−r0)/(r1−r0) ∈ [0,7]
-  // (the seed covers the data), L = round(t), ρ = t − L.
+  // Pass 1, both channels — MOMENTS only. t = d·scale ∈ [0,7] (the seed
+  // covers the data, so no clamp), L = round(t).
   var sL = vec2<f32>(0.0); var sLL = vec2<f32>(0.0);
-  var pR = vec2<f32>(0.0); var pLR = vec2<f32>(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let t = (v[k] - r0f) * scale;
-    let L = clamp(floor(t + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
-    let rho = t - L;
-    sL = sL + L; sLL = sLL + L * L;
-    pR = pR + rho; pLR = pLR + L * rho;
+  var sd = vec2<f32>(0.0); var sLd = vec2<f32>(0.0);
+  for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+    let dr = vr[q] - r0f.x;
+    let dg = vg[q] - r0f.y;
+    let Lr = floor(dr * scale.x + 0.5);
+    let Lg = floor(dg * scale.y + 0.5);
+    sL = sL + vec2<f32>(dot(Lr, vec4<f32>(1.0)), dot(Lg, vec4<f32>(1.0)));
+    sLL = sLL + vec2<f32>(dot(Lr, Lr), dot(Lg, Lg));
+    sd = sd + vec2<f32>(dot(dr, vec4<f32>(1.0)), dot(dg, vec4<f32>(1.0)));
+    sLd = sLd + vec2<f32>(dot(Lr, dr), dot(Lg, dg));
   }
 
   // Per-block refit off the moments (see bc5_fast_f16.wgsl for the
-  // identities).
+  // identities): Σρ = s·Σd − ΣL, ΣLρ = s·ΣLd − ΣL².
+  let pR = scale * sd - sL;
+  let pLR = scale * sLd - sLL;
   let sBB = sLL * (1.0 / 49.0);
   let sAB = sL * (1.0 / 7.0) - sBB;
   let sAA = vec2<f32>(16.0) - 2.0 * sL * (1.0 / 7.0) + sBB;
@@ -160,28 +142,38 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let sAR = (pR - pLR * (1.0 / 7.0)) * dir * (1.0 / 7.0);
   let spread = 16.0 * sLL != sL * sL;
 
-  let fx = refine(sAA.x, sBB.x, sAB.x, sAR.x, sBR.x, r0.x, r1.x, spread.x);
-  let fy = refine(sAA.y, sBB.y, sAB.y, sAR.y, sBR.y, r0.y, r1.y, spread.y);
-  let n0 = vec2<u32>(fx.x, fy.x);
-  let n1 = vec2<u32>(fx.y, fy.y);
+  // Both channels at once, branch-free: nearest rounding of the LSQ
+  // solve, accepted when it stays in 6-interp mode, moves, and prices
+  // strictly better on the current indices. Endpoints clamp to [0,255],
+  // NOT the block's value range: for a scalar channel, endpoints beyond
+  // the data range are often genuinely optimal and there is no colour
+  // axis to bend.
+  let det = sAA * sBB - sAB * sAB;
+  let idet = 1.0 / det;
+  let q0f = floor(clamp(r0f + (sBB * sAR - sAB * sBR) * idet, vec2<f32>(0.0), vec2<f32>(255.0)) + 0.5);
+  let q1f = floor(clamp(r1f + (sAA * sBR - sAB * sAR) * idet, vec2<f32>(0.0), vec2<f32>(255.0)) + 0.5);
+  let dd0 = q0f - r0f;
+  let dd1 = q1f - r1f;
+  let eNew = -2.0 * (dd0 * sAR + dd1 * sBR) + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
+  let acc = spread & (abs(det) > vec2<f32>(1e-3)) & (q0f > q1f) & (eNew < vec2<f32>(0.0));
+  let n0 = select(r0, vec2<u32>(q0f), acc);
+  let n1 = select(r1, vec2<u32>(q1f), acc);
 
-  // Pass 2, both channels — pack the shipped indices against the FINAL
-  // endpoints (rejected channels re-derive their seed assignment). iA
-  // holds pixels 0..7 (3 bits each), iB pixels 8..15.
+  // Pass 2, both channels — levels against the FINAL endpoints (rejected
+  // channels re-derive their seed assignment), packed as Σ L·8^k:
+  // iA = pixels 0..7, iB = pixels 8..15.
   let n0f = vec2<f32>(n0);
-  let n1f = vec2<f32>(n1);
-  let scale2 = vec2<f32>(7.0) / (n1f - n0f);
-  var iAx = 0u; var iBx = 0u; var iAy = 0u; var iBy = 0u;
-  for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-    let L = clamp(floor((v[k] - n0f) * scale2 + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
-    iAx = iAx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << (k * 3u));
-    iAy = iAy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << (k * 3u));
+  let sc2 = vec2<f32>(7.0) / (vec2<f32>(n1) - n0f);
+  var Lr: array<vec4<f32>, 4>;
+  var Lg: array<vec4<f32>, 4>;
+  for (var q: u32 = 0u; q < 4u; q = q + 1u) {
+    Lr[q] = clamp(floor((vr[q] - n0f.x) * sc2.x + 0.5), vec4<f32>(0.0), vec4<f32>(7.0));
+    Lg[q] = clamp(floor((vg[q] - n0f.y) * sc2.y + 0.5), vec4<f32>(0.0), vec4<f32>(7.0));
   }
-  for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-    let L = clamp(floor((v[k] - n0f) * scale2 + 0.5), vec2<f32>(0.0), vec2<f32>(7.0));
-    iBx = iBx | (((IDX_LUT >> (u32(L.x) * 3u)) & 7u) << ((k - 8u) * 3u));
-    iBy = iBy | (((IDX_LUT >> (u32(L.y) * 3u)) & 7u) << ((k - 8u) * 3u));
-  }
+  let iAx = lvl_to_idx(u32(dot(Lr[0], W0) + dot(Lr[1], W1)));
+  let iBx = lvl_to_idx(u32(dot(Lr[2], W0) + dot(Lr[3], W1)));
+  let iAy = lvl_to_idx(u32(dot(Lg[0], W0) + dot(Lg[1], W1)));
+  let iBy = lvl_to_idx(u32(dot(Lg[2], W0) + dot(Lg[3], W1)));
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.
   let o = bi * 4u;

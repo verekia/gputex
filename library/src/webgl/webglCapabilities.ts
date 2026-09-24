@@ -30,6 +30,8 @@ export interface WebGLCapabilities {
   s3tcSrgb: boolean
   /** WEBGL_compressed_texture_astc → ASTC 4×4 (and other footprints). */
   astc: boolean
+  /** WEBGL_compressed_texture_etc → ETC2 RGB8 (and the other ETC2/EAC formats). */
+  etc: boolean
 }
 
 export function detectWebGLCapabilities(gl: ExtensionProvider): WebGLCapabilities {
@@ -43,5 +45,6 @@ export function detectWebGLCapabilities(gl: ExtensionProvider): WebGLCapabilitie
     s3tc: has('WEBGL_compressed_texture_s3tc'),
     s3tcSrgb: has('WEBGL_compressed_texture_s3tc_srgb'),
     astc: has('WEBGL_compressed_texture_astc'),
+    etc: has('WEBGL_compressed_texture_etc'),
   }
 }
