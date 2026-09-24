@@ -6,12 +6,14 @@
 // blocks) at the exact projection extents, quantised directly (no LSQ refit —
 // mode 6's 16-level palette leaves it under 0.15 dB) → one projection-based
 // index-assignment pass (palette is colinear, so the nearest entry is found
-// by projecting onto the endpoint line — O(1) per pixel). Same algorithm as
-// bc7.wgsl; see that file for the mode-6 bit layout and rationale.
+// by projecting onto the endpoint line — O(1) per pixel). Gray + opaque
+// blocks take an integer 1-D tail: lossless for spans ≤ 15 with odd
+// endpoints (alpha exactly 255), alpha-aware scalar LSQ refit above. Same
+// algorithm as bc7.wgsl; see that file (and bc7_fast_f16.wgsl) for the
+// mode-6 bit layout and rationale.
 //
-// Determinism note: the WGSL refit uses round() (half-to-even); here we use
-// floor(x + 0.5) for portability. The two differ only at exact .5 ties, a
-// sub-LSB endpoint nudge that is visually identical.
+// Same arithmetic as bc7.wgsl (roundEven == WGSL round()), so the two
+// produce the same blocks up to driver float-contraction differences.
 
 precision highp float;
 precision highp int;
@@ -22,13 +24,11 @@ uniform int uFlipY;
 
 layout(location = 0) out uvec4 outColor;
 
-// Per-invocation scratch (mirrors the WGSL function-scope arrays passed by ptr).
+// Per-invocation scratch (mirrors the WGSL function-scope array).
 ivec4 gPixels[16];
-uint gIdx[16];
 
 struct QuantPair { ivec4 seven; ivec4 eight; };
 struct Ep { ivec4 seven; ivec4 eight; uint p; };
-struct Fit { ivec4 e0; ivec4 e1; bool valid; };
 
 ivec4 to8(vec4 v) {
   return ivec4(clamp(floor(v * 255.0 + 0.5), vec4(0.0), vec4(255.0)));
@@ -80,72 +80,102 @@ vec4 principalAxis(vec4 c0v, vec4 c1v, vec4 c2v, vec4 c3v, vec4 seed) {
   return v;
 }
 
-// Projection index assignment over gPixels → gIdx. When `fit`, accumulate the
-// LSQ normal-equation sums in the same pass and return refitted endpoints.
-Fit projAssign(ivec4 pe0, ivec4 pe1, bool fit) {
-  Fit res;
-  res.e0 = ivec4(0);
-  res.e1 = ivec4(0);
-  res.valid = false;
-  ivec4 dir = pe1 - pe0;
-  int dd = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z + dir.w * dir.w;
-  if (dd == 0) {
-    for (int k = 0; k < 16; k++) { gIdx[k] = 0u; }
-    return res;
-  }
-  float inv = 15.0 / float(dd);
-  float sAA = 0.0, sBB = 0.0, sAB = 0.0;
-  vec4 sAV = vec4(0.0), sBV = vec4(0.0);
-  for (int k = 0; k < 16; k++) {
-    ivec4 q = gPixels[k] - pe0;
-    float proj = float(q.x * dir.x + q.y * dir.y + q.z * dir.z + q.w * dir.w) * inv;
-    float s = clamp(floor(proj + 0.5), 0.0, 15.0);
-    gIdx[k] = uint(s);
-    if (fit) {
-      vec4 v = vec4(gPixels[k]);
-      float b = s / 15.0;
-      float a = 1.0 - b;
-      sAA += a * a; sBB += b * b; sAB += a * b; sAV += a * v; sBV += b * v;
+// Gray + opaque block (every texel R == G == B, A == 255) from gPixels[].x,
+// packed straight into the 4 block words. 8-bit endpoints E = 2q + p; RGB
+// share q, alpha is 254 + p.
+uvec4 encodeGray(float vmin, float vmax) {
+  float e0 = vmin;
+  float e1 = vmax;
+  if (vmax - vmin <= 15.0) {
+    // LOSSLESS: integer endpoints ≤ 15 apart cover every integer between
+    // them and round(15·(v − e0)/d) selects it; even endpoints step outward
+    // while the span stays ≤ 15 so both p-bits are 1 (alpha 255).
+    if (fract(e0 * 0.5) == 0.0 && e0 > 0.0 && e1 - e0 < 15.0) { e0 -= 1.0; }
+    if (fract(e1 * 0.5) == 0.0 && e1 < 255.0 && e1 - e0 < 15.0) { e1 += 1.0; }
+  } else {
+    // Moment-form scalar LSQ refit on the seed levels, all four p-bit
+    // combinations priced including the alpha term, accept-if-better.
+    float k1 = 15.0 / (vmax - vmin);
+    float k0 = 0.5 - vmin * k1;
+    float sL = 0.0;
+    float sLL = 0.0;
+    float sv = 0.0;
+    float sLv = 0.0;
+    for (int k = 0; k < 16; k++) {
+      float v = float(gPixels[k].x);
+      float L = floor(v * k1 + k0);
+      sL += L;
+      sLL += L * L;
+      sv += v;
+      sLv += L * v;
+    }
+    float C = sLL * (1.0 / 225.0);
+    float B = sL * (1.0 / 15.0) - C;
+    float A = 16.0 - sL * (2.0 / 15.0) + C;
+    float Y = sLv * (1.0 / 15.0);
+    float X = sv - Y;
+    float det = A * C - B * B;
+    if (det > 1e-3) {
+      float s0 = clamp((C * X - B * Y) / det, 0.0, 255.0);
+      float s1 = clamp((A * Y - B * X) / det, 0.0, 255.0);
+      // price(e0, e1, p0, p1) up to the block constant: RGB ×3 + alpha.
+      float ps0 = vmin - 2.0 * floor(vmin * 0.5);
+      float ps1 = vmax - 2.0 * floor(vmax * 0.5);
+      float best = 3.0 * (A * vmin * vmin + 2.0 * B * vmin * vmax + C * vmax * vmax - 2.0 * (X * vmin + Y * vmax))
+        + A * (1.0 - ps0) + 2.0 * B * (1.0 - ps0) * (1.0 - ps1) + C * (1.0 - ps1);
+      for (int pc = 0; pc < 4; pc++) {
+        float p0 = float(pc & 1);
+        float p1 = float(pc >> 1);
+        float c0 = 2.0 * clamp(floor((s0 - p0) * 0.5 + 0.5), 0.0, 127.0) + p0;
+        float c1 = 2.0 * clamp(floor((s1 - p1) * 0.5 + 0.5), 0.0, 127.0) + p1;
+        float pr = 3.0 * (A * c0 * c0 + 2.0 * B * c0 * c1 + C * c1 * c1 - 2.0 * (X * c0 + Y * c1))
+          + A * (1.0 - p0) + 2.0 * B * (1.0 - p0) * (1.0 - p1) + C * (1.0 - p1);
+        if (pr < best) {
+          best = pr;
+          e0 = c0;
+          e1 = c1;
+        }
+      }
     }
   }
-  if (!fit) { return res; }
-  float det = sAA * sBB - sAB * sAB;
-  if (abs(det) < 1e-9) { return res; }
-  res.e0 = ivec4(clamp(floor((sBB * sAV - sAB * sBV) / det + 0.5), vec4(0.0), vec4(255.0)));
-  res.e1 = ivec4(clamp(floor((sAA * sBV - sAB * sAV) / det + 0.5), vec4(0.0), vec4(255.0)));
-  res.valid = true;
-  return res;
-}
-
-void writeBits(inout uint block[4], uint pos, uint nbits, uint value) {
-  uint v = value & ((1u << nbits) - 1u);
-  uint wordLo = pos / 32u;
-  uint bitLo = pos % 32u;
-  uint bitsInLo = min(nbits, 32u - bitLo);
-  uint maskLo = ((1u << bitsInLo) - 1u) << bitLo;
-  block[wordLo] = (block[wordLo] & ~maskLo) | ((v << bitLo) & maskLo);
-  if (bitsInLo < nbits) {
-    uint bitsInHi = nbits - bitsInLo;
-    uint maskHi = (1u << bitsInHi) - 1u;
-    uint valHi = v >> bitsInLo;
-    block[wordLo + 1u] = (block[wordLo + 1u] & ~maskHi) | (valHi & maskHi);
+  uint glo = 0u;
+  uint ghi = 0u;
+  if (e1 != e0) {
+    float k1 = 15.0 / (e1 - e0);
+    float k0 = 0.5 - e0 * k1;
+    for (int k = 0; k < 8; k++) {
+      float sg = clamp(floor(float(gPixels[k].x) * k1 + k0), 0.0, 15.0);
+      glo |= uint(sg) << uint(k * 4);
+    }
+    for (int k = 8; k < 16; k++) {
+      float sg = clamp(floor(float(gPixels[k].x) * k1 + k0), 0.0, 15.0);
+      ghi |= uint(sg) << uint((k - 8) * 4);
+    }
   }
+  uint u0 = uint(e0);
+  uint u1 = uint(e1);
+  // Anchor rule: pixel 0's index MSB must be 0 — swap + reflect (bitwise NOT).
+  if ((glo & 0x8u) != 0u) {
+    uint t = u0; u0 = u1; u1 = t;
+    glo = ~glo; ghi = ~ghi;
+  }
+  uint q0 = u0 >> 1u;
+  uint q1 = u1 >> 1u;
+  return uvec4(
+    0x40u | (q0 << 7u) | (q1 << 14u) | (q0 << 21u) | (q1 << 28u),
+    (q1 >> 4u) | (q0 << 3u) | (q1 << 10u) | (127u << 17u) | (127u << 24u) | ((u0 & 1u) << 31u),
+    (u1 & 1u) | ((glo & 0x7u) << 1u) | (glo & 0xFFFFFFF0u),
+    ghi
+  );
 }
 
 void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
   ivec2 maxXY = uSrcSize - ivec2(1);
 
-  // Load pass with the covariance moments FUSED in: d = px − pixel0
-  // (first-pixel-relative, so the sums scale with the block's span).
+  // Load pass: texels, bbox and the gray test.
   ivec4 lo = ivec4(255);
   ivec4 hi = ivec4(0);
-  vec4 p0f = vec4(0.0);
-  vec4 sd = vec4(0.0);
-  vec4 c0v = vec4(0.0);
-  vec4 c1v = vec4(0.0);
-  vec4 c2v = vec4(0.0);
-  vec4 c3v = vec4(0.0);
   int gd = 0;
   for (int i = 0; i < 16; i++) {
     ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
@@ -155,8 +185,26 @@ void main() {
     lo = min(lo, px);
     hi = max(hi, px);
     gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
-    if (i == 0) { p0f = vec4(px); }
-    vec4 d = vec4(px) - p0f;
+  }
+
+  // Gray + opaque blocks: 1-D, own tail (see bc7_fast_f16.wgsl) — lossless
+  // for spans ≤ 15 with odd endpoints (alpha exactly 255), closed-form
+  // scalar LSQ refit with alpha-aware p-bit pricing above that.
+  if (lo.w == 255 && gd == 0) {
+    outColor = encodeGray(float(lo.x), float(hi.x));
+    return;
+  }
+
+  // Covariance moments: d = px − pixel0 (first-pixel-relative, so the sums
+  // scale with the block's span).
+  vec4 p0f = vec4(gPixels[0]);
+  vec4 sd = vec4(0.0);
+  vec4 c0v = vec4(0.0);
+  vec4 c1v = vec4(0.0);
+  vec4 c2v = vec4(0.0);
+  vec4 c3v = vec4(0.0);
+  for (int i = 1; i < 16; i++) {
+    vec4 d = vec4(gPixels[i]) - p0f;
     sd += d;
     c0v += d.x * d;
     c1v += d.y * d;
@@ -164,7 +212,7 @@ void main() {
     c3v += d.w * d;
   }
   vec4 mean = p0f + sd / 16.0;
-  // Mean-correct the fused moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
+  // Mean-correct the moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
   vec4 sd16 = sd / 16.0;
   c0v -= sd.x * sd16;
   c1v -= sd.y * sd16;
@@ -173,12 +221,7 @@ void main() {
 
   ivec4 seed0 = lo;
   ivec4 seed1 = hi;
-  // Gray + opaque blocks: axis is analytically (1,1,1,0)/√3 with extents
-  // at the luma min/max — skip iteration + extents (see bc7_fast_f16.wgsl).
-  if (lo.w == 255 && gd == 0) {
-    seed0 = ivec4(lo.x, lo.x, lo.x, 255);
-    seed1 = ivec4(hi.x, hi.x, hi.x, 255);
-  } else {
+  {
     vec4 axis = principalAxis(c0v, c1v, c2v, c3v, vec4(hi - lo));
     if (dot(axis, axis) > 0.0) {
       // Exact projection extents along the axis. (A Rayleigh-quotient span
@@ -192,50 +235,55 @@ void main() {
         tMin = min(tMin, t);
         tMax = max(tMax, t);
       }
-      seed0 = ivec4(clamp(floor(mean + tMin * axis + 0.5), vec4(0.0), vec4(255.0)));
-      seed1 = ivec4(clamp(floor(mean + tMax * axis + 0.5), vec4(0.0), vec4(255.0)));
+      seed0 = ivec4(clamp(roundEven(mean + tMin * axis), vec4(0.0), vec4(255.0)));
+      seed1 = ivec4(clamp(roundEven(mean + tMax * axis), vec4(0.0), vec4(255.0)));
     }
   }
 
   // Quantise the PCA-extents seed directly and assign indices in one
   // projection pass — no LSQ refit: with the seed already on the principal
   // axis, mode 6's 16-level palette leaves the refit under 0.15 dB (the
-  // coarse 4-level BC1/ASTC fast paths DO keep theirs).
+  // coarse 4-level BC1/ASTC paths DO keep theirs). The 16 4-bit indices pack
+  // on the fly into two nibble words (pixel k → bits 4k..4k+3).
+  uint ilo = 0u;
+  uint ihi = 0u;
   Ep ep0 = pickEp(seed0);
   Ep ep1 = pickEp(seed1);
-  projAssign(ep0.eight, ep1.eight, false);
+  vec4 dir = vec4(ep1.eight - ep0.eight);
+  float dd = dot(dir, dir);
+  if (dd > 0.0) {
+    vec4 e0f = vec4(ep0.eight);
+    float inv = 15.0 / dd;
+    for (int k = 0; k < 8; k++) {
+      float sk = clamp(floor(dot(vec4(gPixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
+      ilo |= uint(sk) << uint(k * 4);
+    }
+    for (int k = 8; k < 16; k++) {
+      float sk = clamp(floor(dot(vec4(gPixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
+      ihi |= uint(sk) << uint((k - 8) * 4);
+    }
+  }
   ivec4 e0_7 = ep0.seven;
   ivec4 e1_7 = ep1.seven;
   uint p0 = ep0.p;
   uint p1 = ep1.p;
 
-  // Anchor rule — pixel 0's index MSB must be 0; otherwise swap endpoints and
-  // reflect every index (decoded image unchanged).
-  if ((gIdx[0] & 0x8u) != 0u) {
+  // Anchor rule — pixel 0's index MSB must be 0. Swapping endpoints reflects
+  // every index (i → 15−i), which on packed nibbles is a bitwise NOT.
+  if ((ilo & 0x8u) != 0u) {
     ivec4 t = e0_7; e0_7 = e1_7; e1_7 = t;
     uint tp = p0; p0 = p1; p1 = tp;
-    for (int k = 0; k < 16; k++) { gIdx[k] = 15u - gIdx[k]; }
+    ilo = ~ilo; ihi = ~ihi;
   }
 
-  uint block[4];
-  block[0] = 0u; block[1] = 0u; block[2] = 0u; block[3] = 0u;
-  uint pos = 0u;
-  writeBits(block, pos, 7u, 0x40u); pos += 7u;
-  writeBits(block, pos, 7u, uint(e0_7.x)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e1_7.x)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e0_7.y)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e1_7.y)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e0_7.z)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e1_7.z)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e0_7.w)); pos += 7u;
-  writeBits(block, pos, 7u, uint(e1_7.w)); pos += 7u;
-  writeBits(block, pos, 1u, p0); pos += 1u;
-  writeBits(block, pos, 1u, p1); pos += 1u;
-  writeBits(block, pos, 3u, gIdx[0] & 0x7u); pos += 3u;
-  for (int k = 1; k < 16; k++) {
-    writeBits(block, pos, 4u, gIdx[k] & 0xFu);
-    pos += 4u;
-  }
-
-  outColor = uvec4(block[0], block[1], block[2], block[3]);
+  // Straight-line mode-6 packing (a generic bit writer's dynamic word
+  // indexing keeps the output array out of registers).
+  uvec4 e0 = uvec4(e0_7);
+  uvec4 e1 = uvec4(e1_7);
+  outColor = uvec4(
+    0x40u | (e0.x << 7u) | (e1.x << 14u) | (e0.y << 21u) | (e1.y << 28u),
+    (e1.y >> 4u) | (e0.z << 3u) | (e1.z << 10u) | (e0.w << 17u) | (e1.w << 24u) | (p0 << 31u),
+    p1 | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u),
+    ihi
+  );
 }

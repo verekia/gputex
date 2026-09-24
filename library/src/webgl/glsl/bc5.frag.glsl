@@ -1,14 +1,22 @@
 #version 300 es
-// BC5 (RGTC2) fragment-shader encoder — WebGL2 port of bc5.wgsl (fast path).
+// BC5 (RGTC2) fragment-shader encoder — WebGL2 port of bc5.wgsl.
 //
 // One fragment per 4×4 block → 16-byte BC5 block as 4 × u32 in outColor.
-// BC5 = two BC4 halves (R then G). This is the *fast* path only: bbox
-// endpoints + a full-L2 index assignment per channel with the least-squares
-// refit sums accumulated in the same pass, then one refit accepted
-// CLOSED-FORM when it lowers the block's error on the seed indices — the
-// accepted endpoints ship with the seed indices, no second assignment pass
-// (mirrors bc5.wgsl; see bc5_fast_f16.wgsl for the measured trade). Always
-// emits 6-interpolation mode (red0 > red1).
+// BC5 = two BC4 halves (R then G), both channels processed together. Same
+// algorithm and arithmetic order as bc5.wgsl (see bc5_fast_f16.wgsl for the
+// full notes and measurements):
+//   • texels held as quad-major vec4s per channel, in textureGather order
+//     (x=(0,1) y=(1,1) z=(1,0) w=(0,0) within each 2×2 quad);
+//   • seed endpoints at the per-channel extremes; pass 1 accumulates the
+//     MOMENTS ΣL, ΣL², Σd, ΣL·d (d = v − r0, L = the seed level — the seed
+//     covers the data, so no clamp), from which every least-squares sum is
+//     O(1) per block; exact rank guard 16·ΣL² == (ΣL)²;
+//   • one closed-form refit accepted when it prices better on the seed
+//     levels (nearest rounding of the solve, 6-interp mode kept);
+//   • pass 2 derives the shipped levels against the FINAL endpoints, packed
+//     as float fields Σ L·8^k (exact below 2^24), then one SWAR level → BC4
+//     index map (0→0, 7→1, L→L+1) per 24-bit word.
+// Always emits 6-interpolation mode (red0 > red1).
 
 precision highp float;
 precision highp int;
@@ -19,138 +27,124 @@ uniform int uFlipY;
 
 layout(location = 0) out uvec4 outColor;
 
-// 6-interpolation-mode palette weights: pal[j] = W0_6[j]*r0 + W1_6[j]*r1.
-const float W0_6[8] = float[8](1.0, 0.0, 6.0 / 7.0, 5.0 / 7.0, 4.0 / 7.0, 3.0 / 7.0, 2.0 / 7.0, 1.0 / 7.0);
-const float W1_6[8] = float[8](0.0, 1.0, 1.0 / 7.0, 2.0 / 7.0, 3.0 / 7.0, 4.0 / 7.0, 5.0 / 7.0, 6.0 / 7.0);
-
-uint quantize8(float v) {
-  return uint(clamp(floor(v * 255.0 + 0.5), 0.0, 255.0));
+// 8 packed 3-bit levels → BC4 indices (0→0, 7→1, L→L+1 otherwise).
+uint lvlToIdx(uint x) {
+  uint y = ((x & 0x6DB6DBu) + 0x249249u) ^ (x & 0x924924u);
+  return y ^ (~((y >> 1u) | (y >> 2u)) & 0x249249u);
 }
 
-// Nearest-palette assignment with the LSQ normal-equation sums and total
-// squared error accumulated in the same pass. Sums are only consumed by the
-// caller's refit; err drives the accept-if-better test.
-struct Assign { float err; float sAA; float sBB; float sAB; float sAV; float sBV; };
-Assign assignAll(float values[16], float pal[8], out uint indices[16]) {
-  Assign r = Assign(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-  for (int k = 0; k < 16; k++) {
-    float v = values[k];
-    uint bestJ = 0u;
-    float bestD = 1e20;
-    for (int j = 0; j < 8; j++) {
-      float d = pal[j] - v;
-      float d2 = d * d;
-      if (d2 < bestD) { bestD = d2; bestJ = uint(j); }
-    }
-    indices[k] = bestJ;
-    r.err += bestD;
-    float a = W0_6[int(bestJ)];
-    float b = W1_6[int(bestJ)];
-    r.sAA += a * a; r.sBB += b * b; r.sAB += a * b; r.sAV += a * v; r.sBV += b * v;
-  }
-  return r;
+// Per-quad pixel weights 8^k (gather order x,y,z,w = (0,1),(1,1),(1,0),(0,0)).
+const vec4 W0 = vec4(4096.0, 32768.0, 8.0, 1.0);
+const vec4 W1 = vec4(262144.0, 2097152.0, 512.0, 64.0);
+
+vec4 fetchRG(ivec2 p, ivec2 maxXY) {
+  ivec2 c = clamp(p, ivec2(0), maxXY);
+  int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - c.y) : c.y;
+  return texelFetch(uSrc, ivec2(c.x, sy), 0);
 }
 
-// Encode 16 single-channel values into an 8-byte BC4 block (two little-endian
-// u32s). Mirrors encode_bc4() in bc5.wgsl's fast branch: bbox seed, fused
-// assignment + LSQ sums, refit accepted only if the error drops. vmin/vmax
-// are the channel's min/max, computed in the caller's load loop — fusing
-// that scan there saves a 16-value pass per channel.
-uvec2 encodeBC4(float values[16], float vmin, float vmax) {
-  uint r0 = quantize8(vmax);
-  uint r1 = quantize8(vmin);
-  if (r0 == r1) {
-    if (r1 > 0u) { r1 = r1 - 1u; } else { r0 = r0 + 1u; }
-  }
-
-  float pal[8];
-  float r0f = float(r0) / 255.0;
-  float r1f = float(r1) / 255.0;
-  for (int j = 0; j < 8; j++) {
-    pal[j] = W0_6[j] * r0f + W1_6[j] * r1f;
-  }
-
-  uint indices[16];
-  Assign seed = assignAll(values, pal, indices);
-
-  // One least-squares refit, accepted CLOSED-FORM: with the seed indices
-  // kept, the block error for endpoints (e0, e1) is
-  //   E(e0, e1) = sAA·e0² + sBB·e1² + 2(sAB·e0·e1 − e0·sAV − e1·sBV) + ΣV²
-  // and ΣV² cancels out of the accept comparison, so no second assignment
-  // pass is needed. Clamp to [0,1], NOT the block's value range: for a
-  // scalar channel, endpoints beyond the data range are often genuinely
-  // optimal and there is no colour axis to bend — the bbox clamp the colour
-  // formats need costs ~0.3 dB here. Keep 6-interp mode (r0 > r1 strictly).
-  float det = seed.sAA * seed.sBB - seed.sAB * seed.sAB;
-  if (abs(det) > 1e-9) {
-    float e0 = clamp((seed.sBB * seed.sAV - seed.sAB * seed.sBV) / det, 0.0, 1.0) * 255.0;
-    float e1 = clamp((seed.sAA * seed.sBV - seed.sAB * seed.sAV) / det, 0.0, 1.0) * 255.0;
-    // Price all four floor/ceil roundings of the fractional solve
-    // closed-form (see bc5_fast_f16.wgsl); keep the best that stays in
-    // 6-interp mode and beats the seed.
-    float quadSeed = seed.sAA * r0f * r0f + seed.sBB * r1f * r1f
-      + 2.0 * (seed.sAB * r0f * r1f - r0f * seed.sAV - r1f * seed.sBV);
-    float bestQuad = quadSeed;
-    uint seed0 = r0;
-    uint seed1 = r1;
-    for (uint m = 0u; m < 4u; m++) {
-      float q0f = clamp(floor(e0) + float(m & 1u), 0.0, 255.0);
-      float q1f = clamp(floor(e1) + float(m >> 1u), 0.0, 255.0);
-      uint n0 = uint(q0f);
-      uint n1 = uint(q1f);
-      if (n0 > n1 && !(n0 == seed0 && n1 == seed1)) {
-        float n0f = q0f / 255.0;
-        float n1f = q1f / 255.0;
-        float quadNew = seed.sAA * n0f * n0f + seed.sBB * n1f * n1f
-          + 2.0 * (seed.sAB * n0f * n1f - n0f * seed.sAV - n1f * seed.sBV);
-        if (quadNew < bestQuad) {
-          bestQuad = quadNew;
-          r0 = n0; r1 = n1;
-        }
-      }
-    }
-  }
-
-  // Pack the 48-bit index field (bytes 2..7) split across two u32 halves.
-  uint idxLo = 0u;
-  uint idxHi = 0u;
-  for (int k = 0; k < 16; k++) {
-    uint bit = 3u * uint(k);
-    uint v = indices[k] & 7u;
-    if (bit + 3u <= 32u) {
-      idxLo = idxLo | (v << bit);
-    } else if (bit >= 32u) {
-      idxHi = idxHi | (v << (bit - 32u));
-    } else {
-      idxLo = idxLo | (v << bit);
-      idxHi = idxHi | (v >> (32u - bit));
-    }
-  }
-
-  uint outLo = r0 | (r1 << 8) | ((idxLo & 0xFFFFu) << 16);
-  uint outHi = (idxLo >> 16) | (idxHi << 16);
-  return uvec2(outLo, outHi);
+// Closed-form accept-if-better refit for one channel off the pass-1
+// moments; returns the final (r0, r1).
+uvec2 refit(float sL, float sLL, float sd, float sLd, uint r0, uint r1) {
+  float r0f = float(r0);
+  float r1f = float(r1);
+  float dir = r1f - r0f;
+  float scale = 7.0 / dir;
+  // Σρ = s·Σd − ΣL, ΣLρ = s·ΣLd − ΣL² (ρ = level-space residual).
+  float pR = scale * sd - sL;
+  float pLR = scale * sLd - sLL;
+  float sBB = sLL * (1.0 / 49.0);
+  float sAB = sL * (1.0 / 7.0) - sBB;
+  float sAA = 16.0 - 2.0 * sL * (1.0 / 7.0) + sBB;
+  float sBR = pLR * dir * (1.0 / 49.0);
+  float sAR = (pR - pLR * (1.0 / 7.0)) * dir * (1.0 / 7.0);
+  bool spread = 16.0 * sLL != sL * sL;
+  float det = sAA * sBB - sAB * sAB;
+  float idet = 1.0 / det;
+  // Endpoints clamp to [0,255], NOT the block's value range: for a scalar
+  // channel, endpoints beyond the data range are often genuinely optimal.
+  float q0f = floor(clamp(r0f + (sBB * sAR - sAB * sBR) * idet, 0.0, 255.0) + 0.5);
+  float q1f = floor(clamp(r1f + (sAA * sBR - sAB * sAR) * idet, 0.0, 255.0) + 0.5);
+  float dd0 = q0f - r0f;
+  float dd1 = q1f - r1f;
+  float eNew = -2.0 * (dd0 * sAR + dd1 * sBR) + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
+  bool acc = spread && abs(det) > 1e-3 && q0f > q1f && eNew < 0.0;
+  return acc ? uvec2(uint(q0f), uint(q1f)) : uvec2(r0, r1);
 }
 
 void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
   ivec2 maxXY = uSrcSize - ivec2(1);
 
-  float rValues[16];
-  float gValues[16];
-  float rMin = 1.0; float rMax = 0.0;
-  float gMin = 1.0; float gMax = 0.0;
-  for (int i = 0; i < 16; i++) {
-    ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
-    int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
-    vec4 c = texelFetch(uSrc, ivec2(p.x, sy), 0);
-    rValues[i] = c.r;
-    gValues[i] = c.g;
-    rMin = min(rMin, c.r); rMax = max(rMax, c.r);
-    gMin = min(gMin, c.g); gMax = max(gMax, c.g);
+  vec4 vr[4];
+  vec4 vg[4];
+  for (int q = 0; q < 4; q++) {
+    ivec2 qo = base + ivec2((q & 1) * 2, (q >> 1) * 2);
+    vec4 cx = fetchRG(qo + ivec2(0, 1), maxXY);
+    vec4 cy = fetchRG(qo + ivec2(1, 1), maxXY);
+    vec4 cz = fetchRG(qo + ivec2(1, 0), maxXY);
+    vec4 cw = fetchRG(qo, maxXY);
+    vr[q] = vec4(cx.r, cy.r, cz.r, cw.r) * 255.0;
+    vg[q] = vec4(cx.g, cy.g, cz.g, cw.g) * 255.0;
+  }
+  vec4 mnr = min(min(vr[0], vr[1]), min(vr[2], vr[3]));
+  vec4 mxr = max(max(vr[0], vr[1]), max(vr[2], vr[3]));
+  vec4 mng = min(min(vg[0], vg[1]), min(vg[2], vg[3]));
+  vec4 mxg = max(max(vg[0], vg[1]), max(vg[2], vg[3]));
+  vec2 vmin = vec2(min(min(mnr.x, mnr.y), min(mnr.z, mnr.w)), min(min(mng.x, mng.y), min(mng.z, mng.w)));
+  vec2 vmax = vec2(max(max(mxr.x, mxr.y), max(mxr.z, mxr.w)), max(max(mxg.x, mxg.y), max(mxg.z, mxg.w)));
+
+  // Seed endpoints at the exact per-channel extremes (round-to-nearest).
+  // Flat blocks get nudged apart to keep the 6-interp mode (r0 > r1).
+  uvec2 r0 = uvec2(clamp(floor(vmax + 0.5), vec2(0.0), vec2(255.0)));
+  uvec2 r1 = uvec2(clamp(floor(vmin + 0.5), vec2(0.0), vec2(255.0)));
+  if (r0.x == r1.x) { if (r1.x > 0u) { r1.x = r1.x - 1u; } else { r0.x = r0.x + 1u; } }
+  if (r0.y == r1.y) { if (r1.y > 0u) { r1.y = r1.y - 1u; } else { r0.y = r0.y + 1u; } }
+
+  vec2 r0f = vec2(r0);
+  vec2 scale = vec2(7.0) / (vec2(r1) - r0f);
+
+  // Pass 1 — moments only.
+  vec2 sL = vec2(0.0);
+  vec2 sLL = vec2(0.0);
+  vec2 sd = vec2(0.0);
+  vec2 sLd = vec2(0.0);
+  for (int q = 0; q < 4; q++) {
+    vec4 dr = vr[q] - r0f.x;
+    vec4 dg = vg[q] - r0f.y;
+    vec4 Lr = floor(dr * scale.x + 0.5);
+    vec4 Lg = floor(dg * scale.y + 0.5);
+    sL += vec2(dot(Lr, vec4(1.0)), dot(Lg, vec4(1.0)));
+    sLL += vec2(dot(Lr, Lr), dot(Lg, Lg));
+    sd += vec2(dot(dr, vec4(1.0)), dot(dg, vec4(1.0)));
+    sLd += vec2(dot(Lr, dr), dot(Lg, dg));
   }
 
-  uvec2 rBlock = encodeBC4(rValues, rMin, rMax);
-  uvec2 gBlock = encodeBC4(gValues, gMin, gMax);
-  outColor = uvec4(rBlock.x, rBlock.y, gBlock.x, gBlock.y);
+  uvec2 fr = refit(sL.x, sLL.x, sd.x, sLd.x, r0.x, r1.x);
+  uvec2 fg = refit(sL.y, sLL.y, sd.y, sLd.y, r0.y, r1.y);
+  uvec2 n0 = uvec2(fr.x, fg.x);
+  uvec2 n1 = uvec2(fr.y, fg.y);
+
+  // Pass 2 — levels against the FINAL endpoints, packed as Σ L·8^k:
+  // iA = pixels 0..7, iB = pixels 8..15.
+  vec2 n0f = vec2(n0);
+  vec2 sc2 = vec2(7.0) / (vec2(n1) - n0f);
+  vec4 Lr[4];
+  vec4 Lg[4];
+  for (int q = 0; q < 4; q++) {
+    Lr[q] = clamp(floor((vr[q] - n0f.x) * sc2.x + 0.5), vec4(0.0), vec4(7.0));
+    Lg[q] = clamp(floor((vg[q] - n0f.y) * sc2.y + 0.5), vec4(0.0), vec4(7.0));
+  }
+  uint iAx = lvlToIdx(uint(dot(Lr[0], W0) + dot(Lr[1], W1)));
+  uint iBx = lvlToIdx(uint(dot(Lr[2], W0) + dot(Lr[3], W1)));
+  uint iAy = lvlToIdx(uint(dot(Lg[0], W0) + dot(Lg[1], W1)));
+  uint iBy = lvlToIdx(uint(dot(Lg[2], W0) + dot(Lg[3], W1)));
+
+  // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.
+  outColor = uvec4(
+    n0.x | (n1.x << 8u) | (iAx << 16u),
+    (iAx >> 16u) | (iBx << 8u),
+    n0.y | (n1.y << 8u) | (iAy << 16u),
+    (iAy >> 16u) | (iBy << 8u)
+  );
 }

@@ -94,6 +94,26 @@ export abstract class WebGLBlockEncoder {
   protected _uSrcSize: WebGLUniformLocation | null = null
   protected _uFlipY: WebGLUniformLocation | null = null
 
+  // Per-encoder resource cache (mirrors the WebGPU Encoder). Sequential
+  // encodes reuse the source texture while its size is stable and the
+  // RGBA32UI target + framebuffer while the block grid is stable, so a
+  // same-sized encode allocates nothing. encodeToBytes() is synchronous, so
+  // there is no concurrent-encode case to guard.
+  private _srcTex: WebGLTexture | null = null
+  private _srcW = 0
+  private _srcH = 0
+  // Upload memoisation: the ImageBitmap whose pixels _srcTex currently
+  // holds. ImageBitmaps are immutable, so re-encoding the same bitmap
+  // (format A/B, quality-ladder re-encodes, benchmark loops) skips the
+  // upload — ~14-19 ms of a ~22-28 ms 4096² encode. Mutable sources
+  // (ImageData, raw pixels, canvases, images) are always re-uploaded. flipY
+  // is applied in the shader, so it doesn't affect the texture contents.
+  private _srcBitmap: ImageBitmap | null = null
+  private _outTex: WebGLTexture | null = null
+  private _fbo: WebGLFramebuffer | null = null
+  private _outBX = 0
+  private _outBY = 0
+
   constructor({ gl }: WebGLEncoderOptions) {
     this.gl = gl
     this._buildProgram()
@@ -139,27 +159,59 @@ export abstract class WebGLBlockEncoder {
     this._uFlipY = gl.getUniformLocation(program, 'uFlipY')
   }
 
-  /** Release the GL program + VAO. The shared context itself is left intact. */
+  /** Release the GL program, VAO and cached textures. The shared context itself is left intact. */
   destroy(): void {
     const gl = this.gl
-    if (gl.isContextLost()) return
-    gl.deleteProgram(this._program)
-    gl.deleteVertexArray(this._vao)
+    if (!gl.isContextLost()) {
+      gl.deleteProgram(this._program)
+      gl.deleteVertexArray(this._vao)
+      if (this._srcTex) gl.deleteTexture(this._srcTex)
+      if (this._outTex) gl.deleteTexture(this._outTex)
+      if (this._fbo) gl.deleteFramebuffer(this._fbo)
+    }
+    this._srcTex = null
+    this._srcBitmap = null
+    this._outTex = null
+    this._fbo = null
   }
 
   /**
-   * Upload the source image to a freshly created RGBA8 texture bound on unit 0.
-   * Raw pixel sources (ImageData / mip levels) go through the typed-array
-   * overload; DOM sources (ImageBitmap / canvas / image) through the element
-   * overload. No flip / premultiply / colour conversion — flipY is applied in
-   * the shader so each mip level flips by its own height.
+   * Upload the source image to the cached RGBA8 texture (recreated when the
+   * image size changes), bound on unit 0. Raw pixel sources (ImageData / mip
+   * levels) go through the typed-array overload; DOM sources (ImageBitmap /
+   * canvas / image) through the element overload. No flip / premultiply /
+   * colour conversion — flipY is applied in the shader so each mip level
+   * flips by its own height. Re-encoding the ImageBitmap already held by the
+   * texture skips the upload.
    */
   protected _uploadSource(source: WebGLEncoderImageSource, width: number, height: number): WebGLTexture {
     const gl = this.gl
-    const tex = gl.createTexture()
-    if (!tex) throw new Error(`${this.label}: gl.createTexture failed`)
     gl.activeTexture(gl.TEXTURE0)
-    gl.bindTexture(gl.TEXTURE_2D, tex)
+    const isBitmap = typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap
+    const sameSize = this._srcTex !== null && this._srcW === width && this._srcH === height
+    if (sameSize && isBitmap && this._srcBitmap === source) {
+      gl.bindTexture(gl.TEXTURE_2D, this._srcTex)
+      return this._srcTex!
+    }
+    if (!sameSize) {
+      if (this._srcTex) gl.deleteTexture(this._srcTex)
+      const tex = gl.createTexture()
+      if (!tex) throw new Error(`${this.label}: gl.createTexture failed`)
+      gl.bindTexture(gl.TEXTURE_2D, tex)
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, width, height)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      this._srcTex = tex
+      this._srcW = width
+      this._srcH = height
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, this._srcTex)
+    }
+    // Invalidate before uploading: a throwing upload must not leave a stale
+    // bitmap identity pointing at half-written pixels.
+    this._srcBitmap = null
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false)
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false)
     gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE)
@@ -167,16 +219,12 @@ export abstract class WebGLBlockEncoder {
 
     const raw = source as Partial<RawPixelSource>
     if (raw.data && ArrayBuffer.isView(raw.data)) {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, raw.data)
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, raw.data)
     } else {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, source as TexImageSource)
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, source as TexImageSource)
     }
-
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-    return tex
+    if (isBitmap) this._srcBitmap = source as ImageBitmap
+    return this._srcTex!
   }
 
   /**
@@ -206,28 +254,40 @@ export abstract class WebGLBlockEncoder {
     // 1. Source texture (sized to the unpadded image; the shader clamps reads).
     const srcTex = this._uploadSource(source, width, height)
 
-    // 2. Output integer texture (RGBA32UI) + framebuffer.
-    const outTex = gl.createTexture()
-    const fbo = gl.createFramebuffer()
-    if (!outTex || !fbo) {
-      gl.deleteTexture(srcTex)
-      if (outTex) gl.deleteTexture(outTex)
-      if (fbo) gl.deleteFramebuffer(fbo)
-      throw new Error(`${this.label}: failed to allocate output texture/framebuffer`)
-    }
-    gl.bindTexture(gl.TEXTURE_2D, outTex)
-    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32UI, blocksX, blocksY)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, outTex, 0)
-    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
-    if (status !== gl.FRAMEBUFFER_COMPLETE) {
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-      gl.deleteFramebuffer(fbo)
-      gl.deleteTexture(outTex)
-      gl.deleteTexture(srcTex)
-      throw new Error(`${this.label}: integer framebuffer incomplete (0x${status.toString(16)})`)
+    // 2. Output integer texture (RGBA32UI) + framebuffer, reused while the
+    //    block grid is unchanged.
+    if (!this._outTex || !this._fbo || this._outBX !== blocksX || this._outBY !== blocksY) {
+      if (this._outTex) gl.deleteTexture(this._outTex)
+      if (this._fbo) gl.deleteFramebuffer(this._fbo)
+      this._outTex = null
+      this._fbo = null
+      const outTex = gl.createTexture()
+      const fbo = gl.createFramebuffer()
+      if (!outTex || !fbo) {
+        if (outTex) gl.deleteTexture(outTex)
+        if (fbo) gl.deleteFramebuffer(fbo)
+        throw new Error(`${this.label}: failed to allocate output texture/framebuffer`)
+      }
+      gl.bindTexture(gl.TEXTURE_2D, outTex)
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32UI, blocksX, blocksY)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, outTex, 0)
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER)
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+        gl.bindTexture(gl.TEXTURE_2D, null)
+        gl.deleteFramebuffer(fbo)
+        gl.deleteTexture(outTex)
+        throw new Error(`${this.label}: integer framebuffer incomplete (0x${status.toString(16)})`)
+      }
+      this._outTex = outTex
+      this._fbo = fbo
+      this._outBX = blocksX
+      this._outBY = blocksY
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._fbo)
     }
 
     // 3. Draw exactly one fragment per block.
@@ -268,13 +328,10 @@ export abstract class WebGLBlockEncoder {
 
     const encodeMs = performance.now() - t0
 
-    // 6. Release per-encode resources; the program + VAO persist on the encoder.
+    // 6. Unbind; the program, VAO and cached textures persist on the encoder.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null)
     gl.bindTexture(gl.TEXTURE_2D, null)
     gl.bindVertexArray(null)
-    gl.deleteFramebuffer(fbo)
-    gl.deleteTexture(outTex)
-    gl.deleteTexture(srcTex)
 
     return { width, height, paddedWidth, paddedHeight, data, encodeMs }
   }

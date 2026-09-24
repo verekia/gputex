@@ -49,7 +49,7 @@ when unsupported, and both apply to `hint: 'color'` only.
 
 ## WebGL fallback
 
-WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. The two backends are not byte-identical (the WebGPU shaders use f16 where available), but they implement the same algorithms at the same quality level and the resulting `CompressedTexture` looks the same under either renderer.
+WebGPU is the primary path. When it's unavailable (older Safari, Firefox without WebGPU, locked-down environments) `compressTexture()` automatically falls back to a **WebGL2** path that runs the same family of block encoders as fragment shaders — each 4×4 block is computed in one fragment, written to an `RGBA32UI` render target, and read back. Each fragment shader is a line-for-line port of the WebGPU f32 shader and produces the same bytes as it (verified on Apple M3); the default WebGPU path runs the f16 variants where `shader-f16` is available, which can differ from f32 on rounding ties only, so the resulting `CompressedTexture` looks the same under either renderer. The WebGL encoders also reuse their textures across encodes and skip re-uploading an `ImageBitmap` they already hold.
 
 The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend` field on the result (`'webgpu' | 'webgl' | 'none'`) tells you which path ran.
 

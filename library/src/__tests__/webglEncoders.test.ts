@@ -38,7 +38,7 @@ describe('BC5WebGLEncoder', () => {
     expect(view.supportsSrgb).toBe(false)
     const src: string = view.fragSource()
     expectValidFragSource(src)
-    expect(src).toContain('encodeBC4')
+    expect(src).toContain('lvlToIdx')
   })
 })
 
