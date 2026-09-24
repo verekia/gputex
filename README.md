@@ -90,8 +90,13 @@ moments and accepted per block only when they lower the error; its
 near-flat blocks skip the line fit and take the endpoint pair whose ⅔/⅓
 interpolant lands nearest the block colour (direct 565 rounding is up to 4
 levels off — worth up to +3.9 dB on maps with flat regions). BC5 refits
-once; BC7's 16-level mode-6 palette makes the refit redundant on a
-principal-axis seed (≤0.05 dB). ASTC spends every one of its 128 bits: a
+once from levels assigned against a slightly inset range (so the extreme
+levels gather every pixel near the extremes, not just the extreme pixel),
+then shifts both endpoints by the mean residual of the final levels, and
+encodes blocks spanning ≤ 7 values losslessly — roughly 4–9% lower error than a
+plain min/max seed on real textures, up to 60% on displacement maps. BC7's
+16-level mode-6 palette makes the refit redundant on a principal-axis seed
+(≤0.05 dB). ASTC spends every one of its 128 bits: a
 wide-span opaque block gets 16 weight levels with 192-level (trit-coded)
 endpoints, a small-span one exact 8-bit endpoints with 8 levels,
 exactly-grayscale blocks a luminance-only mode with 32 levels. On GPUs that

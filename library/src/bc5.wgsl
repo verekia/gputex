@@ -20,15 +20,16 @@
 // Same algorithm as bc5_fast_f16.wgsl (see that file for the full notes):
 //   • both channels processed in the same fused passes, texels held as
 //     quad-major vec4s per channel (the gather layout);
-//   • pass 1 accumulates MOMENTS (ΣL, ΣL², Σd, ΣL·d with d = v − r0) from
-//     which every LSQ normal-equation sum is an O(1) per-block expression;
-//     the seed covers the data, so pass 1 needs no clamp; the rank guard
-//     is the exact 16·ΣL² == (ΣL)² test;
-//   • the closed-form refit prices the nearest rounding of the solve
-//     through E(δ) = err − 2(δ0·sAR + δ1·sBR) + δ0²sAA + 2δ0δ1·sAB
-//     + δ1²sBB, accept-if-better, both channels as branch-free vec2 lanes;
-//   • pass 2 derives the levels ONCE, against the FINAL endpoints — full
-//     reprojection quality;
+//   • seed at the per-channel extremes (spans ≤ 7: a lossless 7-wide
+//     window); pass-1 levels come from that range inset by ~5.5/256 of the
+//     span and accumulate MOMENTS (ΣL, ΣL², Σd, ΣL·d with d = v − r0) — the
+//     seed covers the data, so pass 1 needs no clamp;
+//   • refit = the least-squares line through those levels straight off the
+//     moments (den = 16ΣL² − (ΣL)² = 0 keeps the seed), both channels as
+//     branch-free vec2 lanes;
+//   • pass 2 derives the levels ONCE, against the refit endpoints — full
+//     reprojection quality — then an offset round shifts both endpoints by
+//     the rounded mean residual of those levels (never worse on them);
 //   • the 16 texel reads are 8 textureGather fetches (4 quads × R,G)
 //     through a clamp-to-edge sampler, byte-identical to per-texel loads;
 //   • 3-bit levels pack as Σ L·8^k in f32 (exact below 2^24), then one
@@ -103,82 +104,82 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let vmin = vec2<f32>(min(min(mnr.x, mnr.y), min(mnr.z, mnr.w)), min(min(mng.x, mng.y), min(mng.z, mng.w)));
   let vmax = vec2<f32>(max(max(mxr.x, mxr.y), max(mxr.z, mxr.w)), max(max(mxg.x, mxg.y), max(mxg.z, mxg.w)));
 
-  // Seed endpoints at the exact per-channel extremes (round-to-nearest, the
-  // same rule the CPU reference uses). Flat blocks get nudged apart to keep
-  // the 6-interp mode (r0 > r1 strictly).
-  var r0 = vec2<u32>(clamp(floor(vmax + 0.5), vec2<f32>(0.0), vec2<f32>(255.0)));
-  var r1 = vec2<u32>(clamp(floor(vmin + 0.5), vec2<f32>(0.0), vec2<f32>(255.0)));
-  if (r0.x == r1.x) { if (r1.x > 0u) { r1.x = r1.x - 1u; } else { r0.x = r0.x + 1u; } }
-  if (r0.y == r1.y) { if (r1.y > 0u) { r1.y = r1.y - 1u; } else { r0.y = r0.y + 1u; } }
+  // Seed endpoints at the per-channel extremes (round-to-nearest, the same
+  // rule the CPU reference uses); spans ≤ 7 (incl. flat blocks) seed a
+  // 7-wide window instead, whose levels land on every integer the block
+  // holds — lossless, and the refit keeps it.
+  let vhi = clamp(floor(vmax + 0.5), vec2<f32>(0.0), vec2<f32>(255.0));
+  let vlo = clamp(floor(vmin + 0.5), vec2<f32>(0.0), vec2<f32>(255.0));
+  let small = vhi - vlo <= vec2<f32>(7.0);
+  let r1f = select(vlo, min(vlo, vec2<f32>(248.0)), small);
+  let r0f = select(vhi, r1f + 7.0, small);
+  // Pass-1 levels come from the seed range INSET by ~5.5/256 of the span
+  // on both ends: scale ×7.3125/7, offset ½ − 0.15625 (exact dyadic
+  // constants, so the WebGL port folds them identically).
+  let scale = vec2<f32>(7.3125) / (r1f - r0f);
 
-  let r0f = vec2<f32>(r0);
-  let r1f = vec2<f32>(r1);
-  let dir = r1f - r0f;
-  let scale = vec2<f32>(7.0) / dir;
-
-  // Pass 1, both channels — MOMENTS only. t = d·scale ∈ [0,7] (the seed
-  // covers the data, so no clamp), L = round(t).
+  // Pass 1, both channels — MOMENTS only. t = d·scale ∈ [0,7.3125] (the seed
+  // covers the data), L = floor(t + 11/32) ∈ [0,7], no clamp.
   var sL = vec2<f32>(0.0); var sLL = vec2<f32>(0.0);
   var sd = vec2<f32>(0.0); var sLd = vec2<f32>(0.0);
   for (var q: u32 = 0u; q < 4u; q = q + 1u) {
     let dr = vr[q] - r0f.x;
     let dg = vg[q] - r0f.y;
-    let Lr = floor(dr * scale.x + 0.5);
-    let Lg = floor(dg * scale.y + 0.5);
+    let Lr = floor(dr * scale.x + 0.34375);
+    let Lg = floor(dg * scale.y + 0.34375);
     sL = sL + vec2<f32>(dot(Lr, vec4<f32>(1.0)), dot(Lg, vec4<f32>(1.0)));
     sLL = sLL + vec2<f32>(dot(Lr, Lr), dot(Lg, Lg));
     sd = sd + vec2<f32>(dot(dr, vec4<f32>(1.0)), dot(dg, vec4<f32>(1.0)));
     sLd = sLd + vec2<f32>(dot(Lr, dr), dot(Lg, dg));
   }
 
-  // Per-block refit off the moments (see bc5_fast_f16.wgsl for the
-  // identities): Σρ = s·Σd − ΣL, ΣLρ = s·ΣLd − ΣL².
-  let pR = scale * sd - sL;
-  let pLR = scale * sLd - sLL;
-  let sBB = sLL * (1.0 / 49.0);
-  let sAB = sL * (1.0 / 7.0) - sBB;
-  let sAA = vec2<f32>(16.0) - 2.0 * sL * (1.0 / 7.0) + sBB;
-  let sBR = pLR * dir * (1.0 / 49.0);
-  let sAR = (pR - pLR * (1.0 / 7.0)) * dir * (1.0 / 7.0);
-  let spread = 16.0 * sLL != sL * sL;
+  // Refit: least-squares line v ≈ r0 + α + β·L through the pass-1 levels,
+  // straight off the moments; den = 0 ⟺ every pixel on one level — keep
+  // the seed then. Endpoints clamp to [0,255], NOT the block's value
+  // range: for a scalar channel, endpoints beyond the data range are often
+  // genuinely optimal and there is no colour axis to bend.
+  let den = 16.0 * sLL - sL * sL;
+  let beta = (16.0 * sLd - sL * sd) / den;
+  let e0 = r0f + (sd - beta * sL) * (1.0 / 16.0);
+  let q0f = floor(clamp(e0, vec2<f32>(0.0), vec2<f32>(255.0)) + 0.5);
+  let q1f = floor(clamp(e0 + 7.0 * beta, vec2<f32>(0.0), vec2<f32>(255.0)) + 0.5);
+  let acc = (den > vec2<f32>(0.0)) & (q0f > q1f);
+  let n0f = select(r0f, q0f, acc);
+  let n1f = select(r1f, q1f, acc);
 
-  // Both channels at once, branch-free: nearest rounding of the LSQ
-  // solve, accepted when it stays in 6-interp mode, moves, and prices
-  // strictly better on the current indices. Endpoints clamp to [0,255],
-  // NOT the block's value range: for a scalar channel, endpoints beyond
-  // the data range are often genuinely optimal and there is no colour
-  // axis to bend.
-  let det = sAA * sBB - sAB * sAB;
-  let idet = 1.0 / det;
-  let q0f = floor(clamp(r0f + (sBB * sAR - sAB * sBR) * idet, vec2<f32>(0.0), vec2<f32>(255.0)) + 0.5);
-  let q1f = floor(clamp(r1f + (sAA * sBR - sAB * sAR) * idet, vec2<f32>(0.0), vec2<f32>(255.0)) + 0.5);
-  let dd0 = q0f - r0f;
-  let dd1 = q1f - r1f;
-  let eNew = -2.0 * (dd0 * sAR + dd1 * sBR) + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
-  let acc = spread & (abs(det) > vec2<f32>(1e-3)) & (q0f > q1f) & (eNew < vec2<f32>(0.0));
-  let n0 = select(r0, vec2<u32>(q0f), acc);
-  let n1 = select(r1, vec2<u32>(q1f), acc);
-
-  // Pass 2, both channels — levels against the FINAL endpoints (rejected
-  // channels re-derive their seed assignment), packed as Σ L·8^k:
-  // iA = pixels 0..7, iB = pixels 8..15.
-  let n0f = vec2<f32>(n0);
-  let sc2 = vec2<f32>(7.0) / (vec2<f32>(n1) - n0f);
-  var Lr: array<vec4<f32>, 4>;
-  var Lg: array<vec4<f32>, 4>;
+  // Pass 2, both channels — levels against the refit endpoints, packed as
+  // Σ L·8^k (A = pixels 0..7, B = pixels 8..15), plus ΣL for the offset
+  // round.
+  let sc2 = vec2<f32>(7.0) / (n1f - n0f);
+  var pk = vec4<f32>(0.0); // (Ax, Bx, Ay, By)
+  var sL2 = vec2<f32>(0.0);
   for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-    Lr[q] = clamp(floor((vr[q] - n0f.x) * sc2.x + 0.5), vec4<f32>(0.0), vec4<f32>(7.0));
-    Lg[q] = clamp(floor((vg[q] - n0f.y) * sc2.y + 0.5), vec4<f32>(0.0), vec4<f32>(7.0));
+    let Lr = clamp(floor((vr[q] - n0f.x) * sc2.x + 0.5), vec4<f32>(0.0), vec4<f32>(7.0));
+    let Lg = clamp(floor((vg[q] - n0f.y) * sc2.y + 0.5), vec4<f32>(0.0), vec4<f32>(7.0));
+    let w = select(W0, W1, (q & 1u) == 1u);
+    let hi = q >= 2u;
+    let pr = dot(Lr, w);
+    let pg = dot(Lg, w);
+    pk = pk + vec4<f32>(select(pr, 0.0, hi), select(0.0, pr, hi), select(pg, 0.0, hi), select(0.0, pg, hi));
+    sL2 = sL2 + vec2<f32>(dot(Lr, vec4<f32>(1.0)), dot(Lg, vec4<f32>(1.0)));
   }
-  let iAx = lvl_to_idx(u32(dot(Lr[0], W0) + dot(Lr[1], W1)));
-  let iBx = lvl_to_idx(u32(dot(Lr[2], W0) + dot(Lr[3], W1)));
-  let iAy = lvl_to_idx(u32(dot(Lg[0], W0) + dot(Lg[1], W1)));
-  let iBy = lvl_to_idx(u32(dot(Lg[2], W0) + dot(Lg[3], W1)));
+
+  // Offset round: shift both endpoints by the rounded mean residual of the
+  // shipped levels (a whole-level shift moves every palette entry equally,
+  // so the error on these indices can only drop, under any decoder).
+  let res = sd + 16.0 * (r0f - n0f) - (n1f - n0f) * sL2 * (1.0 / 7.0);
+  let sh = clamp(floor(res * (1.0 / 16.0) + 0.5), -n1f, vec2<f32>(255.0) - n0f);
+  let m0 = vec2<u32>(n0f + sh);
+  let m1 = vec2<u32>(n1f + sh);
+  let iAx = lvl_to_idx(u32(pk.x));
+  let iBx = lvl_to_idx(u32(pk.y));
+  let iAy = lvl_to_idx(u32(pk.z));
+  let iBy = lvl_to_idx(u32(pk.w));
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.
   let o = bi * 4u;
-  dst[o] = n0.x | (n1.x << 8u) | (iAx << 16u);
+  dst[o] = m0.x | (m1.x << 8u) | (iAx << 16u);
   dst[o + 1u] = (iAx >> 16u) | (iBx << 8u);
-  dst[o + 2u] = n0.y | (n1.y << 8u) | (iAy << 16u);
+  dst[o + 2u] = m0.y | (m1.y << 8u) | (iAy << 16u);
   dst[o + 3u] = (iAy >> 16u) | (iBy << 8u);
 }

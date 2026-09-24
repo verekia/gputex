@@ -7,15 +7,18 @@
 // full notes and measurements):
 //   • texels held as quad-major vec4s per channel, in textureGather order
 //     (x=(0,1) y=(1,1) z=(1,0) w=(0,0) within each 2×2 quad);
-//   • seed endpoints at the per-channel extremes; pass 1 accumulates the
-//     MOMENTS ΣL, ΣL², Σd, ΣL·d (d = v − r0, L = the seed level — the seed
-//     covers the data, so no clamp), from which every least-squares sum is
-//     O(1) per block; exact rank guard 16·ΣL² == (ΣL)²;
-//   • one closed-form refit accepted when it prices better on the seed
-//     levels (nearest rounding of the solve, 6-interp mode kept);
-//   • pass 2 derives the shipped levels against the FINAL endpoints, packed
-//     as float fields Σ L·8^k (exact below 2^24), then one SWAR level → BC4
-//     index map (0→0, 7→1, L→L+1) per 24-bit word.
+//   • seed endpoints at the per-channel extremes (spans ≤ 7: a 7-wide
+//     window, lossless); pass-1 levels come from the seed range inset by
+//     ~5.5/256 of the span (scale ×7.3125/7, offset 11/32), accumulating
+//     the MOMENTS ΣL, ΣL², Σd, ΣL·d (d = v − r0; the seed covers the
+//     data, so no clamp);
+//   • one least-squares line through the pass-1 levels straight off the
+//     moments (den = 16ΣL² − (ΣL)² = 0 keeps the seed);
+//   • pass 2 derives the shipped levels against the refit endpoints,
+//     packed as float fields Σ L·8^k (exact below 2^24), then one SWAR
+//     level → BC4 index map (0→0, 7→1, L→L+1) per 24-bit word;
+//   • offset round: both endpoints shift by the rounded mean residual of
+//     the shipped levels (never worse on those indices).
 // Always emits 6-interpolation mode (red0 > red1).
 
 precision highp float;
@@ -43,35 +46,6 @@ vec4 fetchRG(ivec2 p, ivec2 maxXY) {
   return texelFetch(uSrc, ivec2(c.x, sy), 0);
 }
 
-// Closed-form accept-if-better refit for one channel off the pass-1
-// moments; returns the final (r0, r1).
-uvec2 refit(float sL, float sLL, float sd, float sLd, uint r0, uint r1) {
-  float r0f = float(r0);
-  float r1f = float(r1);
-  float dir = r1f - r0f;
-  float scale = 7.0 / dir;
-  // Σρ = s·Σd − ΣL, ΣLρ = s·ΣLd − ΣL² (ρ = level-space residual).
-  float pR = scale * sd - sL;
-  float pLR = scale * sLd - sLL;
-  float sBB = sLL * (1.0 / 49.0);
-  float sAB = sL * (1.0 / 7.0) - sBB;
-  float sAA = 16.0 - 2.0 * sL * (1.0 / 7.0) + sBB;
-  float sBR = pLR * dir * (1.0 / 49.0);
-  float sAR = (pR - pLR * (1.0 / 7.0)) * dir * (1.0 / 7.0);
-  bool spread = 16.0 * sLL != sL * sL;
-  float det = sAA * sBB - sAB * sAB;
-  float idet = 1.0 / det;
-  // Endpoints clamp to [0,255], NOT the block's value range: for a scalar
-  // channel, endpoints beyond the data range are often genuinely optimal.
-  float q0f = floor(clamp(r0f + (sBB * sAR - sAB * sBR) * idet, 0.0, 255.0) + 0.5);
-  float q1f = floor(clamp(r1f + (sAA * sBR - sAB * sAR) * idet, 0.0, 255.0) + 0.5);
-  float dd0 = q0f - r0f;
-  float dd1 = q1f - r1f;
-  float eNew = -2.0 * (dd0 * sAR + dd1 * sBR) + dd0 * dd0 * sAA + 2.0 * dd0 * dd1 * sAB + dd1 * dd1 * sBB;
-  bool acc = spread && abs(det) > 1e-3 && q0f > q1f && eNew < 0.0;
-  return acc ? uvec2(uint(q0f), uint(q1f)) : uvec2(r0, r1);
-}
-
 void main() {
   ivec2 base = ivec2(gl_FragCoord.xy) * 4;
   ivec2 maxXY = uSrcSize - ivec2(1);
@@ -94,15 +68,15 @@ void main() {
   vec2 vmin = vec2(min(min(mnr.x, mnr.y), min(mnr.z, mnr.w)), min(min(mng.x, mng.y), min(mng.z, mng.w)));
   vec2 vmax = vec2(max(max(mxr.x, mxr.y), max(mxr.z, mxr.w)), max(max(mxg.x, mxg.y), max(mxg.z, mxg.w)));
 
-  // Seed endpoints at the exact per-channel extremes (round-to-nearest).
-  // Flat blocks get nudged apart to keep the 6-interp mode (r0 > r1).
-  uvec2 r0 = uvec2(clamp(floor(vmax + 0.5), vec2(0.0), vec2(255.0)));
-  uvec2 r1 = uvec2(clamp(floor(vmin + 0.5), vec2(0.0), vec2(255.0)));
-  if (r0.x == r1.x) { if (r1.x > 0u) { r1.x = r1.x - 1u; } else { r0.x = r0.x + 1u; } }
-  if (r0.y == r1.y) { if (r1.y > 0u) { r1.y = r1.y - 1u; } else { r0.y = r0.y + 1u; } }
-
-  vec2 r0f = vec2(r0);
-  vec2 scale = vec2(7.0) / (vec2(r1) - r0f);
+  // Seed endpoints at the per-channel extremes (round-to-nearest); spans
+  // ≤ 7 (incl. flat blocks) seed a 7-wide window instead — lossless.
+  vec2 vhi = clamp(floor(vmax + 0.5), vec2(0.0), vec2(255.0));
+  vec2 vlo = clamp(floor(vmin + 0.5), vec2(0.0), vec2(255.0));
+  bvec2 small = lessThanEqual(vhi - vlo, vec2(7.0));
+  vec2 r1f = vec2(small.x ? min(vlo.x, 248.0) : vlo.x, small.y ? min(vlo.y, 248.0) : vlo.y);
+  vec2 r0f = vec2(small.x ? r1f.x + 7.0 : vhi.x, small.y ? r1f.y + 7.0 : vhi.y);
+  // Pass-1 levels from the seed range inset by ~5.5/256 of the span.
+  vec2 scale = vec2(7.3125) / (r1f - r0f);
 
   // Pass 1 — moments only.
   vec2 sL = vec2(0.0);
@@ -112,39 +86,57 @@ void main() {
   for (int q = 0; q < 4; q++) {
     vec4 dr = vr[q] - r0f.x;
     vec4 dg = vg[q] - r0f.y;
-    vec4 Lr = floor(dr * scale.x + 0.5);
-    vec4 Lg = floor(dg * scale.y + 0.5);
+    vec4 Lr = floor(dr * scale.x + 0.34375);
+    vec4 Lg = floor(dg * scale.y + 0.34375);
     sL += vec2(dot(Lr, vec4(1.0)), dot(Lg, vec4(1.0)));
     sLL += vec2(dot(Lr, Lr), dot(Lg, Lg));
     sd += vec2(dot(dr, vec4(1.0)), dot(dg, vec4(1.0)));
     sLd += vec2(dot(Lr, dr), dot(Lg, dg));
   }
 
-  uvec2 fr = refit(sL.x, sLL.x, sd.x, sLd.x, r0.x, r1.x);
-  uvec2 fg = refit(sL.y, sLL.y, sd.y, sLd.y, r0.y, r1.y);
-  uvec2 n0 = uvec2(fr.x, fg.x);
-  uvec2 n1 = uvec2(fr.y, fg.y);
+  // Refit: least-squares line v ≈ r0 + α + β·L through the pass-1 levels.
+  // Endpoints clamp to [0,255], NOT the block's value range.
+  vec2 den = 16.0 * sLL - sL * sL;
+  vec2 beta = (16.0 * sLd - sL * sd) / den;
+  vec2 e0 = r0f + (sd - beta * sL) * (1.0 / 16.0);
+  vec2 q0f = floor(clamp(e0, vec2(0.0), vec2(255.0)) + 0.5);
+  vec2 q1f = floor(clamp(e0 + 7.0 * beta, vec2(0.0), vec2(255.0)) + 0.5);
+  bvec2 acc = bvec2(den.x > 0.0 && q0f.x > q1f.x, den.y > 0.0 && q0f.y > q1f.y);
+  vec2 n0f = vec2(acc.x ? q0f.x : r0f.x, acc.y ? q0f.y : r0f.y);
+  vec2 n1f = vec2(acc.x ? q1f.x : r1f.x, acc.y ? q1f.y : r1f.y);
 
-  // Pass 2 — levels against the FINAL endpoints, packed as Σ L·8^k:
-  // iA = pixels 0..7, iB = pixels 8..15.
-  vec2 n0f = vec2(n0);
-  vec2 sc2 = vec2(7.0) / (vec2(n1) - n0f);
-  vec4 Lr[4];
-  vec4 Lg[4];
+  // Pass 2 — levels against the refit endpoints, packed as Σ L·8^k
+  // (A = pixels 0..7, B = pixels 8..15), plus ΣL for the offset round.
+  vec2 sc2 = vec2(7.0) / (n1f - n0f);
+  vec4 pk = vec4(0.0); // (Ax, Bx, Ay, By)
+  vec2 sL2 = vec2(0.0);
   for (int q = 0; q < 4; q++) {
-    Lr[q] = clamp(floor((vr[q] - n0f.x) * sc2.x + 0.5), vec4(0.0), vec4(7.0));
-    Lg[q] = clamp(floor((vg[q] - n0f.y) * sc2.y + 0.5), vec4(0.0), vec4(7.0));
+    vec4 Lr = clamp(floor((vr[q] - n0f.x) * sc2.x + 0.5), vec4(0.0), vec4(7.0));
+    vec4 Lg = clamp(floor((vg[q] - n0f.y) * sc2.y + 0.5), vec4(0.0), vec4(7.0));
+    vec4 w = (q & 1) == 1 ? W1 : W0;
+    bool hi = q >= 2;
+    float pr = dot(Lr, w);
+    float pg = dot(Lg, w);
+    pk += vec4(hi ? 0.0 : pr, hi ? pr : 0.0, hi ? 0.0 : pg, hi ? pg : 0.0);
+    sL2 += vec2(dot(Lr, vec4(1.0)), dot(Lg, vec4(1.0)));
   }
-  uint iAx = lvlToIdx(uint(dot(Lr[0], W0) + dot(Lr[1], W1)));
-  uint iBx = lvlToIdx(uint(dot(Lr[2], W0) + dot(Lr[3], W1)));
-  uint iAy = lvlToIdx(uint(dot(Lg[0], W0) + dot(Lg[1], W1)));
-  uint iBy = lvlToIdx(uint(dot(Lg[2], W0) + dot(Lg[3], W1)));
+
+  // Offset round: shift both endpoints by the rounded mean residual of the
+  // shipped levels.
+  vec2 res = sd + 16.0 * (r0f - n0f) - (n1f - n0f) * sL2 * (1.0 / 7.0);
+  vec2 sh = clamp(floor(res * (1.0 / 16.0) + 0.5), -n1f, vec2(255.0) - n0f);
+  uvec2 m0 = uvec2(n0f + sh);
+  uvec2 m1 = uvec2(n1f + sh);
+  uint iAx = lvlToIdx(uint(pk.x));
+  uint iBx = lvlToIdx(uint(pk.y));
+  uint iAy = lvlToIdx(uint(pk.z));
+  uint iBy = lvlToIdx(uint(pk.w));
 
   // BC5 block = R half (bytes 0..7) || G half (bytes 8..15) = 4 u32s.
   outColor = uvec4(
-    n0.x | (n1.x << 8u) | (iAx << 16u),
+    m0.x | (m1.x << 8u) | (iAx << 16u),
     (iAx >> 16u) | (iBx << 8u),
-    n0.y | (n1.y << 8u) | (iAy << 16u),
+    m0.y | (m1.y << 8u) | (iAy << 16u),
     (iAy >> 16u) | (iBy << 8u)
   );
 }
