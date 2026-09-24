@@ -27,7 +27,7 @@
 // option and `device`/`adapter` options apply to the WebGPU path only.
 
 import { Encoder, type EncodedLevelBytes, type EncoderConstructor } from './Encoder.js'
-import { generateGpuMipChain } from './gpuMipgen.js'
+import { generateGpuMipChain, warmGpuMipgen } from './gpuMipgen.js'
 import { generateMipChain, padToBlockMultiple, type MipLevel } from './mipgen.js'
 import {
   selectFormat,
@@ -211,6 +211,12 @@ interface GpuTier {
   selection: FormatSelection & { format: TextureFormat; encoderClass: EncoderConstructor }
 }
 
+/** A WebGPU encoder for one call, and whether it's a shared (long-lived) one. */
+interface AcquiredEncoder {
+  encoder: Encoder
+  shared: boolean
+}
+
 /** A resolved WebGL2 tier: context + a selection guaranteed usable. */
 interface GlTier {
   gl: WebGL2RenderingContext
@@ -266,6 +272,17 @@ function getSharedGpu(): Promise<SharedGpu | null> {
   return sharedGpuPromise
 }
 
+/** The shared device's encoder for `cls`, created (and its pipeline compile
+ *  started) on first request. */
+function sharedWebGPUEncoder(shared: SharedGpu, cls: EncoderConstructor): Encoder {
+  let enc = shared.encoders.get(cls)
+  if (!enc) {
+    enc = new cls({ device: shared.device, adapter: shared.adapter, ownsDevice: false })
+    shared.encoders.set(cls, enc)
+  }
+  return enc
+}
+
 // One WebGL2 encoder per class on the shared context, reused across
 // `compressTexture()` calls like the WebGPU encoders above: creating one
 // compiles and links its fragment program (tens of ms), and a live encoder
@@ -314,6 +331,85 @@ export function releaseSharedGpuResources(): void {
       shared.device.destroy()
     })
     .catch(() => {})
+}
+
+// ---------------------------------------------------------------------------
+// Prewarming
+// ---------------------------------------------------------------------------
+
+/** The `compressTexture()` options that decide which encoder runs. */
+export type PrewarmTarget = Pick<
+  CompressOptions,
+  'hint' | 'quality' | 'preferredFormat' | 'colorSpace' | 'mipmaps' | 'forceWebGL'
+>
+
+export interface PrewarmResult {
+  /** Per target, in order: the backend and format `compressTexture()` will use for it on this client. */
+  targets: { backend: 'webgpu' | 'webgl' | 'none'; format: TextureFormat | null }[]
+  /** Wall time until every selected pipeline finished compiling. */
+  ms: number
+}
+
+/**
+ * Compile, ahead of first use, exactly the shaders `compressTexture()` will
+ * need on this client for the given option sets — the same capability-based
+ * selection (BC on desktop, ASTC/ETC2 on mobile, the WebGL2 tier when
+ * WebGPU is missing or `forceWebGL` is set), so nothing unused compiles.
+ * Creates the shared WebGPU device (or WebGL2 context) and the per-format
+ * encoders that later `compressTexture()` calls reuse, plus the GPU
+ * mip-generation pipeline when a target sets `mipmaps`. Pass your texture
+ * option presets as-is; unrelated keys are ignored.
+ *
+ * Call it as early as possible (app boot); textures requested before it
+ * settles simply wait for the same in-flight compiles. Never rejects:
+ * compile errors surface on the first encode that needs the pipeline. Only
+ * the default shared path is warmed — calls passing their own `device` or
+ * `adapter` build their own encoders.
+ */
+export async function prewarmCompressTexture(
+  targets: PrewarmTarget | readonly PrewarmTarget[] = {},
+): Promise<PrewarmResult> {
+  const t0 = performance.now()
+  const list: readonly PrewarmTarget[] = Array.isArray(targets) ? targets : [targets as PrewarmTarget]
+  const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator
+  const shared = hasWebGPU && list.some(t => !t.forceWebGL) ? await getSharedGpu().catch(() => null) : null
+  const waits: Promise<unknown>[] = []
+  let mipgenWarmed = false
+  const out: PrewarmResult['targets'] = []
+  for (const t of list) {
+    const { hint = 'color', quality = 'high', preferredFormat, colorSpace = 'srgb', mipmaps = false } = t
+    const opts = { colorSpace, preferredFormat, quality }
+    // Tier 1 — the WebGPU shared device, as compressTexture() resolves it.
+    if (!t.forceWebGL && shared) {
+      const sel = selectFormat(shared.adapter, hint, opts)
+      if (sel.format && sel.encoderClass) {
+        waits.push(sharedWebGPUEncoder(shared, sel.encoderClass).ready())
+        if (mipmaps && !mipgenWarmed && !needsWriteTextureWorkaround(shared.adapter)) {
+          mipgenWarmed = true
+          waits.push(warmGpuMipgen(shared.device))
+        }
+        out.push({ backend: 'webgpu', format: sel.format })
+        continue
+      }
+    }
+    // Tier 2 — the shared WebGL2 context.
+    const gl = getSharedWebGLContext()
+    if (gl) {
+      const sel = selectWebGLFormat(detectWebGLCapabilities(gl), hint, opts)
+      if (sel.format && sel.encoderClass) {
+        try {
+          waits.push(sharedWebGLEncoder(gl, sel.encoderClass).ready())
+        } catch {
+          // Allocation failure: the encode path reports it.
+        }
+        out.push({ backend: 'webgl', format: sel.format })
+        continue
+      }
+    }
+    out.push({ backend: 'none', format: null })
+  }
+  await Promise.allSettled(waits)
+  return { targets: out, ms: performance.now() - t0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,14 +633,42 @@ export async function compressTextureToBytes(
     }
   }
 
+  // Acquire the encoder BEFORE decoding: a new encoder starts compiling its
+  // pipeline (and a mipped WebGPU encode its mip pipeline) right away, so
+  // shader compilation overlaps the image fetch/decode instead of following
+  // it. Already-warm encoders (shared, prewarmed) make this a no-op.
+  const gpuEncoder = gpu ? acquireWebGPUEncoder(gpu) : null
+  // Rejections are observed where the encoder is awaited; keep a decode
+  // failure from surfacing them as unhandled.
+  gpuEncoder?.catch(() => {})
+  let glEncoder: WebGLBlockEncoder | null = null
+  let glEncoderError: unknown = null
+  if (gl) {
+    try {
+      glEncoder = sharedWebGLEncoder(gl.gl, gl.selection.encoderClass)
+    } catch (e) {
+      glEncoderError = e
+    }
+  }
+
   const tDecode = performance.now()
-  const bitmap = await sourceToBitmap(source, svgSize)
+  let bitmap: ImageBitmap
+  try {
+    bitmap = await sourceToBitmap(source, svgSize)
+  } catch (e) {
+    // Non-shared encoders (caller's device / adapter) die with this call.
+    void gpuEncoder?.then(
+      a => a.shared || a.encoder.destroy(),
+      () => {},
+    )
+    throw e
+  }
   const decodeMs = performance.now() - tDecode
 
   // Tier 1: WebGPU compute path. Tier 2: WebGL2 fragment-shader fallback.
   // Tier 3: uncompressed RGBA8.
-  if (gpu) return encodeViaWebGPU(gpu)
-  const viaWebGL = gl ? encodeViaWebGL(gl) : null
+  if (gpu && gpuEncoder) return encodeViaWebGPU(gpu, await gpuEncoder)
+  const viaWebGL = gl ? encodeViaWebGL(gl, glEncoder, glEncoderError) : null
   if (viaWebGL) return viaWebGL
 
   console.warn(
@@ -597,29 +721,33 @@ export async function compressTextureToBytes(
     }
   }
 
+  /** Instantiate the WebGPU encoder: reuse a caller-provided device; on the
+   *  shared path reuse (or create and cache) the per-format shared encoder;
+   *  otherwise (adapter-only callers) have the encoder's `create()` request
+   *  its own device. Also starts the mip pipeline compile for mipped
+   *  encodes that will take the GPU chain. */
+  async function acquireWebGPUEncoder({ adapter, shared, selection }: GpuTier): Promise<AcquiredEncoder> {
+    const EncoderCtor = selection.encoderClass
+    let acquired: AcquiredEncoder
+    if (providedDevice) {
+      acquired = { encoder: new EncoderCtor({ device: providedDevice, adapter, ownsDevice: false }), shared: false }
+    } else if (shared) {
+      acquired = { encoder: sharedWebGPUEncoder(shared, EncoderCtor), shared: true }
+    } else {
+      acquired = { encoder: await EncoderCtor.create(), shared: false }
+    }
+    if (mipmaps && !needsWriteTextureWorkaround(adapter)) {
+      warmGpuMipgen(acquired.encoder.device).catch(() => {})
+    }
+    return acquired
+  }
+
   /** Encode on the WebGPU tier. The selection is already validated, so any
    *  failure from here throws rather than falling back. */
-  async function encodeViaWebGPU({ adapter, shared, selection }: GpuTier): Promise<CompressResult> {
-    // Instantiate the encoder. Reuse a caller-provided device; on the shared
-    // path reuse (or create and cache) the per-format shared encoder;
-    // otherwise (adapter-only callers) have the encoder's `create()` request
-    // its own device.
-    const EncoderCtor = selection.encoderClass
-    let encoder: Encoder
-    let sharedEncoder = false
-    if (providedDevice) {
-      encoder = new EncoderCtor({ device: providedDevice, adapter, ownsDevice: false })
-    } else if (shared) {
-      sharedEncoder = true
-      let cached = shared.encoders.get(EncoderCtor)
-      if (!cached) {
-        cached = new EncoderCtor({ device: shared.device, adapter: shared.adapter, ownsDevice: false })
-        shared.encoders.set(EncoderCtor, cached)
-      }
-      encoder = cached
-    } else {
-      encoder = await EncoderCtor.create()
-    }
+  async function encodeViaWebGPU(
+    { adapter, selection }: GpuTier,
+    { encoder, shared: sharedEncoder }: AcquiredEncoder,
+  ): Promise<CompressResult> {
     // Shared encoders outlive this call; their GPU resources are released
     // via releaseSharedGpuResources(), not per-result destroy().
     const destroyEncoder = sharedEncoder ? () => {} : () => encoder.destroy()
@@ -737,10 +865,13 @@ export async function compressTextureToBytes(
    * (→ uncompressed) rather than throwing — the fallback's job is to keep
    * producing a working texture.
    */
-  function encodeViaWebGL({ gl, selection }: GlTier): CompressResult | null {
-    let encoder: WebGLBlockEncoder | null = null
+  function encodeViaWebGL(
+    { selection }: GlTier,
+    encoder: WebGLBlockEncoder | null,
+    acquireError: unknown,
+  ): CompressResult | null {
     try {
-      encoder = sharedWebGLEncoder(gl, selection.encoderClass)
+      if (!encoder) throw acquireError
       if (!mipmaps) {
         const bytes = encoder.encodeToBytes(bitmap, { flipY })
         if (transcodeKey) {

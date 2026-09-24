@@ -90,7 +90,10 @@ export { rasterizeSvg, type RasterizeSvgOptions, type SvgRasterSize } from './sv
 // from `result.levels` (or `result.fallbackBitmap` on the RGBA8 fallback).
 export {
   compressTextureToBytes,
+  prewarmCompressTexture,
   releaseSharedGpuResources,
+  type PrewarmResult,
+  type PrewarmTarget,
   type CompressResult,
   type CompressOptions,
   type CompressTextureSource,

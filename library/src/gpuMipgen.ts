@@ -73,6 +73,11 @@ function getDownsamplePipeline(device: GPUDevice): Promise<GPUComputePipeline> {
   return pipeline
 }
 
+/** Compile the mip-generation pipeline for `device` ahead of first use. */
+export async function warmGpuMipgen(device: GPUDevice): Promise<void> {
+  await getDownsamplePipeline(device)
+}
+
 /**
  * Upload `source` and generate its full mip chain on the GPU. Returns an
  * `rgba8unorm` texture with `gpuMipLevelCount` levels whose dimensions
