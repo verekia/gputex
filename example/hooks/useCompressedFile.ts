@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
 
-import { compressTexture } from 'gputex/three'
+import { compressTexture, prewarmCompressTexture } from 'gputex/three'
 
 import { forceWebGL } from '../lib/forceWebGL'
 
-import type { CompressResult } from 'gputex/three'
+import type { CompressOptions, CompressResult } from 'gputex/three'
 import type { Texture } from 'three'
 
 import type { EncodeInfo } from './useGputex'
@@ -17,6 +17,17 @@ import type { EncodeInfo } from './useGputex'
 // content hash, so re-dropping the same file skips decode + encode
 // (~30 ms instead of hundreds).
 
+const DEMO_OPTIONS: CompressOptions = { hint: 'color', colorSpace: 'srgb', svgSize: 1024, cache: true, forceWebGL }
+
+// Compile the demo's encoder at page load, while the user picks a file: the
+// same selection compressTexture() makes for DEMO_OPTIONS on this client, so
+// the first drop doesn't pay a cold shader compile.
+if (typeof window !== 'undefined') {
+  void prewarmCompressTexture(DEMO_OPTIONS).then(({ targets, ms }) =>
+    console.log(`[GPUtex] prewarmed ${targets.map(t => `${t.backend} ${t.format}`).join(', ')} in ${ms.toFixed(1)} ms`),
+  )
+}
+
 export function useCompressedFile(file: File | null, onResult?: (info: EncodeInfo) => void): Texture | null {
   const [texture, setTexture] = useState<Texture | null>(null)
 
@@ -26,7 +37,7 @@ export function useCompressedFile(file: File | null, onResult?: (info: EncodeInf
     let result: CompressResult | null = null
     setTexture(null)
 
-    compressTexture(file, { hint: 'color', colorSpace: 'srgb', svgSize: 1024, cache: true, forceWebGL })
+    compressTexture(file, DEMO_OPTIONS)
       .then(r => {
         if (cancelled) {
           r.destroy()

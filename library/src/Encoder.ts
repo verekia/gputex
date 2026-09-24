@@ -331,6 +331,16 @@ export abstract class Encoder {
     this._pipelineReady.catch(() => {})
   }
 
+  /**
+   * Resolves once the encoder's compute pipeline(s) have compiled. Encodes
+   * await this themselves; call it to compile ahead of first use (see
+   * `prewarmCompressTexture()`). Rejects with the compile error, if any.
+   */
+  async ready(): Promise<void> {
+    await this._pipelineReady
+    if (this._prepPipelineReady) await this._prepPipelineReady
+  }
+
   destroy(): void {
     this._cachedSrcTex?.destroy()
     if (this._cachedPrepPlanes) for (const t of this._cachedPrepPlanes) t.destroy()

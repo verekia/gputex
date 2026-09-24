@@ -60,18 +60,19 @@ export type WebGLEncoderConstructor<T extends WebGLBlockEncoder = WebGLBlockEnco
   create(gl?: WebGL2RenderingContext | null): T
 }
 
+// Compile without querying COMPILE_STATUS: that query blocks until the
+// driver finishes, which would defeat KHR_parallel_shader_compile. Errors
+// surface when the program's link status is checked (_ensureLinked).
 function compileShader(gl: WebGL2RenderingContext, type: number, source: string, label: string): WebGLShader {
   const shader = gl.createShader(type)
   if (!shader) throw new Error(`${label}: gl.createShader failed`)
   gl.shaderSource(shader, source)
   gl.compileShader(shader)
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(shader)
-    gl.deleteShader(shader)
-    const kind = type === gl.VERTEX_SHADER ? 'vertex' : 'fragment'
-    throw new Error(`${label}: ${kind} shader compile failed: ${log}`)
-  }
   return shader
+}
+
+interface ParallelShaderCompile {
+  readonly COMPLETION_STATUS_KHR: number
 }
 
 export abstract class WebGLBlockEncoder {
@@ -93,6 +94,12 @@ export abstract class WebGLBlockEncoder {
   protected _uSrc: WebGLUniformLocation | null = null
   protected _uSrcSize: WebGLUniformLocation | null = null
   protected _uFlipY: WebGLUniformLocation | null = null
+  // Program compile/link runs asynchronously in the driver where
+  // KHR_parallel_shader_compile is available; the link status (and the
+  // uniform lookups, which would block on it) are deferred to first use.
+  private _parallel: ParallelShaderCompile | null = null
+  private _shaders: WebGLShader[] = []
+  private _linked = false
 
   // Per-encoder resource cache (mirrors the WebGPU Encoder). Sequential
   // encodes reuse the source texture while its size is stable and the
@@ -138,37 +145,72 @@ export abstract class WebGLBlockEncoder {
     const vao = gl.createVertexArray()
     if (!program || !vao) throw new Error(`${this.label}: failed to allocate WebGL program/VAO`)
 
+    // Enabling the extension (getExtension does) lets the driver compile and
+    // link in the background; ready() polls its completion flag.
+    this._parallel = gl.getExtension('KHR_parallel_shader_compile') as ParallelShaderCompile | null
     const vert = compileShader(gl, gl.VERTEX_SHADER, vertSource, this.label)
     const frag = compileShader(gl, gl.FRAGMENT_SHADER, this.fragSource(), this.label)
     gl.attachShader(program, vert)
     gl.attachShader(program, frag)
     gl.linkProgram(program)
-    // Shader objects are no longer needed once linked.
-    gl.deleteShader(vert)
-    gl.deleteShader(frag)
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      const log = gl.getProgramInfoLog(program)
-      gl.deleteProgram(program)
-      throw new Error(`${this.label}: WebGL program link failed: ${log}`)
-    }
-
+    this._shaders = [vert, frag]
     this._program = program
     this._vao = vao
+  }
+
+  /** Check the link (blocking until it completes), then look up uniforms. */
+  private _ensureLinked(): void {
+    if (this._linked) return
+    const gl = this.gl
+    const program = this._program
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const logs = [gl.getProgramInfoLog(program), ...this._shaders.map(sh => gl.getShaderInfoLog(sh))]
+      throw new Error(`${this.label}: WebGL program link failed: ${logs.filter(Boolean).join('\n')}`)
+    }
+    // Shader objects are no longer needed once linked.
+    for (const sh of this._shaders) gl.deleteShader(sh)
+    this._shaders = []
     this._uSrc = gl.getUniformLocation(program, 'uSrc')
     this._uSrcSize = gl.getUniformLocation(program, 'uSrcSize')
     this._uFlipY = gl.getUniformLocation(program, 'uFlipY')
+    this._linked = true
+  }
+
+  /**
+   * Resolves once the fragment program has compiled and linked, without
+   * blocking the main thread where the driver exposes
+   * KHR_parallel_shader_compile (elsewhere the final status check waits for
+   * the driver). Encodes check this themselves; call it to compile ahead of
+   * first use (see `prewarmCompressTexture()`). Rejects on a compile/link
+   * error.
+   */
+  async ready(): Promise<void> {
+    const gl = this.gl
+    const ext = this._parallel
+    while (
+      ext &&
+      !this._linked &&
+      !gl.isContextLost() &&
+      !gl.getProgramParameter(this._program, ext.COMPLETION_STATUS_KHR)
+    ) {
+      await new Promise(resolve => setTimeout(resolve, 4))
+    }
+    if (gl.isContextLost()) throw new Error(`${this.label}WebGLEncoder: WebGL context lost`)
+    this._ensureLinked()
   }
 
   /** Release the GL program, VAO and cached textures. The shared context itself is left intact. */
   destroy(): void {
     const gl = this.gl
     if (!gl.isContextLost()) {
+      for (const sh of this._shaders) gl.deleteShader(sh)
       gl.deleteProgram(this._program)
       gl.deleteVertexArray(this._vao)
       if (this._srcTex) gl.deleteTexture(this._srcTex)
       if (this._outTex) gl.deleteTexture(this._outTex)
       if (this._fbo) gl.deleteFramebuffer(this._fbo)
     }
+    this._shaders = []
     this._srcTex = null
     this._srcBitmap = null
     this._outTex = null
@@ -235,6 +277,7 @@ export abstract class WebGLBlockEncoder {
   encodeToBytes(source: WebGLEncoderImageSource, { flipY = false }: { flipY?: boolean } = {}): WebGLEncodeBytesResult {
     const gl = this.gl
     if (gl.isContextLost()) throw new Error(`${this.label}WebGLEncoder: WebGL context lost`)
+    this._ensureLinked()
 
     const width = (source as { width: number }).width
     const height = (source as { height: number }).height

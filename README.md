@@ -339,6 +339,34 @@ the encode and reuse the encoder's cached GPU resources. The result's
 whole chain is encoded in a single GPU submission (one compute pass, one
 readback) rather than a round trip per level.
 
+#### Prewarming shaders
+
+A cold shader cache (first visit, browser or driver update) costs ~120–160 ms
+of pipeline compilation per WebGPU encoder, ~60–90 ms per WebGL2 program,
+paid by the first texture that needs it. `prewarmCompressTexture()` compiles
+ahead of time exactly what `compressTexture()` will use on this client for
+the option sets you pass — the same capability-based selection (BC on
+desktop, ASTC/ETC2 on mobile, the WebGL2 tier when WebGPU is missing or
+`forceWebGL` is set), so nothing unused compiles:
+
+```ts
+import { prewarmCompressTexture } from 'gputex'
+
+// At app boot — pass your texture option presets as-is.
+prewarmCompressTexture([{ hint: 'color', quality: 'low', mipmaps: true }, { hint: 'normal' }])
+```
+
+It creates the shared device (or WebGL2 context) and the per-format encoders
+later `compressTexture()` calls reuse, plus the mip-generation pipeline when
+a target sets `mipmaps`, and resolves with the chosen backend/format per
+target once everything compiled. Compilation runs off the main thread
+(`createComputePipelineAsync`; `KHR_parallel_shader_compile` on WebGL2), and
+it never rejects — compile errors surface on the first encode. Calls that
+pass their own `device`/`adapter` build their own encoders and aren't
+warmed. Independently of prewarming, every `compressTexture()` call starts
+its encoder's compile before decoding the image, so compile and decode
+overlap.
+
 ## Benchmarks
 
 Measured on an Apple Silicon GPU (`metal-3`, M3) in Chrome with the `/eval`
