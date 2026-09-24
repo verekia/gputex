@@ -105,9 +105,11 @@ export type ProgressFn = (message: string) => void
 const PSNR_THRESHOLDS: Record<string, number | null> = {
   // `${format}:${image}` — measured on the committed test images (2026-07,
   // Apple/metal-3, mode-6-only BC7 with the 8-step power iteration) minus
-  // ~0.15 dB. bc5 rows re-pinned 2026-07 for the moment-form kernel (pass-2
-  // reprojection returned at parity cost; +0.09..0.22 dB, ≥ the exhaustive
-  // reference on every ref-gated row). BC7 rows on multi-modal content (packed-*, rock-color) sit at
+  // ~0.15 dB. bc5 rows re-pinned 2026-09 for the inset-seed kernel (inset
+  // pass-1 partition + regression refit + offset round, lossless spans ≤ 7):
+  // measured normal 53.39, rock-normal 1k/2k/4k 46.68/45.23/44.09, wood-
+  // normal 1k/2k/4k 48.46/49.38/47.98 (min f16/f32) — +0.18..0.30 dB over
+  // the CPU reference on every ref-gated row. BC7 rows on multi-modal content (packed-*, rock-color) sit at
   // the mode-6 exhaustive reference level — the mode 1 candidate that
   // lifted them ~+1.3 dB was dropped for speed (see bc7_fast_f16.wgsl).
   // Unlisted rows and the `:normal` colour-format cross-card entries are
@@ -117,7 +119,7 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   // displacement 45.85, wood-roughness 40.64, wood-displacement 43.36 (min
   // f16/f32).
   'bc1:color': 29.17,
-  'bc5:normal': 53.0,
+  'bc5:normal': 53.2,
   'bc7:color': 31.9,
   // ASTC colour rows re-pinned 2026-09 for the opaque CEM 8 bit budgets
   // (QUANT_192 endpoints + 4-bit weights on wide blocks): measured
@@ -142,7 +144,7 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc1:rock-color-1k': 33.9,
   'bc7:rock-color-1k': 38.1,
   'astc:rock-color-1k': 38.0,
-  'bc5:rock-normal-1k': 46.35,
+  'bc5:rock-normal-1k': 46.5,
   'bc1:rock-roughness-1k': 39.1,
   'bc1:rock-ao-1k': 41.48,
   'bc1:rock-displacement-1k': 45.7,
@@ -164,9 +166,9 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'astc:wood-roughness-1k': 59.85,
   'astc:wood-displacement-1k': 65.1,
   'bc7:rock-color-2k': 38.75,
-  'bc5:rock-normal-2k': 44.9,
+  'bc5:rock-normal-2k': 45.05,
   'bc7:rock-color-4k': 39.15,
-  'bc5:rock-normal-4k': 43.75,
+  'bc5:rock-normal-4k': 43.9,
   'bc1:wood-color-1k': 41.9,
   'bc7:wood-color-1k': 49.4,
   'astc:wood-color-1k': 50.7,
@@ -183,13 +185,13 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'etc2:rock-color-1k': 33.7,
   'etc2:rock-roughness-1k': 39.99,
   'etc2:wood-color-1k': 39.06,
-  'bc5:wood-normal-1k': 48.0,
+  'bc5:wood-normal-1k': 48.3,
   'bc1:wood-roughness-1k': 40.49,
   'bc1:wood-displacement-1k': 43.21,
   'bc7:wood-color-2k': 50.65,
-  'bc5:wood-normal-2k': 48.95,
+  'bc5:wood-normal-2k': 49.2,
   'bc7:wood-color-4k': 51.7,
-  'bc5:wood-normal-4k': 47.65,
+  'bc5:wood-normal-4k': 47.8,
 }
 
 // Worst-EASY-block gate: over blocks that the CPU reference encodes
