@@ -83,8 +83,8 @@ export interface CompressOptions {
    * device has one — BC1 on desktop-class GPUs, ETC2 RGB8 on mobile-class
    * ones — halving GPU memory at visibly lower quality on smooth content.
    * Ignored for `hint: 'colorWithAlpha'` and `hint: 'normal'` (the 4-bpp
-   * formats can't carry them). On the WebGL fallback tier only BC1 is
-   * available at 'low'.
+   * formats can't carry them). The WebGL fallback tier makes the same
+   * choice (BC1 where s3tc is exposed, else ETC2 RGB8).
    */
   quality?: FormatQuality
   /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */

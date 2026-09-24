@@ -55,7 +55,7 @@ The fallback chain is **WebGPU → WebGL2 → uncompressed RGBA8**. The `backend
 
 Notes on the WebGL path:
 
-- It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present. ETC2 is WebGPU-only (no WebGL fragment encoder), so `quality: 'low'` on the WebGL tier can only deliver BC1.
+- It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), `WEBGL_compressed_texture_s3tc` (BC1), or `WEBGL_compressed_texture_etc` (ETC2). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present; ETC2 RGB8 (`WEBGL_compressed_texture_etc`) is the `quality: 'low'` pick on devices without s3tc and the final opaque-colour fallback.
 - The `device` / `adapter` options apply to the WebGPU path only.
 - All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas. `compressTexture()` keeps one compiled encoder per format on it across calls (released by `releaseSharedGpuResources()`).
 - `forceWebGL: true` (or `loader.forceWebGL = true`) takes this path on WebGPU-capable browsers too — handy for testing it. In the example app, add `?forcewebgl=1` to any page to encode and render through WebGL2.
@@ -443,7 +443,7 @@ consumer can run the same validation.
 - WebGPU (primary) **or** WebGL2 (fallback) — almost every current browser has at least one
 - A compressed-texture capability for compressed output:
   - WebGPU: `texture-compression-bc` (desktop), `texture-compression-astc` (mobile), or `texture-compression-etc2` (mobile)
-  - WebGL2: `EXT_texture_compression_bptc` / `_rgtc`, `WEBGL_compressed_texture_astc`, or `WEBGL_compressed_texture_s3tc`
+  - WebGL2: `EXT_texture_compression_bptc` / `_rgtc`, `WEBGL_compressed_texture_astc`, `WEBGL_compressed_texture_s3tc`, or `WEBGL_compressed_texture_etc`
 - Falls back to uncompressed RGBA8 when no compressed format is available on either backend
 
 ## Device-specific workarounds

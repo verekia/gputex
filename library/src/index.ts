@@ -44,6 +44,7 @@ export {
   BC5WebGLEncoder,
   BC7WebGLEncoder,
   ASTC4x4WebGLEncoder,
+  ETC2WebGLEncoder,
   createWebGLContext,
   getSharedWebGLContext,
   isWebGLAvailable,

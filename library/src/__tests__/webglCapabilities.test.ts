@@ -11,7 +11,7 @@ function stubGL(supported: readonly string[]): ExtensionProvider {
 describe('detectWebGLCapabilities', () => {
   it('reports all formats absent on a bare context', () => {
     const caps = detectWebGLCapabilities(stubGL([]))
-    expect(caps).toEqual({ bptc: false, rgtc: false, s3tc: false, s3tcSrgb: false, astc: false })
+    expect(caps).toEqual({ bptc: false, rgtc: false, s3tc: false, s3tcSrgb: false, astc: false, etc: false })
   })
 
   it('maps each extension string to its capability flag', () => {
@@ -20,6 +20,7 @@ describe('detectWebGLCapabilities', () => {
     expect(detectWebGLCapabilities(stubGL(['WEBGL_compressed_texture_s3tc'])).s3tc).toBe(true)
     expect(detectWebGLCapabilities(stubGL(['WEBGL_compressed_texture_s3tc_srgb'])).s3tcSrgb).toBe(true)
     expect(detectWebGLCapabilities(stubGL(['WEBGL_compressed_texture_astc'])).astc).toBe(true)
+    expect(detectWebGLCapabilities(stubGL(['WEBGL_compressed_texture_etc'])).etc).toBe(true)
   })
 
   it('detects a typical desktop set (bptc + rgtc + s3tc)', () => {
@@ -31,7 +32,7 @@ describe('detectWebGLCapabilities', () => {
         'WEBGL_compressed_texture_s3tc_srgb',
       ]),
     )
-    expect(caps).toEqual({ bptc: true, rgtc: true, s3tc: true, s3tcSrgb: true, astc: false })
+    expect(caps).toEqual({ bptc: true, rgtc: true, s3tc: true, s3tcSrgb: true, astc: false, etc: false })
   })
 
   it('throws on an object without getExtension', () => {

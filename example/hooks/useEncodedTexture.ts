@@ -10,6 +10,8 @@ import {
   BC7Encoder,
   BC7WebGLEncoder,
   detectWebGLCapabilities,
+  ETC2Encoder,
+  ETC2WebGLEncoder,
   getSharedWebGLContext,
 } from 'gputex'
 import type { EncoderConstructor, TextureFormat, WebGLCapabilities, WebGLEncoderConstructor } from 'gputex'
@@ -30,12 +32,13 @@ import type { Texture } from 'three'
 // encoded by its WebGL2 fragment-shader twin instead (see lib/forceWebGL).
 
 // WebGL2 twin of each WebGPU encoder, plus the extension that makes the
-// output sampleable there. ETC2 has no WebGL encoder.
+// output sampleable there.
 const WEBGL_TWINS = new Map<EncoderConstructor, { cls: WebGLEncoderConstructor; cap: keyof WebGLCapabilities }>([
   [BC1Encoder, { cls: BC1WebGLEncoder, cap: 's3tc' }],
   [BC5Encoder, { cls: BC5WebGLEncoder, cap: 'rgtc' }],
   [BC7Encoder, { cls: BC7WebGLEncoder, cap: 'bptc' }],
   [ASTC4x4Encoder, { cls: ASTC4x4WebGLEncoder, cap: 'astc' }],
+  [ETC2Encoder, { cls: ETC2WebGLEncoder, cap: 'etc' }],
 ])
 
 export interface EncodedInfo {
