@@ -57,7 +57,8 @@ Notes on the WebGL path:
 
 - It needs the matching WebGL2 compressed-texture extension to be sampleable: `EXT_texture_compression_bptc` (BC7), `EXT_texture_compression_rgtc` (BC5), `WEBGL_compressed_texture_astc` (ASTC), or `WEBGL_compressed_texture_s3tc` (BC1). Selection mirrors the WebGPU side, with BC1 added as a broadly-available last resort for **opaque** colour when neither BPTC nor ASTC is present. ETC2 is WebGPU-only (no WebGL fragment encoder), so `quality: 'low'` on the WebGL tier can only deliver BC1.
 - The `device` / `adapter` options apply to the WebGPU path only.
-- All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas.
+- All encoding happens on one shared, off-screen WebGL2 context; nothing is drawn to a visible canvas. `compressTexture()` keeps one compiled encoder per format on it across calls (released by `releaseSharedGpuResources()`).
+- `forceWebGL: true` (or `loader.forceWebGL = true`) takes this path on WebGPU-capable browsers too — handy for testing it. In the example app, add `?forcewebgl=1` to any page to encode and render through WebGL2.
 
 ## Usage
 
@@ -312,6 +313,7 @@ const tex = buildCompressedTexture([bytes], TextureFormat.BC7_SRGB)
 | `cache`           | `boolean`                     | `false`   | Session-scoped in-memory cache; repeat calls skip decode + encode (see below)                                            |
 | `cacheKey`        | `string`                      | derived   | Explicit cache identity (skips content hashing; makes pixel sources cacheable)                                           |
 | `device`          | `GPUDevice`                   | —         | Reuse an existing WebGPU device instead of creating one                                                                  |
+| `forceWebGL`      | `boolean`                     | `false`   | Skip WebGPU and encode on the WebGL2 fallback (testing); pair with `new WebGPURenderer({ forceWebGL: true })`            |
 
 #### In-memory transcode cache
 

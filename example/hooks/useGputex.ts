@@ -5,6 +5,8 @@ import type { SvgRasterSize, TextureHint } from 'gputex'
 import { useLoader } from '@react-three/fiber'
 import { GputexLoader } from 'gputex/three'
 
+import { forceWebGL } from '../lib/forceWebGL'
+
 import type { Texture } from 'three'
 
 export interface EncodeInfo {
@@ -37,6 +39,7 @@ export function useGputex(
   onLoad?: (texture: Texture | Texture[], result: EncodeInfo | null) => void,
 ): Texture | Texture[] {
   const textures = useLoader(GputexLoader, url, loader => {
+    loader.forceWebGL = forceWebGL
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
     if (options?.svgSize !== undefined) loader.svgSize = options.svgSize
@@ -56,6 +59,7 @@ export function useGputex(
 
 useGputex.preload = (url: string | string[], options?: UseGputexOptions) => {
   useLoader.preload(GputexLoader, url, loader => {
+    loader.forceWebGL = forceWebGL
     if (options?.hint !== undefined) loader.hint = options.hint
     if (options?.colorSpace !== undefined) loader.colorSpace = options.colorSpace
     if (options?.svgSize !== undefined) loader.svgSize = options.svgSize

@@ -17,6 +17,7 @@ import { float, max, sqrt, texture as textureNode, vec4 } from 'three/tsl'
 import { MeshBasicNodeMaterial } from 'three/webgpu'
 
 import { useEncodedTexture } from '../hooks/useEncodedTexture'
+import { forceWebGL } from '../lib/forceWebGL'
 import TestNav from './TestNav'
 
 import type { Texture } from 'three'
@@ -145,9 +146,11 @@ const CompareView = ({
         // every texel (0.5 → 0.73 — washed-out lavender). sRGB pages
         // round-trip (decode on sample, encode on output), so they keep the
         // default. NB: on the webgpu build the prop is `renderer`, not `gl`.
+        // ?forcewebgl=1 renders through three's WebGL2 backend (see lib/forceWebGL).
         renderer={{
           outputColorSpace: colorSpace === 'linear' ? LinearSRGBColorSpace : SRGBColorSpace,
           toneMapping: NoToneMapping,
+          forceWebGL,
         }}
       >
         <Suspense fallback={null}>
@@ -214,6 +217,10 @@ const CompareView = ({
           <>
             <div className="border-t border-white/10 pt-2">
               <Row label="Format" value={info?.format ?? (loading ? 'Encoding…' : '—')} />
+              <Row
+                label="Backend"
+                value={info ? (info.backend === 'webgl' ? 'WebGL2 (fragment)' : 'WebGPU (compute)') : '—'}
+              />
               <Row label="Resolution" value={info ? `${info.width} × ${info.height} px` : '—'} />
               <Row label="Encode time" value={info ? `${info.encodeMs.toFixed(2)} ms` : '—'} />
             </div>
