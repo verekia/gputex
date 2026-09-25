@@ -49,6 +49,29 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var smp: sampler;
 
+// Float -> u32 for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so bitcast(x + MAGIC) ^ MAGIC_BITS == x. WGSL's u32(float) is a
+// SATURATING conversion (compares + selects around the convert).
+const MAGIC = 8388608.0;
+const MAGIC_BITS = 0x4B000000u;
+fn fu2(x: vec2<f32>) -> vec2<u32> {
+  return bitcast<vec2<u32>>(x + MAGIC) ^ vec2<u32>(MAGIC_BITS);
+}
+
+// Edge blocks: one quad's R and G from four clamped texel loads, in gather
+// order (x=(0,1) y=(1,1) z=(1,0) w=(0,0)).
+struct QuadRG {
+  r: vec4<f32>,
+  g: vec4<f32>,
+};
+fn load_quad(qo: vec2<i32>, mx: vec2<i32>) -> QuadRG {
+  let cx = textureLoad(src_tex, min(qo + vec2<i32>(0, 1), mx), 0);
+  let cy = textureLoad(src_tex, min(qo + vec2<i32>(1, 1), mx), 0);
+  let cz = textureLoad(src_tex, min(qo + vec2<i32>(1, 0), mx), 0);
+  let cw = textureLoad(src_tex, min(qo, mx), 0);
+  return QuadRG(vec4<f32>(cx.r, cy.r, cz.r, cw.r), vec4<f32>(cx.g, cy.g, cz.g, cw.g));
+}
+
 // 8 packed 3-bit levels → BC4 indices (0→0, 7→1, L→L+1 otherwise).
 fn lvl_to_idx(x: u32) -> u32 {
   let y = ((x & 0x6DB6DBu) + 0x249249u) ^ (x & 0x924924u);
@@ -78,24 +101,30 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   var vr: array<vec4<f32>, 4>;
   var vg: array<vec4<f32>, 4>;
   if (u32(base.x) + 4u <= params.width && u32(base.y) + 4u <= params.height) {
-    let inv_size = vec2<f32>(1.0, 1.0) / vec2<f32>(textureDimensions(src_tex));
-    for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-      let qo = vec2<u32>((q & 1u) * 2u, (q >> 1u) * 2u);
-      let cc = (vec2<f32>(base) + vec2<f32>(qo) + vec2<f32>(1.0, 1.0)) * inv_size;
-      vr[q] = textureGather(0, src_tex, smp, cc) * 255.0;
-      vg[q] = textureGather(1, src_tex, smp, cc) * 255.0;
-    }
+    // Unrolled: runtime-indexed vr[q]/vg[q] writes cost ~1% GPU.
+    let cc = (vec2<f32>(base) + 1.0) / vec2<f32>(textureDimensions(src_tex));
+    vr[0] = textureGather(0, src_tex, smp, cc) * 255.0;
+    vg[0] = textureGather(1, src_tex, smp, cc) * 255.0;
+    vr[1] = textureGather(0, src_tex, smp, cc, vec2<i32>(2, 0)) * 255.0;
+    vg[1] = textureGather(1, src_tex, smp, cc, vec2<i32>(2, 0)) * 255.0;
+    vr[2] = textureGather(0, src_tex, smp, cc, vec2<i32>(0, 2)) * 255.0;
+    vg[2] = textureGather(1, src_tex, smp, cc, vec2<i32>(0, 2)) * 255.0;
+    vr[3] = textureGather(0, src_tex, smp, cc, vec2<i32>(2, 2)) * 255.0;
+    vg[3] = textureGather(1, src_tex, smp, cc, vec2<i32>(2, 2)) * 255.0;
   } else {
     let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
-    for (var q: u32 = 0u; q < 4u; q = q + 1u) {
-      let qo = base + vec2<i32>(i32(q & 1u) * 2, i32(q >> 1u) * 2);
-      let cx = textureLoad(src_tex, clamp(qo + vec2<i32>(0, 1), vec2<i32>(0), mx), 0);
-      let cy = textureLoad(src_tex, clamp(qo + vec2<i32>(1, 1), vec2<i32>(0), mx), 0);
-      let cz = textureLoad(src_tex, clamp(qo + vec2<i32>(1, 0), vec2<i32>(0), mx), 0);
-      let cw = textureLoad(src_tex, clamp(qo, vec2<i32>(0), mx), 0);
-      vr[q] = vec4<f32>(cx.r, cy.r, cz.r, cw.r) * 255.0;
-      vg[q] = vec4<f32>(cx.g, cy.g, cz.g, cw.g) * 255.0;
-    }
+    let l0 = load_quad(base + vec2<i32>(0, 0), mx);
+    let l1 = load_quad(base + vec2<i32>(2, 0), mx);
+    let l2 = load_quad(base + vec2<i32>(0, 2), mx);
+    let l3 = load_quad(base + vec2<i32>(2, 2), mx);
+    vr[0] = l0.r * 255.0;
+    vg[0] = l0.g * 255.0;
+    vr[1] = l1.r * 255.0;
+    vg[1] = l1.g * 255.0;
+    vr[2] = l2.r * 255.0;
+    vg[2] = l2.g * 255.0;
+    vr[3] = l3.r * 255.0;
+    vg[3] = l3.g * 255.0;
   }
   let mnr = min(min(vr[0], vr[1]), min(vr[2], vr[3]));
   let mxr = max(max(vr[0], vr[1]), max(vr[2], vr[3]));
@@ -169,8 +198,8 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   // so the error on these indices can only drop, under any decoder).
   let res = sd + 16.0 * (r0f - n0f) - (n1f - n0f) * sL2 * (1.0 / 7.0);
   let sh = clamp(floor(res * (1.0 / 16.0) + 0.5), -n1f, vec2<f32>(255.0) - n0f);
-  let m0 = vec2<u32>(n0f + sh);
-  let m1 = vec2<u32>(n1f + sh);
+  let m0 = fu2(n0f + sh);
+  let m1 = fu2(n1f + sh);
   let iAx = lvl_to_idx(u32(pk.x));
   let iBx = lvl_to_idx(u32(pk.y));
   let iAy = lvl_to_idx(u32(pk.z));

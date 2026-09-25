@@ -48,6 +48,20 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
+// Float -> u32 for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so bitcast(x + MAGIC) ^ MAGIC_BITS == x (or masked, for small
+// fields). WGSL's u32(float) is a SATURATING conversion (compares + selects
+// around the convert): the gray path's per-texel ones cost ~5% on gray maps.
+// (The colour path's endpoint conversions measured faster left as u32().)
+const MAGIC = 8388608.0;
+const MAGIC_BITS = 0x4B000000u;
+fn fbits(x: f32, mask: u32) -> u32 {
+  return bitcast<u32>(x + MAGIC) & mask;
+}
+fn fu(x: f32) -> u32 {
+  return bitcast<u32>(x + MAGIC) ^ MAGIC_BITS;
+}
+
 // Mode-4 endpoint-precision charge (8-bit² covariance units; see the f16
 // module's header — 0.15 there).
 const N4: f32 = 38.1;
@@ -155,15 +169,15 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
       let k0 = 0.5 - e0 * k1;
       for (var k: u32 = 0u; k < 8u; k = k + 1u) {
         let sg = clamp(floor(pixels[k].x * k1 + k0), 0.0, 15.0);
-        glo = glo | (u32(sg) << (k * 4u));
+        glo = glo | (fbits(sg, 15u) << (k * 4u));
       }
       for (var k: u32 = 8u; k < 16u; k = k + 1u) {
         let sg = clamp(floor(pixels[k].x * k1 + k0), 0.0, 15.0);
-        ghi = ghi | (u32(sg) << ((k - 8u) * 4u));
+        ghi = ghi | (fbits(sg, 15u) << ((k - 8u) * 4u));
       }
     }
-    var u0 = u32(e0);
-    var u1 = u32(e1);
+    var u0 = fu(e0);
+    var u1 = fu(e1);
     if ((glo & 0x8u) != 0u) {
       let t = u0; u0 = u1; u1 = t;
       glo = ~glo; ghi = ~ghi;

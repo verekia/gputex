@@ -32,12 +32,17 @@ struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, y0: u32, 
 @group(0) @binding(2) var<uniform> params: Params;
 alias h = f16;
 alias h3 = vec3<f16>;
+// Float -> u32 for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so bitcast(x + MAGIC) ^ MAGIC_BITS == x. WGSL's u32(float) is a
+// SATURATING conversion (compares + selects around the convert).
+const MAGIC = 8388608.0;
+const MAGIC_BITS = 0x4B000000u;
 
+// Packed in float (r·2048 + g·32 + b, exact), then ONE conversion (−2% GPU
+// over three u32() conversions).
 fn to565(c: h3) -> u32 {
-  let r = u32(clamp(floor(c.r * h(31.0) + h(0.5)), h(0.0), h(31.0)));
-  let g = u32(clamp(floor(c.g * h(63.0) + h(0.5)), h(0.0), h(63.0)));
-  let b = u32(clamp(floor(c.b * h(31.0) + h(0.5)), h(0.0), h(31.0)));
-  return (r << 11u) | (g << 5u) | b;
+  let q = clamp(floor(c * h3(31.0, 63.0, 31.0) + h(0.5)), h3(0.0), h3(31.0, 63.0, 31.0));
+  return bitcast<u32>(dot(vec3<f32>(q), vec3<f32>(2048.0, 32.0, 1.0)) + MAGIC) ^ MAGIC_BITS;
 }
 
 // Decode a 565 endpoint to [0,1]: (x*527+23)>>6 (6-bit: 259/33) —
@@ -73,34 +78,53 @@ fn order565(a: u32, b: u32) -> vec2<u32> {
 // ulp is a whole level — which skews the closed-form solve by several
 // levels) — plus the block's exact squared error against this palette.
 // Level → BC1 index: 0→0 (c0), 1→2, 2→3, 3→1 (c1); packed LUT
-// (0x78 >> 2L) & 3.
+// (0x78 >> 2L) & 3, with 2L read out of the float by the MAGIC trick (a
+// u32(L) conversion per texel cost ~5% GPU).
 struct Moments { sL: f32, sLL: f32, sU: vec3<f32>, sLu: vec3<f32>, indices: u32, err: f32 };
+struct MomAcc { sL: f16, sLL: f16, err: f16, sU: vec3<f32>, sLu: vec3<f32>, indices: u32 };
+fn project(a: ptr<function, MomAcc>, v: h3, p0: h3, dir: h3, inv: f16, k: u32) {
+  let u = v - p0;
+  let L = clamp(floor(dot(u, dir) * inv + h(0.5)), h(0.0), h(3.0));
+  (*a).sL = (*a).sL + L;
+  (*a).sLL = (*a).sLL + L * L;
+  let uf = vec3<f32>(u);
+  (*a).sU = (*a).sU + uf;
+  (*a).sLu = (*a).sLu + f32(L) * uf;
+  (*a).indices = (*a).indices | (((0x78u >> (bitcast<u32>(f32(L) * 2.0 + MAGIC) & 7u)) & 3u) << (k * 2u));
+  let e = u - L * h(1.0 / 3.0) * dir;
+  (*a).err = (*a).err + dot(e, e);
+}
+// Unrolled over constant texel indices: a pix[k] loop kept the array in
+// indexable memory (−3.5% GPU unrolled; the f16/f32 sums then reassociate
+// differently, moving ~0.5% of blocks by ±0.001 dB).
 fn moments(pix: ptr<function, array<h3, 16>>, c0: u32, c1: u32) -> Moments {
   let p0 = from565(c0);
   let dir = from565(c1) - p0;
   let inv = h(3.0) / dot(dir, dir);
-  var sL = h(0.0);
-  var sLL = h(0.0);
+  var a = MomAcc(h(0.0), h(0.0), h(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0u);
+  project(&a, (*pix)[0], p0, dir, inv, 0u);
+  project(&a, (*pix)[1], p0, dir, inv, 1u);
+  project(&a, (*pix)[2], p0, dir, inv, 2u);
+  project(&a, (*pix)[3], p0, dir, inv, 3u);
+  project(&a, (*pix)[4], p0, dir, inv, 4u);
+  project(&a, (*pix)[5], p0, dir, inv, 5u);
+  project(&a, (*pix)[6], p0, dir, inv, 6u);
+  project(&a, (*pix)[7], p0, dir, inv, 7u);
+  project(&a, (*pix)[8], p0, dir, inv, 8u);
+  project(&a, (*pix)[9], p0, dir, inv, 9u);
+  project(&a, (*pix)[10], p0, dir, inv, 10u);
+  project(&a, (*pix)[11], p0, dir, inv, 11u);
+  project(&a, (*pix)[12], p0, dir, inv, 12u);
+  project(&a, (*pix)[13], p0, dir, inv, 13u);
+  project(&a, (*pix)[14], p0, dir, inv, 14u);
+  project(&a, (*pix)[15], p0, dir, inv, 15u);
   var out: Moments;
-  out.sU = vec3<f32>(0.0);
-  out.sLu = vec3<f32>(0.0);
-  out.indices = 0u;
-  var err = h(0.0);
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let u = (*pix)[k] - p0;
-    let L = clamp(floor(dot(u, dir) * inv + h(0.5)), h(0.0), h(3.0));
-    sL = sL + L;
-    sLL = sLL + L * L;
-    let uf = vec3<f32>(u);
-    out.sU = out.sU + uf;
-    out.sLu = out.sLu + f32(L) * uf;
-    out.indices = out.indices | (((0x78u >> (u32(L) * 2u)) & 3u) << (k * 2u));
-    let e = u - L * h(1.0 / 3.0) * dir;
-    err = err + dot(e, e);
-  }
-  out.err = f32(err);
-  out.sL = f32(sL);
-  out.sLL = f32(sLL);
+  out.sU = a.sU;
+  out.sLu = a.sLu;
+  out.indices = a.indices;
+  out.err = f32(a.err);
+  out.sL = f32(a.sL);
+  out.sLL = f32(a.sLL);
   return out;
 }
 
@@ -170,7 +194,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   var mean = h3(0.0);
   var gd = h(0.0);
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
+    let p = min(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), mx);
     let px = h3(textureLoad(src_tex, p, 0).rgb);
     pix[i] = px; mn = min(mn, px); mxv = max(mxv, px);
     mean = mean + px;

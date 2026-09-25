@@ -24,11 +24,14 @@ uniform int uFlipY;     // 1 = sample bottom-up (matches Three.js flipY)
 
 layout(location = 0) out uvec4 outColor;
 
+// Float -> uint for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa (same trick as bc1.wgsl).
+const float MAGIC = 8388608.0;
+const uint MAGIC_BITS = 0x4B000000u;
+
 uint to565(vec3 c) {
-  uint r = uint(clamp(floor(c.r * 31.0 + 0.5), 0.0, 31.0));
-  uint g = uint(clamp(floor(c.g * 63.0 + 0.5), 0.0, 63.0));
-  uint b = uint(clamp(floor(c.b * 31.0 + 0.5), 0.0, 31.0));
-  return (r << 11) | (g << 5) | b;
+  vec3 q = clamp(floor(c * vec3(31.0, 63.0, 31.0) + 0.5), vec3(0.0), vec3(31.0, 63.0, 31.0));
+  return floatBitsToUint(dot(q, vec3(2048.0, 32.0, 1.0)) + MAGIC) ^ MAGIC_BITS;
 }
 
 // 5/6-bit → 8-bit: (x*527+23)>>6 (6-bit: 259/33) — round-to-nearest scaling,
@@ -64,22 +67,40 @@ vec3 gPixels[16];
 // the projection MOMENTS a refit needs: ΣL, ΣL², Σu, ΣL·u (u = v − p0).
 // Level → BC1 index: 0→0 (c0), 1→2, 2→3, 3→1 (c1): packed LUT (0x78 >> 2L) & 3.
 struct Moments { float sL; float sLL; vec3 sU; vec3 sLu; uint indices; float err; };
+void project(inout Moments m, vec3 v, vec3 p0, vec3 dir, float inv, uint k) {
+  vec3 u = v - p0;
+  float L = clamp(floor(dot(u, dir) * inv + 0.5), 0.0, 3.0);
+  m.sL += L;
+  m.sLL += L * L;
+  m.sU += u;
+  m.sLu += L * u;
+  m.indices |= ((0x78u >> (floatBitsToUint(L * 2.0 + MAGIC) & 7u)) & 3u) << (k * 2u);
+  vec3 e = u - L * (1.0 / 3.0) * dir;
+  m.err += dot(e, e);
+}
+// Unrolled over constant texel indices, like bc1.wgsl (same summation
+// order, so the two stay byte-identical).
 Moments moments(uint c0, uint c1) {
   vec3 p0 = from565(c0);
   vec3 dir = from565(c1) - p0;
   float inv = 3.0 / dot(dir, dir);
   Moments m = Moments(0.0, 0.0, vec3(0.0), vec3(0.0), 0u, 0.0);
-  for (int k = 0; k < 16; k++) {
-    vec3 u = gPixels[k] - p0;
-    float L = clamp(floor(dot(u, dir) * inv + 0.5), 0.0, 3.0);
-    m.sL += L;
-    m.sLL += L * L;
-    m.sU += u;
-    m.sLu += L * u;
-    m.indices |= ((0x78u >> (uint(L) * 2u)) & 3u) << (uint(k) * 2u);
-    vec3 e = u - L * (1.0 / 3.0) * dir;
-    m.err += dot(e, e);
-  }
+  project(m, gPixels[0], p0, dir, inv, 0u);
+  project(m, gPixels[1], p0, dir, inv, 1u);
+  project(m, gPixels[2], p0, dir, inv, 2u);
+  project(m, gPixels[3], p0, dir, inv, 3u);
+  project(m, gPixels[4], p0, dir, inv, 4u);
+  project(m, gPixels[5], p0, dir, inv, 5u);
+  project(m, gPixels[6], p0, dir, inv, 6u);
+  project(m, gPixels[7], p0, dir, inv, 7u);
+  project(m, gPixels[8], p0, dir, inv, 8u);
+  project(m, gPixels[9], p0, dir, inv, 9u);
+  project(m, gPixels[10], p0, dir, inv, 10u);
+  project(m, gPixels[11], p0, dir, inv, 11u);
+  project(m, gPixels[12], p0, dir, inv, 12u);
+  project(m, gPixels[13], p0, dir, inv, 13u);
+  project(m, gPixels[14], p0, dir, inv, 14u);
+  project(m, gPixels[15], p0, dir, inv, 15u);
   return m;
 }
 
@@ -163,7 +184,7 @@ void main() {
   vec3 mean = vec3(0.0);
   float gd = 0.0;
   for (int i = 0; i < 16; i++) {
-    ivec2 p = clamp(base + ivec2(i & 3, i >> 2), ivec2(0), maxXY);
+    ivec2 p = min(base + ivec2(i & 3, i >> 2), maxXY);
     int sy = (uFlipY != 0) ? (uSrcSize.y - 1 - p.y) : p.y;
     vec3 c = texelFetch(uSrc, ivec2(p.x, sy), 0).rgb;
     gPixels[i] = c;
