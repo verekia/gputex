@@ -31,7 +31,7 @@ export {
 // Concrete WebGPU encoders.
 export { BC1Encoder } from './BC1Encoder.js'
 export { BC5Encoder } from './BC5Encoder.js'
-export { BC7Encoder, type BC7EncoderOptions } from './BC7Encoder.js'
+export { BC7Encoder } from './BC7Encoder.js'
 export { ASTC4x4Encoder } from './ASTC4x4Encoder.js'
 export { ETC2Encoder } from './ETC2Encoder.js'
 

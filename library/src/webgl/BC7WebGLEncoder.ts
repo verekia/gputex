@@ -1,4 +1,4 @@
-// BC7 (BPTC) mode-6 WebGL2 fallback encoder. 16 bytes / block, RGBA.
+// BC7 (BPTC) mode-6 / mode-4 WebGL2 fallback encoder. 16 bytes / block, RGBA.
 //
 // Needs EXT_texture_compression_bptc to be sampled. Default desktop colour
 // format on the WebGL path (matches the WebGPU BC7 choice). See
