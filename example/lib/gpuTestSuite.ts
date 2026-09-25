@@ -109,40 +109,44 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   // pass-1 partition + regression refit + offset round, lossless spans ≤ 7):
   // measured normal 53.39, rock-normal 1k/2k/4k 46.68/45.23/44.09, wood-
   // normal 1k/2k/4k 48.46/49.38/47.98 (min f16/f32) — +0.18..0.30 dB over
-  // the CPU reference on every ref-gated row. BC7 rows on multi-modal content (packed-*, rock-color) sit at
-  // the mode-6 exhaustive reference level — the mode 1 candidate that
-  // lifted them ~+1.3 dB was dropped for speed (see bc7_fast_f16.wgsl).
-  // Unlisted rows and the `:normal` colour-format cross-card entries are
-  // record-only.
+  // the CPU reference on every ref-gated row. BC7 colour rows re-pinned
+  // 2026-09 for the always-on mode 6 / mode 4 kernel (per-block covariance
+  // decision): measured color 35.99, alpha 46.21, packed-256/512/1024/2048/
+  // 4096 37.34/39.58/41.87/46.48/50.40, rock-color-1k/2k/4k 40.52/40.55/
+  // 40.41, wood-color-1k/2k/4k 50.16/50.72/51.81 (min f16/f32) — +2..8 dB
+  // over the mode-6 exhaustive CPU reference on decorrelated content;
+  // the gray rows take the unchanged gray tail. Unlisted rows and the
+  // `:normal` colour-format cross-card entries are record-only.
   // BC1 rows re-pinned 2026-09 (solid-colour path for near-flat blocks +
   // moment-form refit passes): measured color 29.32, rock-ao 41.63, rock-
   // displacement 45.85, wood-roughness 40.64, wood-displacement 43.36 (min
   // f16/f32).
   'bc1:color': 29.17,
   'bc5:normal': 53.2,
-  'bc7:color': 31.9,
+  'bc7:color': 35.84,
   // ASTC colour rows re-pinned 2026-09 for the opaque CEM 8 bit budgets
   // (QUANT_192 endpoints + 4-bit weights on wide blocks): measured
   // 32.03 / 37.83 / 38.16 / 50.88 (color / packed / rock / wood, min
   // f16/f32), up from 31.97 / 37.59 / 37.52 / 49.60.
   'astc:color': 31.88,
-  // 1024² committed alpha card (2026-07): bc7 38.43/38.38 f16/f32, astc
-  // 37.28/37.27 — both above the exhaustive reference on this content.
-  'bc7:alpha': 38.2,
+  // 1024² committed alpha card: bc7 46.21/46.23 f16/f32 (2026-09, mode 4
+  // splits the independent alpha into its own plane), astc 37.28/37.27
+  // (2026-07) — both above the exhaustive reference on this content.
+  'bc7:alpha': 46.06,
   'astc:alpha': 37.1,
   'bc1:normal': null,
   'bc7:normal': null,
   'astc:normal': null,
   // Real textures (2026-07 baselines, min over f16/f32, minus ~0.15 dB).
-  'bc7:packed-256': 32.75,
-  'bc7:packed-512': 35.0,
+  'bc7:packed-256': 37.18,
+  'bc7:packed-512': 39.43,
   'bc1:packed-1024': 34.75,
-  'bc7:packed-1024': 37.65,
+  'bc7:packed-1024': 41.71,
   'astc:packed-1024': 37.68,
-  'bc7:packed-2048': 45.15,
-  'bc7:packed-4096': 49.95,
+  'bc7:packed-2048': 46.32,
+  'bc7:packed-4096': 50.25,
   'bc1:rock-color-1k': 33.9,
-  'bc7:rock-color-1k': 38.1,
+  'bc7:rock-color-1k': 40.36,
   'astc:rock-color-1k': 38.0,
   'bc5:rock-normal-1k': 46.5,
   'bc1:rock-roughness-1k': 39.1,
@@ -165,12 +169,12 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'astc:rock-displacement-1k': 70.4,
   'astc:wood-roughness-1k': 59.85,
   'astc:wood-displacement-1k': 65.1,
-  'bc7:rock-color-2k': 38.75,
+  'bc7:rock-color-2k': 40.4,
   'bc5:rock-normal-2k': 45.05,
-  'bc7:rock-color-4k': 39.15,
+  'bc7:rock-color-4k': 40.26,
   'bc5:rock-normal-4k': 43.9,
   'bc1:wood-color-1k': 41.9,
-  'bc7:wood-color-1k': 49.4,
+  'bc7:wood-color-1k': 50.0,
   'astc:wood-color-1k': 50.7,
   // ETC2 (observed minus ~0.15 dB). The 2026-09 speed rewrite (gather
   // loads, register-resident lumas, gray-only dual-flip scoring) is ~1.7×
@@ -188,9 +192,9 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc5:wood-normal-1k': 48.3,
   'bc1:wood-roughness-1k': 40.49,
   'bc1:wood-displacement-1k': 43.21,
-  'bc7:wood-color-2k': 50.65,
+  'bc7:wood-color-2k': 50.57,
   'bc5:wood-normal-2k': 49.2,
-  'bc7:wood-color-4k': 51.7,
+  'bc7:wood-color-4k': 51.66,
   'bc5:wood-normal-4k': 47.8,
 }
 

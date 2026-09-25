@@ -1,37 +1,68 @@
-// bc7 "fast" encoder — f16 variant (requires the shader-f16 feature).
-// Same algorithm family as the f32 fast path in bc7.wgsl (principal-axis
-// seed at the exact projection extents → quantise → one projection-based
-// index-assignment pass), tuned for throughput:
+// bc7 encoder — f16 variant (requires the shader-f16 feature). The host
+// selects this module when the device reports shader-f16, falling back to
+// bc7.wgsl (the same algorithm in f32) otherwise.
 //
-//   • All projection math in f16 ([0,1] domain). ~2× ALU throughput on
-//     f16-capable GPUs. The projection direction is pre-scaled by 32:
-//     a shallow block (endpoints ~1/255 apart) has dd = dot(dir,dir) ≈ 1.5e-5,
-//     where 15/dd ≈ 10⁶ overflows f16 (max 65504) to +inf and the products
-//     inside the projection dot are subnormal — the indices turn to garbage
-//     (visible as banding on smooth gradients). Scaling dir by 32 multiplies
-//     the dots by 32 and dd by 1024; s = dot·(32·L/dd₃₂) is the same
-//     quantity with every intermediate in f16's normal range (worst case
-//     inv = 480/0.0157 ≈ 3.0e4 < 65504).
-//   • TWO MODES (mode 4 OPT-IN via the enable_mode4 override constant,
-//     default off and dead-coded at pipeline creation — see the constant's
-//     comment for the measured cost/benefit), decided per block BEFORE
-//     encoding — never encoded both:
-//     mode 6 (single RGBA line, 4-bit indices) by default, mode 4 (rotation:
-//     one channel split into its own scalar plane with 3-bit indices, the
-//     remaining three on a 2-bit line) when the principal axis leaves a
-//     large share of the block's variance unexplained — decorrelated data
-//     (normal maps, channel-packed atlases) where any single 4-D line fails.
-//     The decision reads the covariance already in registers (λ = axisᵀCa,
-//     residual = trace − λ) and costs no extra pass. An encode-both-and-
-//     compare trial was priced at ~2× on exactly this content (see the mode
-//     1 postmortem below) — deciding first keeps it at ~1.2×.
-//   • The two modes SHARE the per-pixel passes (axis matvecs, projection
-//     extents, the index/weight pass runs once with per-thread level count,
-//     index width and packing split) so warps holding a mix of mode-4 and
-//     mode-6 blocks do not execute two disjoint kernels back to back — a
-//     first cut with separate per-mode passes measured 1.77× on normal maps
-//     from exactly that divergence; the only mode-4-extra 16-pixel work is
-//     the cheap scalar-plane pass.
+// TWO BC7 MODES, chosen per block from the covariance and then encoded ONCE
+// by the same per-pixel code:
+//   • mode 6: one RGBA line, 16 levels, 7-bit + p-bit endpoints — the best
+//     single-subset mode when the block's colours lie near one line.
+//   • mode 4: "rotation": one channel (ch) becomes its own scalar plane with
+//     6-bit endpoints at its exact extremes, the other three share a 5-bit
+//     line; a 2-bit and a 3-bit index set, the 3-bit set going to whichever
+//     plane carries more variance (idxMode). Decorrelated channels — normal
+//     maps, channel-packed atlases, noisy chroma in photos, independent
+//     alpha — are exactly where any single 4-D line fails.
+//   Measured on the /eval corpus vs the mode-6-only encoder (hardware
+//   decode, RGBA PSNR): rock colour +1.1..+2.2 dB, normal maps +2.4..+4.5,
+//   packed atlases +0.1..+4.4, proc/cutout/alpha test images +2.6..+7.8;
+//   gray maps unchanged (own tail below), wood colour ±0.03. MSE −33%
+//   geomean over all 41 images. An exhaustive oracle (every mode-6/4/5
+//   candidate encoded, exact error, best kept) sits only 0.1–0.9 dB higher.
+//
+// MODE DECISION (per block, no pixel pass): score = variance a candidate
+// explains net of its quantisation, in the ×256 covariance units below:
+//   mode 6:  λ·(1 − 1/225)                     (λ = principal eigenvalue)
+//   mode 4:  (48/49)·max(λ3, σ²ch) + (8/9)·min(λ3, σ²ch) − N4
+// with σ²ch the scalar channel's variance, λ3 the principal eigenvalue of
+// the other three channels, N4 a flat charge for mode 4's coarser endpoint
+// codes (tuned: 0.1 over-picks mode 4 on smooth wood, 0.3 under-picks it on
+// normal maps). λ3 for all four candidate channels comes from ONE
+// closed-form power step: with Ma = λa, M·a_m = λa − a_c·col_c for the axis
+// restricted to the plane (a_m), and |M·a_m| / |a_m| bounds λ3 from below;
+// the plane's largest variance is a second lower bound that takes over for
+// the channel dominating the axis (a_m ≈ 0 there). Exact per-plane power
+// iterations measured within 0.05 dB of this at +60% GPU. (A per-block
+// per-candidate noise model from the actual 5/6-bit rounding errors of the
+// bbox corners was within ±0.05 dB of the flat N4 — not worth its ALU.)
+//
+// PERFORMANCE DESIGN — both modes run the SAME instructions wherever
+// possible, because content that benefits from mode 4 mixes it with mode 6
+// in nearly every SIMD group (5–10% scattered coverage poisons most warps;
+// the previous gated/opt-in mode 4 paid 1.4–1.5× for exactly that):
+//   • Covariance over d = (px − pixel0)·16, stored back into the pixel
+//     array (block-relative, so f16 sums don't cancel), 10 symmetric
+//     products per pixel instead of 16.
+//   • Power iteration on C/trace seeded with the largest-variance column
+//     (a free step) and ONE step pair; λ = |M²a|^½ comes out of the pair's
+//     normalisation. (The old bbox seed needed 8 iterations; a single step
+//     loses 0.1–0.2 dB.) One further masked step refines the fit axis: mode
+//     4 from its closed-form plane vector, mode 6 on its own axis.
+//   • ONE extents pass along the fit axis keeps every pixel's projection t;
+//     the indices come straight from those (decoded endpoints' positions
+//     along the axis set the level scale — the off-axis part of endpoint
+//     quantisation enters only at second order; exact projection onto the
+//     quantised line measured ≤0.05 dB better). The same pass computes the
+//     mode-4 scalar-plane indices (zero weights for mode 6).
+//   • One quantiser for both endpoint formats (7-bit + p / 5-bit).
+//   • The anchor rule is applied BEFORE indexing: pixel 0 is the d-space
+//     origin, so its index is ⌊offset⌋ and a flip just mirrors the map — no
+//     post-hoc index inversion in either packing path.
+//   • Indices accumulate as float nibble fields (≤ 2^24, exact) for both
+//     modes; mode 4 squeezes its nibbles into 2/3-bit fields at pack time.
+//   Net: GPU time ×0.98 geomean vs the mode-6-only kernel over the corpus
+//   (1K colour/normal textures ≤ +3%, 2K/4K ≈ par, low-mode-4 content
+//   faster). All in f16 ([0,1] domain) except the float index fields.
+//
 //   • GRAY + opaque blocks (every texel R == G == B, A == 1) are a 1-D
 //     problem and take their own tail in the integer domain (no power
 //     iteration, no extents pass, no covariance — −34% GPU on roughness/
@@ -46,32 +77,14 @@
 //       – span > 15: closed-form scalar LSQ refit off BC5-style moments
 //         (ΣL, ΣL², Σv, ΣL·v of the seed levels), with all four p-bit
 //         combinations priced INCLUDING the alpha term, accept-if-better.
-//     RGBA PSNR vs the previous analytic-axis tail (/eval 2026-09): rock
-//     displacement 4K +19.3 dB, wood displacement +3.6, AO +2.0,
-//     roughness +0.8..+1.7; RGB alone improves too. GPU cost ≈ 0: the
-//     covariance moved out of the load loop into the colour path pays for
-//     the refit, and the index pass packs levels as float nibble fields.
-//   • NO least-squares refit, unlike the BC1/BC5/ASTC fast paths: with the
-//     seed already on the principal axis at the exact projection extents,
-//     mode 6's fine 16-level palette leaves the refit ≤0.05 dB on the colour
-//     card, ≤0.15 dB on the normal card and +0.03 dB on the channel-packed
-//     packed-materials atlas — not worth its two extra 16-pixel passes. The
-//     coarse 4-level formats DO need it (dropping it there costs 0.5–1.3 dB).
-//   • A MODE 1 (2-subset) candidate was built and evaluated (2026-07): it
-//     buys ~+1.3 dB on multi-modal content but its candidate evaluation
-//     costs up to ~3× the mode-6 pass on exactly that content — dropped in
-//     favour of the decided (not compared) mode 4 above, which covers the
-//     decorrelated-channel share of that content at a fraction of the cost.
-//     The CPU reference decoder keeps mode 1 support (bc7_ref.ts).
-//   • Indices are packed into two u32 words ON THE FLY during the
-//     projection pass — no array<u32,16> private array. The BC7 anchor
-//     reflection is then just a bitwise NOT of the packed words.
-//   • The 128-bit block is assembled with straight-line constant shifts
-//     instead of a generic write_bits() helper (whose dynamic word indexing
-//     defeats register promotion of the output array).
 //
-// The host selects this module only when the device reports shader-f16,
-// falling back to bc7.wgsl otherwise.
+// HISTORY: a MODE 1 (2-subset) candidate bought ~+1.3 dB on multi-modal
+// content for up to ~3× the pass (2026-07, dropped). Mode 4 then shipped as
+// an opt-in behind a pipeline constant with a variance-ratio gate and
+// separate per-mode passes (+2..3 dB where used, 1.4–1.5× GPU from warp
+// divergence); it is replaced by this always-on design. Mode 5 was priced
+// by the oracle: +0.0–0.3 dB on real textures — not worth a third packing.
+// The CPU reference decoder handles modes 1, 4 and 6 (bc7_ref.ts).
 //
 // MODE 6 BIT LAYOUT (LSB-first): see bc7.wgsl. Summary:
 //   w0: mode(7 bits, 0x40) R0 R1 G0 G1[3:0]
@@ -92,36 +105,22 @@ struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, y0: u32, 
 alias h = f16;
 alias h4 = vec4<f16>;
 
-// Mode-4 gate: encode mode 4 when the principal axis leaves more than
-// MODE4_THETA of the (×256-scaled) total variance unexplained and the block
-// isn't near-flat. Tuned against per-content mode histograms and PSNR.
-const MODE4_THETA: f16 = 0.2;
-const MODE4_FLOOR: f16 = 1.0;
-const MODE4_CONC: f16 = 0.5;
+// Mode-4 endpoint-precision charge (×256 covariance units; see header).
+const N4: f16 = 0.15;
 
-// OPT-IN adaptive mode 4, folded at pipeline creation (WebGPU override
-// constant; default OFF dead-codes the whole path — measured at exact par
-// with the mode-6-only kernel). Rationale: the quality is real (+2.5–2.9 dB
-// on normal maps, +1.9–2.4 on channel-packed atlases) but any warp holding
-// one mode-4 block executes both modes' passes, and content that benefits
-// runs 1.4–1.5×; a θ sweep showed quality and warp-poisoning scale together
-// (no per-block middle ground without subgroup ballots). So the trade is
-// the CALLER's: BC7Encoder({ adaptiveMode4: true }).
-override enable_mode4: bool = false;
-
-// Quantise an ideal endpoint (h4 in [0,1]) to 7-bit + p-bit, choosing the
-// p-bit with the lower quantisation error. `eight` is the decoded value the
-// hardware will interpolate with, back in [0,1].
-struct Ep { seven: vec4<u32>, eight: h4, p: u32 };
-fn pick_ep(ideal01: h4) -> Ep {
-  let ideal = ideal01 * h(255.0);
-  let q0 = clamp(floor(ideal * h(0.5) + h(0.5)), h4(0.0), h4(127.0));        // p=0
-  let e0 = q0 * h(2.0);
-  let q1 = clamp(floor((ideal - h(1.0)) * h(0.5) + h(0.5)), h4(0.0), h4(127.0)); // p=1
-  let e1 = q1 * h(2.0) + h(1.0);
-  let d0 = e0 - ideal; let d1 = e1 - ideal;
-  if (dot(d1, d1) < dot(d0, d0)) { return Ep(vec4<u32>(q1), e1 * h(1.0 / 255.0), 1u); }
-  return Ep(vec4<u32>(q0), e0 * h(1.0 / 255.0), 0u);
+// Nibble-slot compaction for the mode-4 index fields: both index streams are
+// accumulated 4 bits per pixel like mode 6's, then squeezed here.
+// compact2: eight 2-bit values in nibbles → 16 bits; compact3: eight 3-bit
+// values in nibbles → 24 bits.
+fn compact2(x: u32) -> u32 {
+  var y = (x | (x >> 2u)) & 0x0F0F0F0Fu;
+  y = (y | (y >> 4u)) & 0x00FF00FFu;
+  return (y | (y >> 8u)) & 0x0000FFFFu;
+}
+fn compact3(x: u32) -> u32 {
+  var y = (x & 0x07070707u) | ((x >> 1u) & 0x38383838u);
+  y = (y & 0x003F003Fu) | ((y >> 2u) & 0x0FC00FC0u);
+  return (y & 0x00000FFFu) | ((y >> 4u) & 0x00FFF000u);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -133,37 +132,25 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
   let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
-  // Load pass: texels, bbox and the gray test. The covariance moments are
-  // accumulated only on the colour path below (gray blocks never use them).
+  // Load pass: texels, bbox and the gray test (edge blocks of odd-sized
+  // images replicate the last row/column). The covariance is accumulated
+  // only on the colour path below (gray blocks never use it).
   var pix: array<h4, 16>;
   var lo = h4(1.0);
   var hi = h4(0.0);
   var gd = h(0.0);
-  var p0v = h4(0.0);
-  var sd = h4(0.0);
-  var c0v = h4(0.0);
-  var c1v = h4(0.0);
-  var c2v = h4(0.0);
-  var c3v = h4(0.0);
+  let xs = min(vec4<i32>(base.x) + vec4<i32>(0, 1, 2, 3), vec4<i32>(mx.x));
+  let ys = min(vec4<i32>(base.y) + vec4<i32>(0, 1, 2, 3), vec4<i32>(mx.y));
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let p = clamp(base + vec2<i32>(i32(i & 3u), i32(i >> 2u)), vec2<i32>(0), mx);
-    let px = h4(textureLoad(src_tex, p, 0));
+    let px = h4(textureLoad(src_tex, vec2<i32>(xs[i & 3u], ys[i >> 2u]), 0));
     pix[i] = px; lo = min(lo, px); hi = max(hi, px);
     gd = max(gd, max(abs(px.x - px.y), abs(px.x - px.z)));
   }
 
-  // Seed endpoints + per-block mode decision (see header).
-  var seed_lo = lo;
-  var seed_hi = hi;
-  var use4 = false;
-  var cmask = h4(1.0);
-  var ch = 0u;
   if (lo.w == h(1.0) && gd == h(0.0)) {
     // GRAY + opaque: always mode 6, fully specialised tail (see header) —
-    // gray textures are warp-uniform, and routing them through the
-    // parametric shared loop below (runtime index width/split) measured
-    // +28% on displacement content purely from the lost constant-shift
-    // codegen. Integer domain: f16 holds k/255 to ±0.06 levels, so the
+    // gray textures are warp-uniform, and routing them through the shared
+    // colour path measured +28% on displacement content. Integer domain: f16 holds k/255 to ±0.06 levels, so the
     // rounding recovers the exact 8-bit value. 8-bit endpoints E = 2q + p;
     // RGB share q, alpha is 254 + p.
     var gv: array<f32, 16>;
@@ -266,218 +253,230 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     dst[og + 3u] = ihi;
     return;
   }
-  // Covariance moments: d = (px − pixel0)·16, relative to the block's first
-  // pixel so the accumulators scale with the block's span — raw Σv·vᵀ
-  // moments would cancel catastrophically in f16 — and pre-scaled ×16 so
-  // shallow blocks (span ~1/255 → d² ≈ 1e-3) clear the subnormal floor
-  // while full-range sums stay ≤4096. C = Σddᵀ − (Σd)(Σd)ᵀ/16 is the
+
+  // Covariance (10 symmetric products) over d = (px − p0)·16, stored back
+  // into pix: every later pass works block-relative. The ×16 pre-scale
+  // lifts shallow blocks (span ~1/255 → d² ≈ 4e-3) off the f16 subnormal
+  // floor while full-range sums stay ≤ 4096. C = Σddᵀ − (Σd)(Σd)ᵀ/16 is the
   // ×256-scaled covariance.
-  p0v = pix[0];
+  let p0v = pix[0];
+  let p016 = p0v * h(16.0);
+  pix[0] = h4(0.0);
+  var sd = h4(0.0);
+  var cx = h4(0.0);
+  var cy = vec3<f16>(0.0);
+  var cz = vec2<f16>(0.0);
+  var cw = h(0.0);
   for (var i: u32 = 1u; i < 16u; i = i + 1u) {
-    let d = (pix[i] - p0v) * h(16.0);
+    let d = pix[i] * h(16.0) - p016;
+    pix[i] = d;
     sd = sd + d;
-    c0v = c0v + d.x * d;
-    c1v = c1v + d.y * d;
-    c2v = c2v + d.z * d;
-    c3v = c3v + d.w * d;
+    cx = cx + d.x * d;
+    cy = cy + d.y * d.yzw;
+    cz = cz + d.z * d.zw;
+    cw = cw + d.w * d.w;
   }
-  let mean = p0v + sd * h(1.0 / 256.0);
-  // Mean-correction via sd4·sd4ᵀ with sd4 = Σd/4: (Σd)(Σd)ᵀ/16 with every
-  // product ≤4096 (a direct Σd·Σdᵀ could hit 65536 and overflow f16).
+  let md = sd * h(1.0 / 16.0);
+  // Mean correction via sd4 = Σd/4: every product ≤ 4096 (Σd·Σdᵀ could
+  // reach 65536 and overflow f16).
   let sd4 = sd * h(0.25);
-  c0v = c0v - sd4.x * sd4;
-  c1v = c1v - sd4.y * sd4;
-  c2v = c2v - sd4.z * sd4;
-  c3v = c3v - sd4.w * sd4;
-  {
-    var axis = hi - lo;
-    var axis_ok = true;
-    // 8 iterations: 4 was under-converged on noisy 4-D blocks (heavily
-    // downscaled photographic/channel-packed content) — going to 8 measured
-    // +0.75 dB on the normal card, +0.12 colour, +0.08 packed-materials, and
-    // matches the f32 fallback's iteration count. Four extra 4-dot matvecs
-    // per block are noise next to the index pass.
-    for (var it: u32 = 0u; it < 8u; it = it + 1u) {
-      let nv = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
-      let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
-      if (m < h(1e-4)) { axis_ok = false; break; }
-      axis = nv / m;
-    }
-    if (axis_ok) {
-      axis = axis / length(axis);
-      var axisF = axis;
+  cx = cx - sd4.x * sd4;
+  cy = cy - sd4.y * sd4.yzw;
+  cz = cz - sd4.z * sd4.zw;
+  cw = cw - sd4.w * sd4.w;
+  let diag = h4(cx.x, cy.x, cz.x, cw);
+  let trace = diag.x + diag.y + diag.z + diag.w;
 
-      // Mode decision from the covariance already in registers: λ is the
-      // variance the mode-6 line explains, trace − λ what it cannot.
-      let Ca = h4(dot(c0v, axis), dot(c1v, axis), dot(c2v, axis), dot(c3v, axis));
-      let lam = dot(Ca, axis);
-      let diag = h4(c0v.x, c1v.y, c2v.z, c3v.w);
-      let trace = diag.x + diag.y + diag.z + diag.w;
-      let resid = trace - lam;
-      let rc = diag - lam * axis * axis;
-      var rbest = rc.x;
-      if (rc.y > rbest) { ch = 1u; rbest = rc.y; }
-      if (rc.z > rbest) { ch = 2u; rbest = rc.z; }
-      if (rc.w > rbest) { ch = 3u; rbest = rc.w; }
-      use4 = enable_mode4 && resid > MODE4_THETA * trace && trace > MODE4_FLOOR && rbest > MODE4_CONC * resid;
-      if (use4) {
-        // The colour plane is the remaining three channels, handled as
-        // masked 4-vectors so every vec4 pass below applies unchanged.
-        // Branchless mask build — a dynamic component store spills the
-        // vector to scratch on some compilers.
-        cmask = h4(1.0) - h4(h(f32(u32(ch == 0u))), h(f32(u32(ch == 1u))), h(f32(u32(ch == 2u))), h(f32(u32(ch == 3u))));
-        var a3 = (hi - lo) * cmask;
-        var ok3 = true;
-        for (var it: u32 = 0u; it < 2u; it = it + 1u) {
-          let nv = h4(dot(c0v, a3), dot(c1v, a3), dot(c2v, a3), dot(c3v, a3)) * cmask;
-          let m = max(max(abs(nv.x), abs(nv.y)), max(abs(nv.z), abs(nv.w)));
-          if (m < h(1e-4)) { ok3 = false; break; }
-          a3 = nv / m;
-        }
-        if (ok3) {
-          axisF = a3 / length(a3);
-        } else {
-          use4 = false;
-          cmask = h4(1.0);
-        }
-      }
+  // Mode decision + fit axis (see header). Flat blocks (trace ≈ 0) keep
+  // axis 0: every index 0, both endpoints at the mean.
+  var use4 = false;
+  var idx1 = false;
+  var ch = 0u;
+  var cmask = h4(1.0);
+  var axisF = h4(0.0);
+  if (trace > h(1e-3)) {
+    // M = C/trace: eigenvalues ≤ 1, the dominant one ≥ ¼.
+    let s = h(1.0) / trace;
+    let m0 = cx * s;
+    let m1 = h4(cx.y, cy) * s;
+    let m2 = h4(cx.z, cy.y, cz) * s;
+    let m3 = h4(cx.w, cy.z, cz.y, cw) * s;
+    var axis = m0;
+    var dm = diag.x;
+    if (diag.y > dm) { axis = m1; dm = diag.y; }
+    if (diag.z > dm) { axis = m2; dm = diag.z; }
+    if (diag.w > dm) { axis = m3; }
+    axis = axis * inverseSqrt(dot(axis, axis));
+    axis = h4(dot(m0, axis), dot(m1, axis), dot(m2, axis), dot(m3, axis));
+    axis = h4(dot(m0, axis), dot(m1, axis), dot(m2, axis), dot(m3, axis));
+    let a4 = max(dot(axis, axis), h(6.2e-5));
+    axis = axis * inverseSqrt(a4);
+    let lamn = sqrt(sqrt(a4));
+    let lam = lamn * trace;
 
-      // Exact projection extents along the fit axis — ONE shared pass for
-      // both modes (for mode 4 axisF[ch] = 0, so the scalar plane is
-      // invisible to it). (A Rayleigh-quotient span estimate was tried in
-      // place of this pass — it saves 16 dots but costs 0.1–0.8 dB and
-      // 4–10× on the worst-easy-block gate.)
-      var t_min = h(4.0);
-      var t_max = h(-4.0);
-      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-        let t = dot(pix[k] - mean, axisF);
-        t_min = min(t_min, t);
-        t_max = max(t_max, t);
-      }
-      seed_lo = clamp(mean + t_min * axisF, h4(0.0), h4(1.0));
-      seed_hi = clamp(mean + t_max * axisF, h4(0.0), h4(1.0));
-    }
+    // λ3 for all four scalar-channel candidates at once (lane c).
+    let a2 = axis * axis;
+    var nn = h4(0.0);
+    { let wr = lamn * axis.x - axis * m0; nn = nn + wr * wr * h4(0.0, 1.0, 1.0, 1.0); }
+    { let wr = lamn * axis.y - axis * m1; nn = nn + wr * wr * h4(1.0, 0.0, 1.0, 1.0); }
+    { let wr = lamn * axis.z - axis * m2; nn = nn + wr * wr * h4(1.0, 1.0, 0.0, 1.0); }
+    { let wr = lamn * axis.w - axis * m3; nn = nn + wr * wr * h4(1.0, 1.0, 1.0, 0.0); }
+    var l3v = sqrt(nn / max(h4(1.0) - a2, h4(1e-3))) * trace;
+    // Bounds: ≥ the plane's largest variance, ≤ the plane's trace.
+    let d1 = max(max(diag.x, diag.y), max(diag.z, diag.w));
+    let oh1 = diag == h4(d1);
+    let dr = select(diag, h4(-1.0), oh1);
+    let d2 = max(max(dr.x, dr.y), max(dr.z, dr.w));
+    l3v = clamp(l3v, select(h4(d1), h4(d2), oh1), h4(trace) - diag);
+
+    let sb = max(l3v, diag) * h(48.0 / 49.0) + min(l3v, diag) * h(8.0 / 9.0);
+    let smax = max(max(sb.x, sb.y), max(sb.z, sb.w));
+    use4 = smax - N4 > lam * h(224.0 / 225.0);
+    if (sb.y == smax) { ch = 1u; }
+    if (sb.z == smax) { ch = 2u; }
+    if (sb.w == smax) { ch = 3u; }
+    let ohc = select(h4(0.0), h4(1.0), vec4<u32>(ch) == vec4<u32>(0u, 1u, 2u, 3u));
+    idx1 = dot(l3v - diag, ohc) > h(0.0);
+
+    // Fit axis, branch-free for both modes: mode 4 starts from its plane's
+    // closed-form vector (plus a whisker of the bbox diagonal for the
+    // dominant-channel case where that vector vanishes), mode 6 from its
+    // own axis; one masked power step each.
+    let col = select(select(select(m0, m1, ch == 1u), m2, ch == 2u), m3, ch == 3u);
+    cmask = select(h4(1.0), h4(1.0) - ohc, use4);
+    var v = select(axis, (lamn * axis - dot(axis, ohc) * col) * cmask + (hi - lo) * cmask * h(1e-3), use4);
+    v = v * inverseSqrt(max(dot(v, v), h(6.2e-5)));
+    v = h4(dot(m0, v), dot(m1, v), dot(m2, v), dot(m3, v)) * cmask;
+    let vv = dot(v, v);
+    axisF = select(h4(0.0), v * inverseSqrt(max(vv, h(6.2e-5))), vv > h(1e-6));
   }
 
-  // Endpoints, per mode. d0/d1 are the DECODED values the weight pass
-  // projects against.
-  var ep0: Ep;
-  var ep1: Ep;
-  var q0c = vec4<u32>(0u);
-  var q1c = vec4<u32>(0u);
-  var A0 = 0u;
-  var A1 = 0u;
-  var iA = 0u;
-  var iB = 0u;
-  var d0: h4;
-  var d1: h4;
-  var d0a = h(0.0);
-  var sca = h(0.0);
+  // Mode-4 scalar plane: 6-bit codes at the channel's exact extremes, index
+  // map v = ⌊d·ks + os⌋ in d space. chs = 0 leaves ks = 0 for mode 6.
   let chs = h4(1.0) - cmask;
-  ep0 = pick_ep(seed_lo);
-  ep1 = pick_ep(seed_hi);
-  d0 = ep0.eight;
-  d1 = ep1.eight;
-  if (use4) {
-    // Scalar plane (3-bit index set): 6-bit endpoints at the channel's
-    // exact extremes. Its projection is FUSED into the shared weight pass
-    // below — a separate 16-pixel pass here measured +46% on normal maps
-    // (mixed warps paid it wholesale); fused, the marginal cost is one dot
-    // per pixel under a warp-uniform predicate.
-    let a0q = u32(floor(dot(lo, chs) * h(63.0) + h(0.5)));
-    let a1q = u32(floor(dot(hi, chs) * h(63.0) + h(0.5)));
-    A0 = a0q;
-    A1 = a1q;
-    let d0av = h(f32((a0q << 2u) | (a0q >> 4u))) * h(1.0 / 255.0);
-    let d1av = h(f32((a1q << 2u) | (a1q >> 4u))) * h(1.0 / 255.0);
-    let aspan = d1av - d0av;
-    if (aspan > h(0.001)) {
-      d0a = d0av;
-      sca = h(7.0) / aspan;
-    }
-    // Colour plane: 5-bit endpoints from the masked extents seed.
-    q0c = vec4<u32>(clamp(floor(seed_lo * h(31.0) + h(0.5)), h4(0.0), h4(31.0)));
-    q1c = vec4<u32>(clamp(floor(seed_hi * h(31.0) + h(0.5)), h4(0.0), h4(31.0)));
-    d0 = h4(vec4<f32>((q0c << vec4<u32>(3u)) | (q0c >> vec4<u32>(2u)))) * h(1.0 / 255.0) * cmask;
-    d1 = h4(vec4<f32>((q1c << vec4<u32>(3u)) | (q1c >> vec4<u32>(2u)))) * h(1.0 / 255.0) * cmask;
-  }
-
-  // Index/weight pass: per-mode SPECIALISED loops (constant level counts
-  // and shifts, so each unrolls cleanly — a single parametric loop with
-  // runtime width/split measured +22% on pure mode-6 photo content).
-  // Mixed warps execute both loops; the mode-4 one carries the fused
-  // scalar-plane projection. For mode 4 pix[ch]·dir[ch] = 0, so the
-  // scalar plane never perturbs the colour projection.
-  var a_lo = 0u;
-  var a_hi = 0u;
-  // Same ×32 pre-scale as the extents math; distinct quantised endpoints
-  // are ≥1/255 apart (dd₃₂ ≥ 0.0157), so the flat-block threshold only
-  // catches truly identical ones.
-  let dir = (d1 - d0) * h(32.0);
-  let dd = dot(dir, dir);
-  let live = dd >= h(0.008);
-  if (use4) {
-    if (live) {
-      let inv = h(96.0) / dd;
-      for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-        let s = clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(3.0));
-        let sv = clamp(floor((dot(pix[k], chs) - d0a) * sca + h(0.5)), h(0.0), h(7.0));
-        a_lo = a_lo | (u32(s) << (k * 2u));
-        iA = iA | (u32(sv) << (k * 3u));
-      }
-      for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-        let s = clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(3.0));
-        let sv = clamp(floor((dot(pix[k], chs) - d0a) * sca + h(0.5)), h(0.0), h(7.0));
-        a_lo = a_lo | (u32(s) << (k * 2u));
-        iB = iB | (u32(sv) << ((k - 8u) * 3u));
-      }
-    }
-  } else if (live) {
-    let inv = h(480.0) / dd;
-    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-      let s = clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(15.0));
-      a_lo = a_lo | (u32(s) << (k * 4u));
-    }
-    for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-      let s = clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(15.0));
-      a_hi = a_hi | (u32(s) << ((k - 8u) * 4u));
-    }
-  }
-
-  // Anchors + packing. Mode 6 packs unconditionally (one-sided branches
-  // compile better than two-sided divergence); mode-4 threads overwrite.
-  let o = bi * 4u;
+  let Ls = select(h(7.0), h(3.0), idx1);
+  var A0 = u32(floor(dot(lo, chs) * h(63.0) + h(0.5)));
+  var A1 = u32(floor(dot(hi, chs) * h(63.0) + h(0.5)));
+  var ks = h4(0.0);
+  var os = h(0.0);
   {
-    var ilo = a_lo;
-    var ihi = a_hi;
-    if ((ilo & 0x8u) != 0u) {
-      let t = ep0; ep0 = ep1; ep1 = t;
-      ilo = ~ilo; ihi = ~ihi;
+    let d0a = h(f32((A0 << 2u) | (A0 >> 4u))) * h(1.0 / 255.0);
+    let d1a = h(f32((A1 << 2u) | (A1 >> 4u))) * h(1.0 / 255.0);
+    let aspan = d1a - d0a;
+    if (aspan > h(0.001)) {
+      let sca = Ls / aspan;
+      ks = chs * (sca * h(1.0 / 16.0));
+      os = (dot(p0v, chs) - d0a) * sca + h(0.5);
     }
-    let e0 = ep0.seven;
-    let e1 = ep1.seven;
-    dst[o] = 0x40u | (e0.x << 7u) | (e1.x << 14u) | (e0.y << 21u) | (e1.y << 28u);
-    dst[o + 1u] = (e1.y >> 4u) | (e0.z << 3u) | (e1.z << 10u) | (e0.w << 17u) | (e1.w << 24u) | (ep0.p << 31u);
-    dst[o + 2u] = ep1.p | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
-    dst[o + 3u] = ihi;
+    // Anchor rule up front: pixel 0 (the d-space origin) indexes at ⌊os⌋;
+    // if its MSB would be set, swap the endpoints and mirror the map.
+    if (floor(os) >= (Ls + h(1.0)) * h(0.5)) {
+      let t = A0; A0 = A1; A1 = t;
+      ks = -ks;
+      os = Ls + h(1.0) - os;
+    }
   }
-  if (use4) {
-    // 3-bit anchor: pixel 0's MSB must be 0; reflect = bitwise NOT.
-    if ((iA & 4u) != 0u) {
-      let tA = A0;
-      A0 = A1;
-      A1 = tA;
-      iA = ~iA & 0xFFFFFFu;
-      iB = ~iB & 0xFFFFFFu;
-    }
-    var c2 = a_lo;
-    // 2-bit anchor: pixel 0's MSB must be 0.
-    if ((c2 & 2u) != 0u) {
-      let tq = q0c;
-      q0c = q1c;
-      q1c = tq;
-      c2 = ~c2;
-    }
+
+  // ONE extents pass along the fit axis: projections kept for the colour
+  // indices; the scalar-plane indices ride along as float nibble fields
+  // (pixels 0–5, 6–11, 12–15; ≤ 2^24, exact).
+  var tv: array<h, 16>;
+  var t_min = h(64.0);
+  var t_max = h(-64.0);
+  var ga = 0.0;
+  var gb = 0.0;
+  var gc = 0.0;
+  var w3 = 1.0;
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let t = dot(pix[k], axisF);
+    tv[k] = t;
+    t_min = min(t_min, t);
+    t_max = max(t_max, t);
+    var v = f32(clamp(floor(dot(pix[k], ks) + os), h(0.0), Ls));
+    // (an exact tie at the mirrored anchor rounds down — equal error)
+    if (k == 0u) { v = min(v, f32(floor(Ls * h(0.5)))); }
+    if (k < 6u) { ga = ga + v * w3; } else if (k < 12u) { gb = gb + v * w3; } else { gc = gc + v * w3; }
+    w3 = select(w3 * 16.0, 1.0, k == 5u || k == 11u);
+  }
+  let tm = dot(md, axisF);
+  let base01 = p0v + md * h(1.0 / 16.0);
+  let seed_lo = clamp(base01 + (t_min - tm) * h(1.0 / 16.0) * axisF, h4(0.0), h4(1.0));
+  let seed_hi = clamp(base01 + (t_max - tm) * h(1.0 / 16.0) * axisF, h4(0.0), h4(1.0));
+
+  // Endpoint codes, one quantiser for both modes: mode 6 = 7-bit + p-bit
+  // (chosen per endpoint by quantisation error, alpha included), mode 4
+  // colour = 5-bit.
+  let sc = select(h(127.5), h(31.0), use4);
+  let cmax = select(h(127.0), h(31.0), use4);
+  let y0 = seed_lo * sc;
+  let y1 = seed_hi * sc;
+  let r0 = min(floor(y0 + h(0.5)), h4(cmax));
+  let r1 = min(floor(y1 + h(0.5)), h4(cmax));
+  let f0 = min(floor(y0), h4(cmax));
+  let f1 = min(floor(y1), h4(cmax));
+  let e0r = r0 - y0;
+  let e0f = f0 + h(0.5) - y0;
+  let e1r = r1 - y1;
+  let e1f = f1 + h(0.5) - y1;
+  let pp0 = !use4 && dot(e0f, e0f) < dot(e0r, e0r);
+  let pp1 = !use4 && dot(e1f, e1f) < dot(e1r, e1r);
+  let g0 = select(r0, f0, pp0);
+  let g1 = select(r1, f1, pp1);
+  var q0c = vec4<u32>(g0);
+  var q1c = vec4<u32>(g1);
+  var P0 = u32(pp0);
+  var P1 = u32(pp1);
+  // Decoded: mode 6 (2q + p)/255, mode 4 (q << 3 | q >> 2)/255 = (8q + ⌊q/4⌋)/255.
+  let d0 = select(g0 * h(2.0) + h(f32(P0)), g0 * h(8.0) + floor(g0 * h(0.25)), use4) * h(1.0 / 255.0);
+  let d1 = select(g1 * h(2.0) + h(f32(P1)), g1 * h(8.0) + floor(g1 * h(0.25)), use4) * h(1.0 / 255.0);
+  let Lc = select(h(15.0), select(h(3.0), h(7.0), idx1), use4);
+
+  // Index map from the stored projections: the decoded endpoints'
+  // positions along the axis (tau) set the level scale.
+  let tau0 = dot((d0 - p0v) * h(16.0), axisF);
+  let tau1 = dot((d1 - p0v) * h(16.0), axisF);
+  let span = tau1 - tau0;
+  var kc = h(0.0);
+  var oc = h(0.0);
+  if (abs(span) > h(1.0 / 64.0)) {
+    kc = Lc / span;
+    oc = h(0.5) - tau0 * kc;
+  }
+  // Anchor rule up front (pixel 0 projects to t = 0, index ⌊oc⌋).
+  if (min(floor(oc), Lc) >= (Lc + h(1.0)) * h(0.5)) {
+    let tq = q0c; q0c = q1c; q1c = tq;
+    let tp = P0; P0 = P1; P1 = tp;
+    oc = h(0.5) + tau1 * kc;
+    kc = -kc;
+  }
+  var fa = 0.0;
+  var fb = 0.0;
+  var fc = 0.0;
+  var w = 1.0;
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    var sg = f32(clamp(floor(tv[k] * kc + oc), h(0.0), Lc));
+    if (k == 0u) { sg = min(sg, f32(floor(Lc * h(0.5)))); }
+    if (k < 6u) { fa = fa + sg * w; } else if (k < 12u) { fb = fb + sg * w; } else { fc = fc + sg * w; }
+    w = select(w * 16.0, 1.0, k == 5u || k == 11u);
+  }
+  let ub = u32(fb);
+  let ilo = u32(fa) | (ub << 24u);
+  let ihi = (ub >> 8u) | (u32(fc) << 16u);
+
+  let o = bi * 4u;
+  if (!use4) {
+    dst[o] = 0x40u | (q0c.x << 7u) | (q1c.x << 14u) | (q0c.y << 21u) | (q1c.y << 28u);
+    dst[o + 1u] = (q1c.y >> 4u) | (q0c.z << 3u) | (q1c.z << 10u) | (q0c.w << 17u) | (q1c.w << 24u) | (P0 << 31u);
+    dst[o + 2u] = P1 | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
+    dst[o + 3u] = ihi;
+  } else {
+    let vb = u32(gb);
+    let slo = u32(ga) | (vb << 24u);
+    let shi = (vb >> 8u) | (u32(gc) << 16u);
+    // 2-bit field ← colour (idxMode 0) or scalar (1); 3-bit field ← the other.
+    let c2 = compact2(select(ilo, slo, idx1)) | (compact2(select(ihi, shi, idx1)) << 16u);
+    let iA = compact3(select(slo, ilo, idx1));
+    let iB = compact3(select(shi, ihi, idx1));
     // Rotated-space RGB: position ch carries the original alpha.
     let R0 = select(q0c.x, q0c.w, ch == 0u);
     let G0 = select(q0c.y, q0c.w, ch == 1u);
@@ -491,7 +490,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     let field2 = (c2 & 1u) | ((c2 >> 2u) << 1u);
     let f_lo = (iA & 3u) | ((iA >> 3u) << 2u) | (iB << 23u);
     let f_hi = iB >> 9u;
-    dst[o] = 0x10u | (rot << 5u) | (R0 << 8u) | (R1 << 13u) | (G0 << 18u) | (G1 << 23u) | (B0 << 28u);
+    dst[o] = 0x10u | (rot << 5u) | (u32(idx1) << 7u) | (R0 << 8u) | (R1 << 13u) | (G0 << 18u) | (G1 << 23u) | (B0 << 28u);
     dst[o + 1u] = (B0 >> 4u) | (B1 << 1u) | (A0 << 6u) | (A1 << 12u) | ((field2 & 0x3FFFu) << 18u);
     dst[o + 2u] = (field2 >> 14u) | (f_lo << 17u);
     dst[o + 3u] = (f_lo >> 15u) | (f_hi << 17u);

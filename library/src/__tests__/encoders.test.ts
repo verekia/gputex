@@ -99,9 +99,9 @@ describe('BC7Encoder', () => {
     expect(src).toContain('@compute')
     expect(src).toContain('@workgroup_size')
     // Sanity: the shader exposes the BC7-specific helpers by name.
-    expect(src).toContain('principal_axis4')
-    expect(src).toContain('pick_ep')
+    expect(src).toContain('compact3')
     expect(src).toMatch(/Mode 6/i)
+    expect(src).toMatch(/Mode 4/i)
   })
 })
 

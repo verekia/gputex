@@ -308,11 +308,10 @@ export abstract class Encoder {
       label: `${this.label}-encoder${useF16 ? '-f16' : ''}`,
       code,
     })
-    const constants = this.pipelineConstants()
     this._pipelineReady = device.createComputePipelineAsync({
       label: `${this.label}-encoder-pipeline${useF16 ? '-f16' : ''}`,
       layout: 'auto',
-      compute: { module, entryPoint: 'encode', ...(constants ? { constants } : {}) },
+      compute: { module, entryPoint: 'encode' },
     })
     const prepCode = this.wgslPrepSource()
     if (prepCode) {
@@ -324,8 +323,7 @@ export abstract class Encoder {
       })
       this._prepPipelineReady.catch(() => {})
     }
-    // An encoder may be constructed and never used, or rebuilt before first
-    // use (BC7's adaptiveMode4 constructor path) — don't let an orphaned
+    // An encoder may be constructed and never used — don't let an orphaned
     // promise surface as an unhandled rejection. Encodes await the live
     // promise and still observe compile errors.
     this._pipelineReady.catch(() => {})
@@ -381,16 +379,6 @@ export abstract class Encoder {
 
   /** 8 for BC1/BC4, 16 for BC5/BC7/ASTC 4×4. */
   abstract get bytesPerBlock(): number
-
-  /**
-   * Pipeline-creation override constants for the active shader, or
-   * undefined for none. Subclasses expose quality/behaviour toggles this
-   * way so the OFF state is dead-coded by the shader compiler instead of
-   * branched at runtime.
-   */
-  protected pipelineConstants(): Record<string, number> | undefined {
-    return undefined
-  }
 
   /** WGSL `@workgroup_size` dimensions. Default 8×8×1. */
   get workgroupSize(): readonly [number, number, number] {

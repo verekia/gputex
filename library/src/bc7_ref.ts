@@ -5,8 +5,10 @@
 // a single 1 bit. The reference ENCODER implements mode 6 only — the
 // strongest single-subset mode, well-suited to smooth content — and is
 // the quality yardstick the GPU encoder is gated against. The DECODER
-// additionally supports mode 1 (2-subset partitioning), which the GPU
-// encoder emits for multi-modal blocks; see `BC7Encoder.ts`.
+// additionally supports mode 4 (rotation + separate scalar plane), which
+// the GPU encoder emits alongside mode 6 on decorrelated blocks, and mode 1
+// (2-subset partitioning, from an earlier GPU experiment); see
+// `BC7Encoder.ts`.
 //
 // -----------------------------------------------------------------------
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)

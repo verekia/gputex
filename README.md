@@ -94,14 +94,21 @@ once from levels assigned against a slightly inset range (so the extreme
 levels gather every pixel near the extremes, not just the extreme pixel),
 then shifts both endpoints by the mean residual of the final levels, and
 encodes blocks spanning ≤ 7 values losslessly — roughly 4–9% lower error than a
-plain min/max seed on real textures, up to 60% on displacement maps. BC7's
-16-level mode-6 palette makes the refit redundant on a principal-axis seed
-(≤0.05 dB). ASTC spends every one of its 128 bits: a
-wide-span opaque block gets 16 weight levels with 192-level (trit-coded)
-endpoints, a small-span one exact 8-bit endpoints with 8 levels,
-exactly-grayscale blocks a luminance-only mode with 32 levels. On GPUs that
-report the `shader-f16` feature everything runs in f16 — the f32 shaders
-are the automatic fallback.
+plain min/max seed on real textures, up to 60% on displacement maps. BC7
+chooses per block between mode 6 (one RGBA line with a 16-level palette,
+fine enough that a principal-axis seed needs no refit) and mode 4, which
+splits the block's least line-like channel into its own scalar plane —
+normal maps, channel-packed atlases, noisy photo chroma, independent alpha.
+The choice comes straight from the block covariance (the variance each mode
+explains net of its quantisation) and both modes run the same per-pixel
+passes, so it costs no GPU time: −33% error (MSE) across the test corpus,
++2.4–4.5 dB on normal maps, +1.1–2.2 dB on noisy photo colour (smooth wood
+colour and gray maps are mode-6 content and unchanged). ASTC spends every
+one of its 128 bits: a wide-span opaque block gets 16 weight levels with
+192-level (trit-coded) endpoints, a small-span one exact 8-bit endpoints
+with 8 levels, exactly-grayscale blocks a luminance-only mode with 32
+levels. On GPUs that report the `shader-f16` feature everything runs in
+f16 — the f32 shaders are the automatic fallback.
 
 ETC2 is the exception to the endpoint-line story: its blocks are per-subblock
 base colours shifted by scalar modifier tables. The encoder exploits the
@@ -125,8 +132,9 @@ different results.
 
 On the repo's test textures this lands within a few tenths of a dB of the
 per-block CPU reference encoders (`gputex/testing`) and above them on
-several (BC5 matches exactly; BC1 on flat content, BC7 and ASTC on some
-maps measure above), trailing only on adversarial high-frequency noise,
+several (BC5 matches exactly; BC1 on flat content and ASTC on some maps
+measure above; BC7, whose reference searches mode 6 only, beats it by 2–8 dB
+wherever mode 4 applies), trailing only on adversarial high-frequency noise,
 where any single-line seed loses to an exhaustive search — while encoding
 an order of magnitude faster. See the benchmark table below.
 
@@ -387,7 +395,7 @@ shader alone.
 | BC5      | f16 (default) | **0.14 ms** |
 | BC5      | f32           | 0.15 ms     |
 | BC7      | f16 (default) | **0.19 ms** |
-| BC7      | f32           | 0.52 ms     |
+| BC7      | f32           | 0.41 ms     |
 | ASTC 4×4 | f16 (default) | **0.17 ms** |
 | ASTC 4×4 | f32           | 0.28 ms     |
 | ETC2     | f16 (default) | **0.14 ms** |

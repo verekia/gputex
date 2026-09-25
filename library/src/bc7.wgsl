@@ -1,28 +1,23 @@
-// BC7 (BPTC) mode 6 compute shader encoder.
+// BC7 (BPTC) compute shader encoder — modes 6 and 4.
 //
 // One invocation per 4×4 block. Emits 16 bytes = 4 u32s into the storage
 // buffer at `dst[block_index * 4 .. + 3]`. This is the f32 fallback;
-// bc7_fast_f16.wgsl is the same algorithm and is preferred when the device
-// reports shader-f16.
+// bc7_fast_f16.wgsl is the same algorithm (see its header for the design,
+// the mode-decision model and the measurements) and is preferred when the
+// device reports shader-f16. This module works in the 8-bit integer domain
+// (texels rounded to 0..255), so covariance-scaled constants are the f16
+// module's × 65025/256.
 //
-// ALGORITHM: principal-axis seed (covariance power-iteration; bbox on
-// degenerate blocks) at the exact projection extents, quantised directly —
-// no LSQ refit; with the seed on the principal axis, mode 6's 16-level
-// palette leaves the refit under 0.15 dB, unlike the 4-level BC1/ASTC
-// encoders which keep theirs — then one pass that projects each pixel onto
-// the endpoint line (the 16 palette entries are colinear, so the nearest
-// index is the rounded projection — no palette build, no 16-entry search),
-// packed on the fly into two nibble words. Gray + opaque blocks take an
-// integer 1-D tail (see bc7_fast_f16.wgsl): lossless for spans ≤ 15 with
-// odd endpoints (alpha exactly 255), alpha-aware scalar LSQ refit above.
-// The covariance moments are accumulated after the load loop, on the colour
-// path only — fused into the loads they cost this module ~30% GPU on colour
-// content (register pressure).
-//
-// A MODE 1 (2-subset) candidate was built and evaluated (2026-07) and
-// dropped: ~+1.3 dB on multi-modal content but up to ~3× the pass cost on
-// exactly that content — see bc7_fast_f16.wgsl. The CPU reference decoder
-// keeps mode 1 support (bc7_ref.ts).
+// ALGORITHM: per block, the covariance picks mode 6 (one RGBA line, 16
+// levels) or mode 4 (one channel split off into its own scalar plane, the
+// other three on a line; 2-bit + 3-bit index sets) by comparing the
+// variance each explains net of quantisation; the principal axis comes
+// from a power iteration seeded with the largest-variance column. Both
+// modes then share ONE extents pass whose stored projections become the
+// indices, one endpoint quantiser (7-bit + p / 5-bit) and an anchor rule
+// applied before indexing. Gray + opaque blocks take an integer 1-D tail:
+// lossless for spans ≤ 15 with odd endpoints (alpha exactly 255),
+// alpha-aware scalar LSQ refit above.
 //
 // MODE 6 LAYOUT (LSB-first, bit 0 = byte 0's bit 0)
 //   bits 0..6    mode field      (0b0000001 — only bit 6 is 1)
@@ -35,9 +30,11 @@
 // Effective 8-bit endpoint channel = (7_bit_value << 1) | p_bit.
 // Palette[i] = ((64 − W4[i]) × e0_8 + W4[i] × e1_8 + 32) >> 6, integer.
 //
-// The block is assembled with straight-line constant shifts (see the layout
-// summary in bc7_fast_f16.wgsl) — a generic write_bits() helper's dynamic
-// word indexing keeps the output array out of registers.
+// MODE 4 LAYOUT: see bc7_fast_f16.wgsl (decode reference in bc7_ref.ts).
+//
+// The block is assembled with straight-line constant shifts — a generic
+// write_bits() helper's dynamic word indexing keeps the output array out of
+// registers.
 
 struct Params {
   blocks_x: u32,
@@ -51,63 +48,21 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
-fn to8(v: vec4<f32>) -> vec4<i32> {
-  return vec4<i32>(clamp(floor(v * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0)));
-}
+// Mode-4 endpoint-precision charge (8-bit² covariance units; see the f16
+// module's header — 0.15 there).
+const N4: f32 = 38.1;
 
-fn dist2(a: vec4<i32>, b: vec4<i32>) -> i32 {
-  let d = a - b;
-  let e = d * d;
-  return e.x + e.y + e.z + e.w;
+// Nibble-slot compaction for the mode-4 index fields (see bc7_fast_f16.wgsl).
+fn compact2(x: u32) -> u32 {
+  var y = (x | (x >> 2u)) & 0x0F0F0F0Fu;
+  y = (y | (y >> 4u)) & 0x00FF00FFu;
+  return (y | (y >> 8u)) & 0x0000FFFFu;
 }
-
-// Quantize an 8-bit ideal endpoint to (7-bit value, reconstructed 8-bit)
-// under a fixed p-bit, all four channels at once. q7 = round((ideal8 − p)/2).
-struct QuantPair { seven: vec4<i32>, eight: vec4<i32> };
-fn quantize_endpoint(ideal8: vec4<i32>, p: u32) -> QuantPair {
-  let q = vec4<i32>(clamp(
-    floor((vec4<f32>(ideal8) - f32(p)) / 2.0 + 0.5),
-    vec4<f32>(0.0), vec4<f32>(127.0),
-  ));
-  let eff = (q << vec4<u32>(1u)) | vec4<i32>(i32(p));
-  return QuantPair(q, eff);
+fn compact3(x: u32) -> u32 {
+  var y = (x & 0x07070707u) | ((x >> 1u) & 0x38383838u);
+  y = (y & 0x003F003Fu) | ((y >> 2u) & 0x0FC00FC0u);
+  return (y & 0x00000FFFu) | ((y >> 4u) & 0x00FFF000u);
 }
-
-// Endpoint with its chosen p-bit, picked by minimum quantisation error.
-struct Ep { seven: vec4<i32>, eight: vec4<i32>, p: u32 };
-fn pick_ep(ideal: vec4<i32>) -> Ep {
-  let a = quantize_endpoint(ideal, 0u);
-  let b = quantize_endpoint(ideal, 1u);
-  if (dist2(b.eight, ideal) < dist2(a.eight, ideal)) { return Ep(b.seven, b.eight, 1u); }
-  return Ep(a.seven, a.eight, 0u);
-}
-
-// Principal colour axis via power-iteration over precomputed, mean-corrected
-// covariance rows (the moments are accumulated for free in the pixel-load
-// loop), seeded with the bbox diagonal. Returns a unit axis, or vec4(0) for
-// a degenerate (constant) block. Same family as bc1.wgsl's principal_axis —
-// the bbox diagonal alone is sign-blind and points across anti-correlated
-// data (normal maps, hue edges) instead of along it.
-fn principal_axis4(
-  c0v: vec4<f32>,
-  c1v: vec4<f32>,
-  c2v: vec4<f32>,
-  c3v: vec4<f32>,
-  seed: vec4<f32>,
-) -> vec4<f32> {
-  var v = seed;
-  var len = length(v);
-  if (len < 1e-9) { return vec4<f32>(0.0); }
-  v = v / len;
-  for (var iter: u32 = 0u; iter < 8u; iter = iter + 1u) {
-    let nv = vec4<f32>(dot(c0v, v), dot(c1v, v), dot(c2v, v), dot(c3v, v));
-    len = length(nv);
-    if (len < 1e-12) { return vec4<f32>(0.0); }
-    v = nv / len;
-  }
-  return v;
-}
-
 
 // ------------------------------- Entry --------------------------------- //
 
@@ -118,25 +73,20 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   if (gid.x >= params.blocks_x || gid.y >= params.blocks_y) {
     return;
   }
-
-  let bx = gid.x;
-  let by = gid.y;
-  let block_index = by * params.blocks_x + bx;
-
-  let base   = vec2<i32>(i32(bx) * 4, i32(by) * 4);
-  let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
+  let block_index = gid.y * params.blocks_x + gid.x;
+  let base = vec2<i32>(i32(gid.x) * 4, i32(gid.y) * 4);
+  let mx = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
 
   // Load 16 RGBA pixels (8-bit integer domain), the per-channel bbox and
   // the gray test.
-  var pixels: array<vec4<i32>, 16>;
-  var lo = vec4<i32>(255);
-  var hi = vec4<i32>(0);
-  var gd = 0;
+  var pixels: array<vec4<f32>, 16>;
+  var lo = vec4<f32>(255.0);
+  var hi = vec4<f32>(0.0);
+  var gd = 0.0;
+  let xs = min(vec4<i32>(base.x) + vec4<i32>(0, 1, 2, 3), vec4<i32>(mx.x));
+  let ys = min(vec4<i32>(base.y) + vec4<i32>(0, 1, 2, 3), vec4<i32>(mx.y));
   for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-    let lx = i32(i & 3u);
-    let ly = i32(i >> 2u);
-    let p  = clamp(base + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
-    let px = to8(textureLoad(src_tex, p, 0));
+    let px = clamp(floor(textureLoad(src_tex, vec2<i32>(xs[i & 3u], ys[i >> 2u]), 0) * 255.0 + 0.5), vec4<f32>(0.0), vec4<f32>(255.0));
     pixels[i] = px;
     lo = min(lo, px);
     hi = max(hi, px);
@@ -146,9 +96,9 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   // Gray + opaque blocks: 1-D, own tail (see bc7_fast_f16.wgsl) — lossless
   // for spans ≤ 15 with odd endpoints (alpha exactly 255), closed-form
   // scalar LSQ refit with alpha-aware p-bit pricing above that.
-  if (lo.w == 255 && gd == 0) {
-    let vmin = f32(lo.x);
-    let vmax = f32(hi.x);
+  if (lo.w == 255.0 && gd == 0.0) {
+    let vmin = lo.x;
+    let vmax = hi.x;
     var e0 = vmin;
     var e1 = vmax;
     if (vmax - vmin <= 15.0) {
@@ -162,7 +112,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
       var sv = 0.0;
       var sLv = 0.0;
       for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-        let v = f32(pixels[k].x);
+        let v = pixels[k].x;
         let L = floor(v * k1 + k0);
         sL = sL + L;
         sLL = sLL + L * L;
@@ -204,11 +154,11 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
       let k1 = 15.0 / (e1 - e0);
       let k0 = 0.5 - e0 * k1;
       for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-        let sg = clamp(floor(f32(pixels[k].x) * k1 + k0), 0.0, 15.0);
+        let sg = clamp(floor(pixels[k].x * k1 + k0), 0.0, 15.0);
         glo = glo | (u32(sg) << (k * 4u));
       }
       for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-        let sg = clamp(floor(f32(pixels[k].x) * k1 + k0), 0.0, 15.0);
+        let sg = clamp(floor(pixels[k].x * k1 + k0), 0.0, 15.0);
         ghi = ghi | (u32(sg) << ((k - 8u) * 4u));
       }
     }
@@ -228,99 +178,223 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     return;
   }
 
-  // Covariance moments: d = px − pixel0 (first-pixel-relative, so the sums
-  // scale with the block's span; d is integer-valued and ≤255, exact in
-  // f32).
-  let p0f = vec4<f32>(pixels[0]);
+  // Covariance (10 symmetric products) over d = px − p0, stored back into
+  // pixels: every later pass works block-relative.
+  let p0v = pixels[0];
+  pixels[0] = vec4<f32>(0.0);
   var sd = vec4<f32>(0.0);
-  var c0v = vec4<f32>(0.0);
-  var c1v = vec4<f32>(0.0);
-  var c2v = vec4<f32>(0.0);
-  var c3v = vec4<f32>(0.0);
+  var cx = vec4<f32>(0.0);
+  var cy = vec3<f32>(0.0);
+  var cz = vec2<f32>(0.0);
+  var cw = 0.0;
   for (var i: u32 = 1u; i < 16u; i = i + 1u) {
-    let d = vec4<f32>(pixels[i]) - p0f;
+    let d = pixels[i] - p0v;
+    pixels[i] = d;
     sd = sd + d;
-    c0v = c0v + d.x * d;
-    c1v = c1v + d.y * d;
-    c2v = c2v + d.z * d;
-    c3v = c3v + d.w * d;
+    cx = cx + d.x * d;
+    cy = cy + d.y * d.yzw;
+    cz = cz + d.z * d.zw;
+    cw = cw + d.w * d.w;
   }
-  let mean = p0f + sd * (1.0 / 16.0);
+  let md = sd * (1.0 / 16.0);
+  let sd4 = sd * 0.25;
+  cx = cx - sd4.x * sd4;
+  cy = cy - sd4.y * sd4.yzw;
+  cz = cz - sd4.z * sd4.zw;
+  cw = cw - sd4.w * sd4.w;
+  let diag = vec4<f32>(cx.x, cy.x, cz.x, cw);
+  let trace = diag.x + diag.y + diag.z + diag.w;
 
-  // Seed endpoints from the block's principal colour axis at the exact
-  // projection extents (see header), quantise, and assign indices in one
-  // projection pass.
-  // Mean-correct the fused moments: C = Σddᵀ − (Σd)(Σd)ᵀ/16.
-  let sd16 = sd * (1.0 / 16.0);
-  let r0v = c0v - sd.x * sd16;
-  let r1v = c1v - sd.y * sd16;
-  let r2v = c2v - sd.z * sd16;
-  let r3v = c3v - sd.w * sd16;
-  var seed0 = lo;
-  var seed1 = hi;
+  // Mode decision + fit axis (see bc7_fast_f16.wgsl). Flat blocks keep
+  // axis 0: every index 0, both endpoints at the mean.
+  var use4 = false;
+  var idx1 = false;
+  var ch = 0u;
+  var cmask = vec4<f32>(1.0);
+  var axisF = vec4<f32>(0.0);
+  if (trace > 0.254) {
+    let s = 1.0 / trace;
+    let m0 = cx * s;
+    let m1 = vec4<f32>(cx.y, cy) * s;
+    let m2 = vec4<f32>(cx.z, cy.y, cz) * s;
+    let m3 = vec4<f32>(cx.w, cy.z, cz.y, cw) * s;
+    var axis = m0;
+    var dm = diag.x;
+    if (diag.y > dm) { axis = m1; dm = diag.y; }
+    if (diag.z > dm) { axis = m2; dm = diag.z; }
+    if (diag.w > dm) { axis = m3; }
+    axis = axis * inverseSqrt(dot(axis, axis));
+    axis = vec4<f32>(dot(m0, axis), dot(m1, axis), dot(m2, axis), dot(m3, axis));
+    axis = vec4<f32>(dot(m0, axis), dot(m1, axis), dot(m2, axis), dot(m3, axis));
+    let a4 = max(dot(axis, axis), 1e-12);
+    axis = axis * inverseSqrt(a4);
+    let lamn = sqrt(sqrt(a4));
+    let lam = lamn * trace;
+
+    // λ3 for all four scalar-channel candidates at once (lane c).
+    let a2 = axis * axis;
+    var nn = vec4<f32>(0.0);
+    { let wr = lamn * axis.x - axis * m0; nn = nn + wr * wr * vec4<f32>(0.0, 1.0, 1.0, 1.0); }
+    { let wr = lamn * axis.y - axis * m1; nn = nn + wr * wr * vec4<f32>(1.0, 0.0, 1.0, 1.0); }
+    { let wr = lamn * axis.z - axis * m2; nn = nn + wr * wr * vec4<f32>(1.0, 1.0, 0.0, 1.0); }
+    { let wr = lamn * axis.w - axis * m3; nn = nn + wr * wr * vec4<f32>(1.0, 1.0, 1.0, 0.0); }
+    var l3v = sqrt(nn / max(vec4<f32>(1.0) - a2, vec4<f32>(1e-3))) * trace;
+    let d1 = max(max(diag.x, diag.y), max(diag.z, diag.w));
+    let oh1 = diag == vec4<f32>(d1);
+    let dr = select(diag, vec4<f32>(-1.0), oh1);
+    let d2 = max(max(dr.x, dr.y), max(dr.z, dr.w));
+    l3v = clamp(l3v, select(vec4<f32>(d1), vec4<f32>(d2), oh1), vec4<f32>(trace) - diag);
+
+    let sb = max(l3v, diag) * (48.0 / 49.0) + min(l3v, diag) * (8.0 / 9.0);
+    let smax = max(max(sb.x, sb.y), max(sb.z, sb.w));
+    use4 = smax - N4 > lam * (224.0 / 225.0);
+    if (sb.y == smax) { ch = 1u; }
+    if (sb.z == smax) { ch = 2u; }
+    if (sb.w == smax) { ch = 3u; }
+    let ohc = select(vec4<f32>(0.0), vec4<f32>(1.0), vec4<u32>(ch) == vec4<u32>(0u, 1u, 2u, 3u));
+    idx1 = dot(l3v - diag, ohc) > 0.0;
+
+    let col = select(select(select(m0, m1, ch == 1u), m2, ch == 2u), m3, ch == 3u);
+    cmask = select(vec4<f32>(1.0), vec4<f32>(1.0) - ohc, use4);
+    var v = select(axis, (lamn * axis - dot(axis, ohc) * col) * cmask + (hi - lo) * cmask * (1e-3 / 255.0), use4);
+    v = v * inverseSqrt(max(dot(v, v), 1e-12));
+    v = vec4<f32>(dot(m0, v), dot(m1, v), dot(m2, v), dot(m3, v)) * cmask;
+    let vv = dot(v, v);
+    axisF = select(vec4<f32>(0.0), v * inverseSqrt(max(vv, 1e-12)), vv > 1e-6);
+  }
+
+  // Mode-4 scalar plane: 6-bit codes at the channel's exact extremes, index
+  // map v = ⌊d·ks + os⌋. chs = 0 leaves ks = 0 for mode 6.
+  let chs = vec4<f32>(1.0) - cmask;
+  let Ls = select(7.0, 3.0, idx1);
+  var A0 = u32(floor(dot(lo, chs) * (63.0 / 255.0) + 0.5));
+  var A1 = u32(floor(dot(hi, chs) * (63.0 / 255.0) + 0.5));
+  var ks = vec4<f32>(0.0);
+  var os = 0.0;
   {
-    let axis = principal_axis4(r0v, r1v, r2v, r3v, vec4<f32>(hi - lo));
-    if (dot(axis, axis) > 0.0) {
-      // Exact projection extents along the axis. (A Rayleigh-quotient span
-      // estimate was tried in place of this pass — it saves 16 dots but
-      // costs 0.1–0.8 dB and 4–10× on the worst-easy-block gate: σ
-      // misjudges two-cluster and outlier blocks. The pass stays.)
-      var t_min: f32 = 1e30;
-      var t_max: f32 = -1e30;
-      for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-        let t = dot(vec4<f32>(pixels[k]) - mean, axis);
-        t_min = min(t_min, t);
-        t_max = max(t_max, t);
-      }
-      seed0 = vec4<i32>(clamp(round(mean + t_min * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
-      seed1 = vec4<i32>(clamp(round(mean + t_max * axis), vec4<f32>(0.0), vec4<f32>(255.0)));
+    let d0a = f32((A0 << 2u) | (A0 >> 4u));
+    let d1a = f32((A1 << 2u) | (A1 >> 4u));
+    let aspan = d1a - d0a;
+    if (aspan > 0.0) {
+      let sca = Ls / aspan;
+      ks = chs * sca;
+      os = (dot(p0v, chs) - d0a) * sca + 0.5;
+    }
+    // Anchor rule up front: pixel 0 (the d-space origin) indexes at ⌊os⌋.
+    if (floor(os) >= (Ls + 1.0) * 0.5) {
+      let t = A0; A0 = A1; A1 = t;
+      ks = -ks;
+      os = Ls + 1.0 - os;
     }
   }
 
-  // The 16 4-bit indices, packed LSB-first into two nibble words
-  // (pixel k → bits 4k..4k+3).
-  var ilo: u32 = 0u;
-  var ihi: u32 = 0u;
-  var ep0 = pick_ep(seed0);
-  var ep1 = pick_ep(seed1);
-  let dir = vec4<f32>(ep1.eight - ep0.eight);
-  let dd = dot(dir, dir);
-  if (dd > 0.0) {
-    let e0f = vec4<f32>(ep0.eight);
-    let inv = 15.0 / dd;
-    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-      let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
-      ilo = ilo | (u32(s) << (k * 4u));
-    }
-    for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-      let s = clamp(floor(dot(vec4<f32>(pixels[k]) - e0f, dir) * inv + 0.5), 0.0, 15.0);
-      ihi = ihi | (u32(s) << ((k - 8u) * 4u));
-    }
+  // ONE extents pass along the fit axis: projections kept for the colour
+  // indices, scalar-plane indices ride along as float nibble fields.
+  var tv: array<f32, 16>;
+  var t_min = 1e30;
+  var t_max = -1e30;
+  var ga = 0.0;
+  var gb = 0.0;
+  var gc = 0.0;
+  var w3 = 1.0;
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    let t = dot(pixels[k], axisF);
+    tv[k] = t;
+    t_min = min(t_min, t);
+    t_max = max(t_max, t);
+    var v = clamp(floor(dot(pixels[k], ks) + os), 0.0, Ls);
+    if (k == 0u) { v = min(v, floor(Ls * 0.5)); }
+    if (k < 6u) { ga = ga + v * w3; } else if (k < 12u) { gb = gb + v * w3; } else { gc = gc + v * w3; }
+    w3 = select(w3 * 16.0, 1.0, k == 5u || k == 11u);
   }
-  var e0_7 = ep0.seven;
-  var e1_7 = ep1.seven;
-  var p0 = ep0.p;
-  var p1 = ep1.p;
+  let tm = dot(md, axisF);
+  let mean = p0v + md;
+  let seed_lo = clamp(mean + (t_min - tm) * axisF, vec4<f32>(0.0), vec4<f32>(255.0));
+  let seed_hi = clamp(mean + (t_max - tm) * axisF, vec4<f32>(0.0), vec4<f32>(255.0));
 
-  // Anchor rule — pixel 0's index MSB must be 0. Swapping endpoints reflects
-  // every index (i → 15−i), which on packed nibbles is a bitwise NOT.
-  if ((ilo & 0x8u) != 0u) {
-    let t7 = e0_7; e0_7 = e1_7; e1_7 = t7;
-    let tp = p0;   p0   = p1;   p1   = tp;
-    ilo = ~ilo; ihi = ~ihi;
+  // Endpoint codes, one quantiser for both modes: mode 6 = 7-bit + p-bit
+  // (per endpoint, by quantisation error), mode 4 colour = 5-bit.
+  let sc = select(0.5, 31.0 / 255.0, use4);
+  let cmax = select(127.0, 31.0, use4);
+  let y0 = seed_lo * sc;
+  let y1 = seed_hi * sc;
+  let r0 = min(floor(y0 + 0.5), vec4<f32>(cmax));
+  let r1 = min(floor(y1 + 0.5), vec4<f32>(cmax));
+  let f0 = min(floor(y0), vec4<f32>(cmax));
+  let f1 = min(floor(y1), vec4<f32>(cmax));
+  let e0r = r0 - y0;
+  let e0f = f0 + 0.5 - y0;
+  let e1r = r1 - y1;
+  let e1f = f1 + 0.5 - y1;
+  let pp0 = !use4 && dot(e0f, e0f) < dot(e0r, e0r);
+  let pp1 = !use4 && dot(e1f, e1f) < dot(e1r, e1r);
+  let g0 = select(r0, f0, pp0);
+  let g1 = select(r1, f1, pp1);
+  var q0c = vec4<u32>(g0);
+  var q1c = vec4<u32>(g1);
+  var P0 = u32(pp0);
+  var P1 = u32(pp1);
+  // Decoded 8-bit endpoints: mode 6 2q + p, mode 4 q << 3 | q >> 2.
+  let d0 = select(g0 * 2.0 + f32(P0), g0 * 8.0 + floor(g0 * 0.25), use4);
+  let d1 = select(g1 * 2.0 + f32(P1), g1 * 8.0 + floor(g1 * 0.25), use4);
+  let Lc = select(15.0, select(3.0, 7.0, idx1), use4);
+
+  let tau0 = dot(d0 - p0v, axisF);
+  let tau1 = dot(d1 - p0v, axisF);
+  let span = tau1 - tau0;
+  var kc = 0.0;
+  var oc = 0.0;
+  if (abs(span) > 0.25) {
+    kc = Lc / span;
+    oc = 0.5 - tau0 * kc;
   }
+  // Anchor rule up front (pixel 0 projects to t = 0, index ⌊oc⌋).
+  if (min(floor(oc), Lc) >= (Lc + 1.0) * 0.5) {
+    let tq = q0c; q0c = q1c; q1c = tq;
+    let tp = P0; P0 = P1; P1 = tp;
+    oc = 0.5 + tau1 * kc;
+    kc = -kc;
+  }
+  var fa = 0.0;
+  var fb = 0.0;
+  var fc = 0.0;
+  var w = 1.0;
+  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
+    var sg = clamp(floor(tv[k] * kc + oc), 0.0, Lc);
+    if (k == 0u) { sg = min(sg, floor(Lc * 0.5)); }
+    if (k < 6u) { fa = fa + sg * w; } else if (k < 12u) { fb = fb + sg * w; } else { fc = fc + sg * w; }
+    w = select(w * 16.0, 1.0, k == 5u || k == 11u);
+  }
+  let ub = u32(fb);
+  let ilo = u32(fa) | (ub << 24u);
+  let ihi = (ub >> 8u) | (u32(fc) << 16u);
 
-  // Straight-line mode-6 packing (see layout at the top of the file).
-  let e0 = vec4<u32>(e0_7);
-  let e1 = vec4<u32>(e1_7);
-  let w0 = 0x40u | (e0.x << 7u) | (e1.x << 14u) | (e0.y << 21u) | (e1.y << 28u);
-  let w1 = (e1.y >> 4u) | (e0.z << 3u) | (e1.z << 10u) | (e0.w << 17u) | (e1.w << 24u) | (p0 << 31u);
-  let w2 = p1 | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
-  let w3 = ihi;
-
-  let out = block_index * 4u;
-  dst[out + 0u] = w0;
-  dst[out + 1u] = w1;
-  dst[out + 2u] = w2;
-  dst[out + 3u] = w3;
+  let o = block_index * 4u;
+  if (!use4) {
+    dst[o] = 0x40u | (q0c.x << 7u) | (q1c.x << 14u) | (q0c.y << 21u) | (q1c.y << 28u);
+    dst[o + 1u] = (q1c.y >> 4u) | (q0c.z << 3u) | (q1c.z << 10u) | (q0c.w << 17u) | (q1c.w << 24u) | (P0 << 31u);
+    dst[o + 2u] = P1 | ((ilo & 0x7u) << 1u) | (ilo & 0xFFFFFFF0u);
+    dst[o + 3u] = ihi;
+  } else {
+    let vb = u32(gb);
+    let slo = u32(ga) | (vb << 24u);
+    let shi = (vb >> 8u) | (u32(gc) << 16u);
+    let c2 = compact2(select(ilo, slo, idx1)) | (compact2(select(ihi, shi, idx1)) << 16u);
+    let iA = compact3(select(slo, ilo, idx1));
+    let iB = compact3(select(shi, ihi, idx1));
+    let R0 = select(q0c.x, q0c.w, ch == 0u);
+    let G0 = select(q0c.y, q0c.w, ch == 1u);
+    let B0 = select(q0c.z, q0c.w, ch == 2u);
+    let R1 = select(q1c.x, q1c.w, ch == 0u);
+    let G1 = select(q1c.y, q1c.w, ch == 1u);
+    let B1 = select(q1c.z, q1c.w, ch == 2u);
+    let rot = (ch + 1u) & 3u;
+    let field2 = (c2 & 1u) | ((c2 >> 2u) << 1u);
+    let f_lo = (iA & 3u) | ((iA >> 3u) << 2u) | (iB << 23u);
+    let f_hi = iB >> 9u;
+    dst[o] = 0x10u | (rot << 5u) | (u32(idx1) << 7u) | (R0 << 8u) | (R1 << 13u) | (G0 << 18u) | (G1 << 23u) | (B0 << 28u);
+    dst[o + 1u] = (B0 >> 4u) | (B1 << 1u) | (A0 << 6u) | (A1 << 12u) | ((field2 & 0x3FFFu) << 18u);
+    dst[o + 2u] = (field2 >> 14u) | (f_lo << 17u);
+    dst[o + 3u] = (f_lo >> 15u) | (f_hi << 17u);
+  }
 }

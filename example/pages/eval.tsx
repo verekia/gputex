@@ -63,6 +63,8 @@ interface Row {
   /** The block behind maxEasyWorse: source RGBA bytes (row-major) and both encodings. */
   maxEasyBlock?: { index: number; bx: number; by: number; src: number[]; base: number[]; mine: number[] }
   identicalPct: number
+  /** BC7 only: block count per mode (mode 4: m4r<rotation>i<idxMode>, mode 5: m5r<rotation>). */
+  modeHist?: Record<string, number>
 }
 
 interface ImageResult {
@@ -168,6 +170,21 @@ const FORMAT_INFO: Record<Fmt, { tex: GPUTextureFormat; bpb: number; channels: n
 const fmtOf = (name: string): Fmt => {
   for (const f of ['bc1', 'bc5', 'bc7', 'astc', 'etc2'] as const) if (name.startsWith(f)) return f
   throw new Error(`${name}: cannot infer the format from the name (want a bc1/bc5/bc7/astc/etc2 prefix)`)
+}
+
+/** BC7 mode histogram (mode = index of the lowest set bit of byte 0). */
+function bc7ModeHist(bytes: Uint8Array, blocks: number): Record<string, number> {
+  const h: Record<string, number> = {}
+  for (let b = 0; b < blocks; b++) {
+    const b0 = bytes[b * 16]!
+    let mode = 0
+    while (mode < 8 && !((b0 >> mode) & 1)) mode++
+    let key = `m${mode}`
+    if (mode === 4) key += `r${(b0 >> 5) & 3}i${b0 >> 7}`
+    else if (mode === 5) key += `r${(b0 >> 6) & 3}`
+    h[key] = (h[key] ?? 0) + 1
+  }
+  return h
 }
 
 const psnrOf = (sse: number, n: number): number => (sse === 0 ? Infinity : 10 * Math.log10((255 * 255 * n) / sse))
@@ -584,6 +601,7 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
                 return { index: maxEasyIdx, bx: bxi, by: byi, src, base: slice(b0), mine: slice(bi) }
               })(),
         identicalPct: (100 * identical) / blocks,
+        modeHist: fmt === 'bc7' ? bc7ModeHist(bi, blocks) : undefined,
       }
     })
     for (const r of rows) {
