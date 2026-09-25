@@ -17,6 +17,9 @@
 // Block bytes are produced byte-identical to the WebGPU encoders for the same
 // input + flipY (same algorithms, same little-endian word order), so the
 // resulting CompressedTexture displays identically under either renderer.
+// ETC2 is the one exception: its [0, 1]-domain channel sums leave exact
+// decision ties to f32 rounding, which two shader compilers order
+// differently (~1 block in 20k differs, at equal expected error).
 
 import vertSource from './glsl/fullscreen.vert.glsl'
 import { getSharedWebGLContext } from './webglContext.js'

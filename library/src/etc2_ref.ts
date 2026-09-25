@@ -44,9 +44,12 @@
 // the encoder for a corner case. The decoder handles all five modes so any
 // spec-valid ETC2 RGB8 stream round-trips.
 //
-// Arithmetic happens in integer 0..255 space (errors are exact integer sums)
-// so the reference tracks the WGSL port closely — f32 holds every value here
-// exactly.
+// Arithmetic happens in integer 0..255 space (errors are exact integer sums).
+// The WGSL port keeps its channel sums in the sampler's [0, 1] domain (a
+// speed choice), so its f32 sums carry rounding noise and it resolves exact
+// decision ties (flip preselect, ETC1-vs-planar, planar corner rounding) at
+// random relative to this mirror: ~0.1-0.7% of colour blocks differ, with
+// equal expected error. Exactly-gray blocks match exactly.
 
 /** 48-value input: 16 RGB triplets, channel-interleaved, row-major, each in [0, 1]. */
 export type ETC2Pixels = Readonly<ArrayLike<number>>
@@ -524,7 +527,7 @@ function fastIndices(D: readonly number[], t: number): SubblockFit {
   return { table: t, indices, err: 0, modSum }
 }
 
-/** The scalar-luma fast encode — mirrors etc2.wgsl decision for decision. */
+/** The scalar-luma fast encode — mirrors etc2.wgsl decision for decision (up to float ties; see header). */
 function encodeFastBlock(px: Int32Array): ETC2Block {
   // Per-texel luma sums and quadrant statistics (Σp, Σ||p||², Σℓ²).
   const luma = new Float64Array(16)
