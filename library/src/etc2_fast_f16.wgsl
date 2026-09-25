@@ -34,12 +34,21 @@
 //     image fall back to clamped per-texel loads. Lumas are kept as 4
 //     COLUMN vectors — wire pixel order is x·4 + y — so both flips' half-
 //     blocks and the index packing use only constant indexing.
+//   • Channel sums stay in the sampler's UNIT domain: the ×255 lives in
+//     the constants that consume them (quantisers, estimates), not in 48
+//     per-texel multiplies (−3..4% GPU). Lumas are exact integers (one FMA
+//     chain per texel). The unit sums carry f32 rounding noise, which only
+//     moves exact decision ties (quality-neutral: ~0.1-0.5% of colour
+//     blocks change bytes, ΔPSNR ±0.001 dB); the gray path, where the two
+//     flips often tie exactly, rounds its five scalars back to integers
+//     and stays byte-identical to the integer-domain form.
 //   • Flip preselect, O(1): per subblock the residual after continuous luma
 //     modulation is within-variance − κ·(luma variance)/3, κ = 0.9. κ = 1
 //     is the exact chroma residual; keeping a tenth of the luma variance
 //     prefers the split with less luma spread for the 4-level tables to
 //     cover (+0.07-0.10 dB on photo colour vs κ = 1, free). Only the chosen
-//     flip is searched.
+//     flip is searched. Evaluated in half-difference form (only the two
+//     halves' difference varies between flips; −1..2% GPU).
 //   • Exactly-gray blocks (every quadrant's R, G and B sums AND both planar
 //     moments equal) have no chroma to steer the preselect, so both flips
 //     are scored — worth ~0.3 dB on roughness/AO content over any O(1)
@@ -79,8 +88,7 @@
 //     is limited to two-chroma-cluster blocks and needs a clustering pass.
 //
 // Numeric notes: every m3 in A3/B3 is divisible by 3 so m = m3/3 is exact;
-// est values are integer sums held exactly in f32 (< 2^24) apart from the
-// planar solve's decimal weights.
+// the table-search terms are integer sums held exactly in f32 (< 2^24).
 
 enable f16;
 
@@ -122,8 +130,9 @@ fn max4(v: vec4<f16>) -> f16 {
   return max(max(v.x, v.y), max(v.z, v.w));
 }
 
-// Base colours from subblock SUMS (8 texels each): codes (as floats) and
-// their 8-bit expansions. Differential mode when the 5-bit codes are within
+// Base colours from subblock SUMS (8 texels each, unit domain: 31·255/2040
+// = 3.875, 15·255/2040 = 1.875): codes (as floats) and their 8-bit
+// expansions. Differential mode when the 5-bit codes are within
 // the 3-bit delta range, else individual 4-bit. Expansions in float:
 // (q<<3)|(q>>2) = floor(8.25·q) for 5 bits, (q<<4)|q = 17·q for 4 bits.
 struct Bases {
@@ -134,13 +143,13 @@ struct Bases {
   diff: bool,
 };
 fn quantise_bases(sum0: vec3<f32>, sum1: vec3<f32>) -> Bases {
-  let q0 = floor(sum0 * (31.0 / 2040.0) + 0.5);
-  let q1 = floor(sum1 * (31.0 / 2040.0) + 0.5);
+  let q0 = floor(sum0 * 3.875 + 0.5);
+  let q1 = floor(sum1 * 3.875 + 0.5);
   let d = q1 - q0;
   var o: Bases;
   o.diff = all(d >= vec3<f32>(-4.0)) && all(d <= vec3<f32>(3.0));
-  let i0 = floor(sum0 * (15.0 / 2040.0) + 0.5);
-  let i1 = floor(sum1 * (15.0 / 2040.0) + 0.5);
+  let i0 = floor(sum0 * 1.875 + 0.5);
+  let i1 = floor(sum1 * 1.875 + 0.5);
   o.c0 = select(i0, q0, o.diff);
   o.c1 = select(i1, q1, o.diff);
   o.b0 = select(i0 * 17.0, floor(q0 * 8.25), o.diff);
@@ -216,7 +225,7 @@ fn sb_pair(u0: vec4<f16>, v0: vec4<f16>, lbf0: f32, u1: vec4<f16>, v1: vec4<f16>
 }
 
 // One flip's fit: base quantisation + table search, and its estimate
-// (Σ||p||² omitted).
+// (Σ||p||² omitted; sums in the unit domain, hence 2·255 = 510).
 struct FlipFit {
   est: f32,
   bases: Bases,
@@ -242,12 +251,12 @@ fn fit_flip(
   let pp = sb_pair(s0u, s0v, out.lb0, s1u, s1v, out.lb1);
   out.t0 = pp.t0;
   out.t1 = pp.t1;
-  out.est = dot(b0, 8.0 * b0 - 2.0 * sum0) + dot(b1, 8.0 * b1 - 2.0 * sum1) + pp.acc * (1.0 / 3.0);
+  out.est = dot(b0, 8.0 * b0 - 510.0 * sum0) + dot(b1, 8.0 * b1 - 510.0 * sum1) + pp.acc * (1.0 / 3.0);
   return out;
 }
 
 // fit_flip for exactly-gray blocks (r = g = b): the same arithmetic on one
-// channel; sum0/sum1 are one channel's subblock sums.
+// channel; sum0/sum1 are one channel's subblock sums, as exact integers.
 fn fit_gray(
   s0u: vec4<f16>,
   s0v: vec4<f16>,
@@ -277,9 +286,10 @@ fn fit_gray(
   return out;
 }
 
-// One gathered 2×2 quad: per-texel luma (gather order), channel sums, and
-// the sums of its right column and bottom row (the planar moments' local
-// parts). Gather order: w=(0,0) z=(1,0) x=(0,1) y=(1,1).
+// One gathered 2×2 quad: per-texel luma (gather order, exact 0..765),
+// unit-domain channel sums, and the sums of its right column and bottom row
+// (the planar moments' local parts). Gather order: w=(0,0) z=(1,0) x=(0,1)
+// y=(1,1).
 struct Quad {
   l: vec4<f16>,
   s: vec3<f32>,
@@ -287,11 +297,11 @@ struct Quad {
   bottom: vec3<f32>,
 };
 fn gather_quad(cc: vec2<f32>) -> Quad {
-  let r = textureGather(0, src_tex, smp, cc) * 255.0;
-  let g = textureGather(1, src_tex, smp, cc) * 255.0;
-  let b = textureGather(2, src_tex, smp, cc) * 255.0;
+  let r = textureGather(0, src_tex, smp, cc);
+  let g = textureGather(1, src_tex, smp, cc);
+  let b = textureGather(2, src_tex, smp, cc);
   var o: Quad;
-  o.l = vec4<f16>(r + g + b);
+  o.l = vec4<f16>(fma(r, vec4<f32>(255.0), fma(g, vec4<f32>(255.0), b * 255.0)));
   o.right = vec3<f32>(r.z + r.y, g.z + g.y, b.z + b.y);
   o.s = o.right + vec3<f32>(r.w + r.x, g.w + g.x, b.w + b.x);
   o.bottom = vec3<f32>(r.x + r.y, g.x + g.y, b.x + b.y);
@@ -312,7 +322,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   // Luma by column: col[x][y]. Quadrant q = (x >= 2) | (y >= 2) << 1.
   var col: array<vec4<f16>, 4>;
   var qsum: array<vec3<f32>, 4>;
-  // Planar right-hand sides: Σ x·p and Σ y·p.
+  // Planar right-hand sides: Σ x·p and Σ y·p (all sums in the unit domain).
   var sxp = vec3<f32>(0.0);
   var syp = vec3<f32>(0.0);
   if (u32(base_xy.x) + 4u <= params.width && u32(base_xy.y) + 4u <= params.height) {
@@ -326,8 +336,8 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     qsum[1] = q1.s;
     qsum[2] = q2.s;
     qsum[3] = q3.s;
-    sxp = q0.right + q2.right + 2.0 * (q1.s + q3.s) + q1.right + q3.right;
-    syp = q0.bottom + q1.bottom + 2.0 * (q2.s + q3.s) + q2.bottom + q3.bottom;
+    sxp = (q0.right + q1.right) + (q2.right + q3.right) + 2.0 * (q1.s + q3.s);
+    syp = (q0.bottom + q1.bottom) + (q2.bottom + q3.bottom) + 2.0 * (q2.s + q3.s);
     col[0] = vec4<f16>(q0.l.w, q0.l.x, q2.l.w, q2.l.x);
     col[1] = vec4<f16>(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
     col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
@@ -345,9 +355,19 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
       sxp = sxp + f32(lx) * c;
       syp = syp + f32(ly) * c;
     }
+    // Edge blocks accumulate in 0..255 units; rescale to the unit domain.
+    qsum[0] = qsum[0] * (1.0 / 255.0);
+    qsum[1] = qsum[1] * (1.0 / 255.0);
+    qsum[2] = qsum[2] * (1.0 / 255.0);
+    qsum[3] = qsum[3] * (1.0 / 255.0);
+    sxp = sxp * (1.0 / 255.0);
+    syp = syp * (1.0 / 255.0);
   }
 
-  let total = qsum[0] + qsum[1] + qsum[2] + qsum[3];
+  let total = (qsum[0] + qsum[1]) + (qsum[2] + qsum[3]);
+  // Right and bottom halves (subblock 1 of flip 0 / flip 1).
+  let right = qsum[1] + qsum[3];
+  let bottom = qsum[2] + qsum[3];
   // Exactly gray: every quadrant sum AND both planar moments equal across
   // R, G, B — then R and B planar corners coincide (same 6-bit code) and
   // only R (6-bit) and G (7-bit) need solving.
@@ -362,10 +382,16 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   var bflip = 0u;
   var sel: FlipFit;
   if (gray) {
+    // The unit-domain sums carry f32 rounding noise; gray blocks resolve
+    // exact est ties (the two flips often tie), so their five scalars are
+    // snapped back to the exact integers first.
+    let tr = round(total.r * 255.0);
+    let r1 = round(right.r * 255.0);
+    let b1 = round(bottom.r * 255.0);
     // Planar on two channels: R and B share the 6-bit solve.
-    let rB = sxp.r * 0.25;
-    let rC = syp.r * 0.25;
-    let rA = total.r - rB - rC;
+    let rB = round(sxp.r * 255.0) * 0.25;
+    let rC = round(syp.r * 255.0) * 0.25;
+    let rA = tr - rB - rC;
     let po = 0.2875 * rA - 0.0125 * rB - 0.0125 * rC;
     let ph = -0.0125 * rA + 0.4875 * rB - 0.3125 * rC;
     let pv = -0.0125 * rA - 0.3125 * rB + 0.4875 * rC;
@@ -384,10 +410,10 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     qh = qh2.xyx;
     qv = qv2.xyx;
 
-    let sum0a = qsum[0].r + qsum[2].r;
-    let sum1a = qsum[1].r + qsum[3].r;
-    let sum0b = qsum[0].r + qsum[1].r;
-    let sum1b = qsum[2].r + qsum[3].r;
+    let sum1a = r1;
+    let sum0a = tr - r1;
+    let sum1b = b1;
+    let sum0b = tr - b1;
     sel = fit_gray(col[0], col[1], col[2], col[3], sum0a, sum1a);
     let alt = fit_gray(
       vec4<f16>(col[0].xy, col[1].xy),
@@ -405,7 +431,8 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     // LSQ plane in closed form: rhs rA = Σ(1 − x/4 − y/4)·p, rB = Σ(x/4)·p,
     // rC = Σ(y/4)·p times the constant inverse Gram matrix (the same
     // coefficient form as the CPU mirror, so rounding ties resolve alike);
-    // estimate with the quantised, clamped corners: −2·θ·rhs + θᵀGθ.
+    // estimate with the quantised, clamped corners: −2·θ·rhs + θᵀGθ. In
+    // the unit domain the corner clamp is a free saturate().
     let rB = sxp * 0.25;
     let rC = syp * 0.25;
     let rA = total - rB - rC;
@@ -413,39 +440,42 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     let ph = -0.0125 * rA + 0.4875 * rB - 0.3125 * rC;
     let pv = -0.0125 * rA - 0.3125 * rB + 0.4875 * rC;
     let pmax = vec3<f32>(63.0, 127.0, 63.0);
-    qo = clamp(floor(po * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
-    qh = clamp(floor(ph * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
-    qv = clamp(floor(pv * (pmax / 255.0) + 0.5), vec3<f32>(0.0), pmax);
+    qo = floor(saturate(po) * pmax + 0.5);
+    qh = floor(saturate(ph) * pmax + 0.5);
+    qv = floor(saturate(pv) * pmax + 0.5);
     // 6-bit expand (q<<2)|(q>>4) = floor(4.0625·q); 7-bit (q<<1)|(q>>6) = floor(2.015625·q).
     let xk = vec3<f32>(4.0625, 2.015625, 4.0625);
     let eo = floor(qo * xk);
     let eh = floor(qh * xk);
     let ev = floor(qv * xk);
-    let gram = 3.5 * (eo * eo + eh * eh + ev * ev) + 0.5 * eo * (eh + ev) + 4.5 * eh * ev;
-    planar_est = dot(gram - 2.0 * (eo * rA + eh * rB + ev * rC), ONE3) + PLANAR_FUDGE;
+    // θᵀGθ − 2θ·rhs in Horner form (rhs scaled back to 0..255 units).
+    let mA = -510.0 * rA;
+    let mB = -510.0 * rB;
+    let mC = -510.0 * rC;
+    let pe = eo * (3.5 * eo + 0.5 * (eh + ev) + mA) + eh * (3.5 * eh + 4.5 * ev + mB) + ev * (3.5 * ev + mC);
+    planar_est = dot(pe, ONE3) + PLANAR_FUDGE;
 
-    // Flip 0 splits columns (sum0a = left half), flip 1 splits rows (sum0b =
-    // top half). Per flip, the preselect residual minus the flip-independent
-    // Σ||p||² and Σℓ² terms: −Σ||s||²/8 + κ·(Σℓ)²/24 over its two subblocks.
-    let sum0a = qsum[0] + qsum[2];
-    let sum1a = qsum[1] + qsum[3];
-    let sum0b = qsum[0] + qsum[1];
-    let sum1b = qsum[2] + qsum[3];
-    let l0a = dot(sum0a, ONE3);
-    let l1a = dot(sum1a, ONE3);
-    let l0b = dot(sum0b, ONE3);
-    let l1b = dot(sum1b, ONE3);
-    let res_a = KAPPA / 24.0 * (l0a * l0a + l1a * l1a) - 0.125 * (dot(sum0a, sum0a) + dot(sum1a, sum1a));
-    let res_b = KAPPA / 24.0 * (l0b * l0b + l1b * l1b) - 0.125 * (dot(sum0b, sum0b) + dot(sum1b, sum1b));
+    // Flip 0 splits columns (subblock 1 = right half), flip 1 splits rows
+    // (subblock 1 = bottom half). Per flip, the preselect residual minus
+    // flip-independent terms: with the halves' difference Δ = s0 − s1 and
+    // δ = Σ_c Δ_c, −Σ||s||²/8 + κ·(Σℓ)²/24 over the two subblocks is
+    // (κ·δ² − 3·||Δ||²)/48 plus a flip-independent constant.
+    let da = total - 2.0 * right;
+    let db = total - 2.0 * bottom;
+    let la = dot(da, ONE3);
+    let lb = dot(db, ONE3);
+    let res_a = KAPPA * la * la - 3.0 * dot(da, da);
+    let res_b = KAPPA * lb * lb - 3.0 * dot(db, db);
     let fb = res_b < res_a;
     bflip = select(0u, 1u, fb);
+    let sum1 = select(right, bottom, fb);
     sel = fit_flip(
       select(col[0], vec4<f16>(col[0].xy, col[1].xy), fb),
       select(col[1], vec4<f16>(col[2].xy, col[3].xy), fb),
       select(col[2], vec4<f16>(col[0].zw, col[1].zw), fb),
       select(col[3], vec4<f16>(col[2].zw, col[3].zw), fb),
-      select(sum0a, sum0b, fb),
-      select(sum1a, sum1b, fb),
+      total - sum1,
+      sum1,
     );
   }
 

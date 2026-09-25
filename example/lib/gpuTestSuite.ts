@@ -551,7 +551,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     // 'fast' mirror instead of 'high': the fast path no longer emits planar,
     // so on smooth content the fast-vs-high gap alone can exceed the bug
     // threshold — and the mirror comparison is the stronger contract anyway
-    // (the GPU pipeline matches it byte-for-byte, prepared source included).
+    // (the GPU pipeline matches it decision for decision, up to float ties).
     onProgress(`Correctness: ${format} odd-size padding vs CPU reference`)
     const oddImg = format === 'bc5' ? normalOdd : colorOdd
     const gpuOdd = await enc.encodeToBytes(oddImg)
