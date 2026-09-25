@@ -29,9 +29,11 @@
 //     true clamped error.
 //   • Loads: 4 textureGather quads × R,G,B for interior blocks (the gather
 //     point, normalised by the PHYSICAL texture size, sits exactly between
-//     the quad's texel centres; interior quads never touch the zeroed
-//     padding strip). Blocks straddling the edge of a non-multiple-of-4
-//     image fall back to clamped per-texel loads. Lumas are kept as 4
+//     the quad's texel centres, the other three quads by constant texel
+//     offsets; interior quads never touch the zeroed padding strip). Blocks
+//     straddling the edge of a non-multiple-of-4 image build the same quads
+//     from clamped per-texel loads — never a runtime-indexed loop: one that
+//     wrote col[x][y]/qsum[q] cost ~2% on EVERY block. Lumas are kept as 4
 //     COLUMN vectors — wire pixel order is x·4 + y — so both flips' half-
 //     blocks and the index packing use only constant indexing.
 //   • Channel sums stay in the sampler's UNIT domain: the ×255 lives in
@@ -67,7 +69,7 @@
 //     magnitude covers max|D| and its lower neighbour (outlier hedge).
 //     One candidate loses ~0.7-2.9 dB; all eight gain ≤ 0.05 dB. Scores use
 //     the min form: per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) is the
-//     threshold rule exactly, and its a3 part sums in closed form. A flip's
+//     threshold rule exactly, summed as an |x| form (see table_score). A flip's
 //     two subblocks are searched together (sb_pair): the lower-neighbour
 //     scores sit behind ONE branch, skipped when both covers are table 0 —
 //     then the lower neighbour IS the cover table. Smooth content skips it
@@ -101,7 +103,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var src_tex: texture_2d<f32>;
-@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<vec2<u32>>;
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var smp: sampler;
 
@@ -117,13 +119,17 @@ const PLANAR_FUDGE = 8.0;
 const KAPPA = 0.9;
 const ONE3 = vec3<f32>(1.0);
 const ONE4 = vec4<f32>(1.0);
-
-fn signed3(bits: u32) -> i32 {
-  return select(i32(bits), i32(bits) - 8, bits > 3u);
-}
+// Float -> u32 for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so bitcast(x + MAGIC) ^ MAGIC_BITS == x, and a left shift by
+// >= 8 drops the exponent bits on its own. WGSL's u32(f32) is a SATURATING
+// conversion (compares + selects around the convert): packing's 15 of them
+// cost ~2.5% GPU.
+const MAGIC = 8388608.0;
+const MAGIC_BITS = 0x4B000000u;
 
 fn bswap(x: u32) -> u32 {
-  return ((x & 0xffu) << 24u) | ((x & 0xff00u) << 8u) | ((x >> 8u) & 0xff00u) | (x >> 24u);
+  let t = ((x & 0x00ff00ffu) << 8u) | ((x >> 8u) & 0x00ff00ffu);
+  return (t << 16u) | (t >> 16u);
 }
 
 fn max4(v: vec4<f16>) -> f16 {
@@ -134,7 +140,10 @@ fn max4(v: vec4<f16>) -> f16 {
 // = 3.875, 15·255/2040 = 1.875): codes (as floats) and their 8-bit
 // expansions. Differential mode when the 5-bit codes are within
 // the 3-bit delta range, else individual 4-bit. Expansions in float:
-// (q<<3)|(q>>2) = floor(8.25·q) for 5 bits, (q<<4)|q = 17·q for 4 bits.
+// (q<<3)|(q>>2) = floor(8.25·q) for 5 bits, (q<<4)|q = 17·q for 4 bits —
+// the mode's codes are selected first, then expanded once. (The codes
+// themselves must stay a select of q/i: recomputing floor(sum·k + 0.5)
+// with a selected k could round differently from the q the diff test saw.)
 struct Bases {
   c0: vec3<f32>,
   c1: vec3<f32>,
@@ -152,27 +161,38 @@ fn quantise_bases(sum0: vec3<f32>, sum1: vec3<f32>) -> Bases {
   let i1 = floor(sum1 * 1.875 + 0.5);
   o.c0 = select(i0, q0, o.diff);
   o.c1 = select(i1, q1, o.diff);
-  o.b0 = select(i0 * 17.0, floor(q0 * 8.25), o.diff);
-  o.b1 = select(i1 * 17.0, floor(q1 * 8.25), o.diff);
+  let k = select(17.0, 8.25, o.diff);
+  o.b0 = floor(o.c0 * k);
+  o.b1 = floor(o.c1 * k);
   return o;
 }
 
 // Subblock error (×3) of table t under the threshold rule, in min form:
-// per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) = (a3² − 2·a3·ad) +
-// min(0, (b3² − a3²) − 2·(b3 − a3)·ad); the a3 part sums in closed form
-// from sad = Σ ad.
-// Per-table score constants: DK = b3² − a3², DM = −2(b3 − a3), A8 = 8·a3²,
-// AM = −2·a3 (precomputed: −1.5% GPU over deriving them per call).
-const DK = array<f32, 8>(540.0, 2376.0, 6840.0, 14355.0, 29484.0, 52416.0, 91323.0, 281520.0);
-const DM = array<f32, 8>(-36.0, -72.0, -120.0, -174.0, -252.0, -336.0, -438.0, -816.0);
-const A8 = array<f32, 8>(288.0, 1800.0, 5832.0, 12168.0, 23328.0, 41472.0, 78408.0, 159048.0);
-const AM = array<f32, 8>(-12.0, -30.0, -54.0, -78.0, -108.0, -144.0, -198.0, -282.0);
+// per texel min(a3² − 2·a3·ad, b3² − 2·b3·ad) = (a3² − 2·a3·ad) + min(0, x)
+// with x = (b3² − a3²) − 2·(b3 − a3)·ad. min(0, x) = (x − |x|)/2, and Σx
+// and the a3 part both sum in closed form from sad = Σ ad, so per texel
+// only one FMA and one |·| add remain (|·| is a free source modifier):
+//   score = 4(a3² + b3²) − (a3 + b3)·sad − ½·Σ|x|
+// All terms are integers (or halves) below 2^24 — exact in f32, identical
+// to the per-texel min form (−2% GPU; −3% on gray maps, which search twice).
+// One vec4 per table (DK = b3² − a3², DM = −2(b3 − a3), C0 = 4(a3² + b3²),
+// C1 = −(a3 + b3)): every runtime-indexed lookup also pays a bounds clamp,
+// so four scalar arrays cost ~1% more.
+const TAB = array<vec4<f32>, 8>(
+  vec4<f32>(540.0, -36.0, 2448.0, -30.0),
+  vec4<f32>(2376.0, -72.0, 11304.0, -66.0),
+  vec4<f32>(6840.0, -120.0, 33192.0, -114.0),
+  vec4<f32>(14355.0, -174.0, 69588.0, -165.0),
+  vec4<f32>(29484.0, -252.0, 141264.0, -234.0),
+  vec4<f32>(52416.0, -336.0, 251136.0, -312.0),
+  vec4<f32>(91323.0, -438.0, 443700.0, -417.0),
+  vec4<f32>(281520.0, -816.0, 1285128.0, -690.0),
+);
 fn table_score(au: vec4<f32>, av: vec4<f32>, sad: f32, t: u32) -> f32 {
-  let dk = DK[t];
-  let dm = DM[t];
-  let eu = min(vec4<f32>(0.0), au * dm + dk);
-  let ev = min(vec4<f32>(0.0), av * dm + dk);
-  return A8[t] + AM[t] * sad + dot(eu + ev, ONE4);
+  let k = TAB[t];
+  let xu = au * k.y + k.x;
+  let xv = av * k.y + k.x;
+  return fma(k.w, sad, k.z) - 0.5 * dot(abs(xu) + abs(xv), ONE4);
 }
 
 // Both subblocks of one flip (lumas u, v against base luma lb): cover
@@ -272,11 +292,14 @@ fn fit_gray(
   let diff = d >= -4.0 && d <= 3.0;
   let i0 = floor(sum0 * (15.0 / 2040.0) + 0.5);
   let i1 = floor(sum1 * (15.0 / 2040.0) + 0.5);
+  let c0 = select(i0, q0, diff);
+  let c1 = select(i1, q1, diff);
   out.bases.diff = diff;
-  out.bases.c0 = vec3<f32>(select(i0, q0, diff));
-  out.bases.c1 = vec3<f32>(select(i1, q1, diff));
-  let b0 = select(i0 * 17.0, floor(q0 * 8.25), diff);
-  let b1 = select(i1 * 17.0, floor(q1 * 8.25), diff);
+  out.bases.c0 = vec3<f32>(c0);
+  out.bases.c1 = vec3<f32>(c1);
+  let k = select(17.0, 8.25, diff);
+  let b0 = floor(c0 * k);
+  let b1 = floor(c1 * k);
   out.lb0 = 3.0 * b0;
   out.lb1 = 3.0 * b1;
   let pp = sb_pair(s0u, s0v, out.lb0, s1u, s1v, out.lb1);
@@ -296,16 +319,23 @@ struct Quad {
   right: vec3<f32>,
   bottom: vec3<f32>,
 };
-fn gather_quad(cc: vec2<f32>) -> Quad {
-  let r = textureGather(0, src_tex, smp, cc);
-  let g = textureGather(1, src_tex, smp, cc);
-  let b = textureGather(2, src_tex, smp, cc);
+fn gather_quad(r: vec4<f32>, g: vec4<f32>, b: vec4<f32>) -> Quad {
   var o: Quad;
   o.l = vec4<f16>(fma(r, vec4<f32>(255.0), fma(g, vec4<f32>(255.0), b * 255.0)));
   o.right = vec3<f32>(r.z + r.y, g.z + g.y, b.z + b.y);
   o.s = o.right + vec3<f32>(r.w + r.x, g.w + g.x, b.w + b.x);
   o.bottom = vec3<f32>(r.x + r.y, g.x + g.y, b.x + b.y);
   return o;
+}
+
+// Edge blocks: four clamped texel loads per quad, in gather order (the
+// sums then carry the same unit-domain rounding as interior blocks).
+fn load_quad(p: vec2<i32>, max_xy: vec2<i32>) -> Quad {
+  let a = textureLoad(src_tex, min(p, max_xy), 0);
+  let b = textureLoad(src_tex, min(p + vec2<i32>(1, 0), max_xy), 0);
+  let c = textureLoad(src_tex, min(p + vec2<i32>(0, 1), max_xy), 0);
+  let d = textureLoad(src_tex, min(p + vec2<i32>(1, 1), max_xy), 0);
+  return gather_quad(vec4<f32>(c.r, d.r, b.r, a.r), vec4<f32>(c.g, d.g, b.g, a.g), vec4<f32>(c.b, d.b, b.b, a.b));
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -328,10 +358,26 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   if (u32(base_xy.x) + 4u <= params.width && u32(base_xy.y) + 4u <= params.height) {
     let inv = vec2<f32>(1.0) / vec2<f32>(textureDimensions(src_tex));
     let c0 = (vec2<f32>(base_xy) + 1.0) * inv;
-    let q0 = gather_quad(c0);
-    let q1 = gather_quad(c0 + vec2<f32>(2.0, 0.0) * inv);
-    let q2 = gather_quad(c0 + vec2<f32>(0.0, 2.0) * inv);
-    let q3 = gather_quad(c0 + vec2<f32>(2.0, 2.0) * inv);
+    let q0 = gather_quad(
+      textureGather(0, src_tex, smp, c0),
+      textureGather(1, src_tex, smp, c0),
+      textureGather(2, src_tex, smp, c0),
+    );
+    let q1 = gather_quad(
+      textureGather(0, src_tex, smp, c0, vec2<i32>(2, 0)),
+      textureGather(1, src_tex, smp, c0, vec2<i32>(2, 0)),
+      textureGather(2, src_tex, smp, c0, vec2<i32>(2, 0)),
+    );
+    let q2 = gather_quad(
+      textureGather(0, src_tex, smp, c0, vec2<i32>(0, 2)),
+      textureGather(1, src_tex, smp, c0, vec2<i32>(0, 2)),
+      textureGather(2, src_tex, smp, c0, vec2<i32>(0, 2)),
+    );
+    let q3 = gather_quad(
+      textureGather(0, src_tex, smp, c0, vec2<i32>(2, 2)),
+      textureGather(1, src_tex, smp, c0, vec2<i32>(2, 2)),
+      textureGather(2, src_tex, smp, c0, vec2<i32>(2, 2)),
+    );
     qsum[0] = q0.s;
     qsum[1] = q1.s;
     qsum[2] = q2.s;
@@ -343,25 +389,22 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
     col[3] = vec4<f16>(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
   } else {
+    // Edge of a non-multiple-of-4 image: clamp to the last texel.
     let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
-    for (var i: u32 = 0u; i < 16u; i = i + 1u) {
-      let lx = i & 3u;
-      let ly = i >> 2u;
-      let p = clamp(base_xy + vec2<i32>(i32(lx), i32(ly)), vec2<i32>(0, 0), max_xy);
-      let c = round(textureLoad(src_tex, p, 0).rgb * 255.0);
-      col[lx][ly] = f16(c.r + c.g + c.b);
-      let q = u32(lx >= 2u) | (u32(ly >= 2u) << 1u);
-      qsum[q] = qsum[q] + c;
-      sxp = sxp + f32(lx) * c;
-      syp = syp + f32(ly) * c;
-    }
-    // Edge blocks accumulate in 0..255 units; rescale to the unit domain.
-    qsum[0] = qsum[0] * (1.0 / 255.0);
-    qsum[1] = qsum[1] * (1.0 / 255.0);
-    qsum[2] = qsum[2] * (1.0 / 255.0);
-    qsum[3] = qsum[3] * (1.0 / 255.0);
-    sxp = sxp * (1.0 / 255.0);
-    syp = syp * (1.0 / 255.0);
+    let q0 = load_quad(base_xy, max_xy);
+    let q1 = load_quad(base_xy + vec2<i32>(2, 0), max_xy);
+    let q2 = load_quad(base_xy + vec2<i32>(0, 2), max_xy);
+    let q3 = load_quad(base_xy + vec2<i32>(2, 2), max_xy);
+    qsum[0] = q0.s;
+    qsum[1] = q1.s;
+    qsum[2] = q2.s;
+    qsum[3] = q3.s;
+    sxp = (q0.right + q1.right) + (q2.right + q3.right) + 2.0 * (q1.s + q3.s);
+    syp = (q0.bottom + q1.bottom) + (q2.bottom + q3.bottom) + 2.0 * (q2.s + q3.s);
+    col[0] = vec4<f16>(q0.l.w, q0.l.x, q2.l.w, q2.l.x);
+    col[1] = vec4<f16>(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
+    col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
+    col[3] = vec4<f16>(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
   }
 
   let total = (qsum[0] + qsum[1]) + (qsum[2] + qsum[3]);
@@ -469,11 +512,16 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     let fb = res_b < res_a;
     bflip = select(0u, 1u, fb);
     let sum1 = select(right, bottom, fb);
+    // sb_pair is order-blind within a subblock: rows 0-1 of columns 0-1 are
+    // in subblock 0 and rows 2-3 of columns 2-3 in subblock 1 for either
+    // flip, so only the other two half-columns swap (8 selects, not 16).
+    let cz = vec4<f16>(col[0].zw, col[1].zw);
+    let cx = vec4<f16>(col[2].xy, col[3].xy);
     sel = fit_flip(
-      select(col[0], vec4<f16>(col[0].xy, col[1].xy), fb),
-      select(col[1], vec4<f16>(col[2].xy, col[3].xy), fb),
-      select(col[2], vec4<f16>(col[0].zw, col[1].zw), fb),
-      select(col[3], vec4<f16>(col[2].zw, col[3].zw), fb),
+      vec4<f16>(col[0].xy, col[1].xy),
+      select(cz, cx, fb),
+      vec4<f16>(col[2].zw, col[3].zw),
+      select(cx, cz, fb),
       total - sum1,
       sum1,
     );
@@ -483,18 +531,15 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   var hi: u32;
   var lo: u32;
   if (sel.est <= planar_est) {
-    let codes0 = vec3<u32>(sel.bases.c0);
-    let codes1 = vec3<u32>(sel.bases.c1);
     let t0 = sel.t0;
     let t1 = sel.t1;
-    if (sel.bases.diff) {
-      let d = vec3<u32>(vec3<i32>(codes1) - vec3<i32>(codes0)) & vec3<u32>(7u);
-      hi = (codes0.r << 27u) | (d.r << 24u) | (codes0.g << 19u) | (d.g << 16u) | (codes0.b << 11u) | (d.b << 8u)
-         | (t0 << 5u) | (t1 << 2u) | 2u | bflip;
-    } else {
-      hi = (codes0.r << 28u) | (codes1.r << 24u) | (codes0.g << 20u) | (codes1.g << 16u) | (codes0.b << 12u) | (codes1.b << 8u)
-         | (t0 << 5u) | (t1 << 2u) | bflip;
-    }
+    // Per channel byte: differential = base5 << 3 | (delta & 7), individual
+    // = base4a << 4 | base4b — built in float, converted once (MAGIC).
+    let dfl = sel.bases.diff;
+    let dd = sel.bases.c1 - sel.bases.c0;
+    let low = select(sel.bases.c1, select(dd, dd + 8.0, dd < vec3<f32>(0.0)), dfl);
+    let bytes = bitcast<vec3<u32>>(fma(sel.bases.c0, vec3<f32>(select(16.0, 8.0, dfl)), low) + MAGIC);
+    hi = (bytes.r << 24u) | (bytes.g << 16u) | (bytes.b << 8u) | (t0 << 5u) | (t1 << 2u) | select(0u, 2u, dfl) | bflip;
     // Wire indices, column by column (bit x·4 + y): flip 0 gives columns
     // 0,1 subblock 0; flip 1 gives rows 0,1 (lanes x, y) subblock 0.
     // LSB = large modifier, MSB = negative.
@@ -509,36 +554,62 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     let lb_r = select(vec4<f16>(lb1), lb_rows, fb);
     let th_l = select(vec4<f16>(th0), th_rows, fb);
     let th_r = select(vec4<f16>(th1), th_rows, fb);
-    let bitv = vec4<u32>(1u, 2u, 4u, 8u);
+    // Unrolled by hand (~1% over the equivalent 4-iteration loop).
     var lsb = 0u;
     var msb = 0u;
-    for (var c: u32 = 0u; c < 4u; c = c + 1u) {
-      let d = col[c] - select(lb_l, lb_r, c >= 2u);
-      let large = select(vec4<u32>(0u), bitv, abs(d) > select(th_l, th_r, c >= 2u));
-      let neg = select(vec4<u32>(0u), bitv, d < vec4<f16>(0.0));
-      lsb = lsb | ((large.x | large.y | large.z | large.w) << (c * 4u));
-      msb = msb | ((neg.x | neg.y | neg.z | neg.w) << (c * 4u));
+    {
+      let d = col[0] - lb_l;
+      let bits = vec4<u32>(1u, 2u, 4u, 8u);
+      let large = select(vec4<u32>(0u), bits, abs(d) > th_l);
+      let neg = select(vec4<u32>(0u), bits, d < vec4<f16>(0.0));
+      lsb = lsb | (large.x | large.y | large.z | large.w);
+      msb = msb | (neg.x | neg.y | neg.z | neg.w);
+    }
+    {
+      let d = col[1] - lb_l;
+      let bits = vec4<u32>(16u, 32u, 64u, 128u);
+      let large = select(vec4<u32>(0u), bits, abs(d) > th_l);
+      let neg = select(vec4<u32>(0u), bits, d < vec4<f16>(0.0));
+      lsb = lsb | (large.x | large.y | large.z | large.w);
+      msb = msb | (neg.x | neg.y | neg.z | neg.w);
+    }
+    {
+      let d = col[2] - lb_r;
+      let bits = vec4<u32>(256u, 512u, 1024u, 2048u);
+      let large = select(vec4<u32>(0u), bits, abs(d) > th_r);
+      let neg = select(vec4<u32>(0u), bits, d < vec4<f16>(0.0));
+      lsb = lsb | (large.x | large.y | large.z | large.w);
+      msb = msb | (neg.x | neg.y | neg.z | neg.w);
+    }
+    {
+      let d = col[3] - lb_r;
+      let bits = vec4<u32>(4096u, 8192u, 16384u, 32768u);
+      let large = select(vec4<u32>(0u), bits, abs(d) > th_r);
+      let neg = select(vec4<u32>(0u), bits, d < vec4<f16>(0.0));
+      lsb = lsb | (large.x | large.y | large.z | large.w);
+      msb = msb | (neg.x | neg.y | neg.z | neg.w);
     }
     lo = lsb | (msb << 16u);
   } else {
-    let ro = u32(qo.r); let go = u32(qo.g); let bo = u32(qo.b);
-    let rh = u32(qh.r); let gh = u32(qh.g); let bh = u32(qh.b);
-    let rv = u32(qv.r); let gv = u32(qv.g); let bv = u32(qv.b);
-    let r_sum = i32(ro >> 2u) + signed3(((ro & 3u) << 1u) | (go >> 6u));
-    let r_fix = select(0u, 1u, r_sum < 0);
-    let g_sum = i32((go >> 2u) & 15u) + signed3(((go & 3u) << 1u) | (bo >> 5u));
-    let g_fix = select(0u, 1u, g_sum < 0);
-    let p = (bo >> 3u) & 3u;
-    let q = (bo >> 1u) & 3u;
-    let b_fix3 = select(0u, 7u, p + q >= 4u);
-    let b_fix1 = select(1u, 0u, p + q >= 4u);
-    hi = (r_fix << 31u) | (ro << 25u) | ((go >> 6u) << 24u) | (g_fix << 23u) | ((go & 63u) << 17u)
-       | ((bo >> 5u) << 16u) | (b_fix3 << 13u) | (((bo >> 3u) & 3u) << 11u) | (b_fix1 << 10u)
-       | ((bo & 7u) << 7u) | ((rh >> 1u) << 2u) | 2u | (rh & 1u);
-    lo = (gh << 25u) | (bh << 19u) | (rv << 13u) | (gv << 6u) | bv;
+    let pi = bitcast<vec4<u32>>(vec4<f32>(qo, qh.r) + MAGIC) ^ vec4<u32>(MAGIC_BITS);
+    let ro = pi.x; let go = pi.y; let bo = pi.z; let rh = pi.w;
+    // ETC1-view overflow fixes. R and G fields read as base + signed 3-bit
+    // delta (x >> 3, x & 7) must stay in [0, 31]: signed3(v) = (v ^ 4) − 4.
+    let xr = (ro << 1u) | (go >> 6u);
+    let xg = ((go & 63u) << 1u) | (bo >> 5u);
+    let r_fix = select(0u, 0x80000000u, (xr >> 3u) + ((xr & 7u) ^ 4u) < 4u);
+    let g_fix = select(0u, 0x800000u, (xg >> 3u) + ((xg & 7u) ^ 4u) < 4u);
+    // B must overflow: bits 47-45 = 111 with bit 42 = 0 when p + q >= 4,
+    // else 000 with bit 42 = 1.
+    let b_fix = select(0x400u, 0xE000u, ((bo >> 3u) & 3u) + ((bo >> 1u) & 3u) >= 4u);
+    // go + (go & 64) moves GO bit 6 up one place (bit 24; bit 23 is g_fix);
+    // rh + (rh & 62) spreads RH around the diff bit.
+    hi = r_fix | (ro << 25u) | ((go + (go & 64u)) << 17u) | g_fix
+       | ((bo & 32u) << 11u) | ((bo & 24u) << 8u) | ((bo & 7u) << 7u) | b_fix
+       | (rh + (rh & 62u)) | 2u;
+    // GH·2^25 | BH·2^19 | RV·2^13 | GV·2^6 | BV: two exact float field sums.
+    lo = (bitcast<u32>(fma(qh.g, 64.0, qh.b) + MAGIC) << 19u) | (bitcast<u32>(fma(fma(qv.r, 128.0, qv.g), 64.0, qv.b) + MAGIC) ^ MAGIC_BITS);
   }
 
-  let out = block_index * 2u;
-  dst[out]      = bswap(hi);
-  dst[out + 1u] = bswap(lo);
+  dst[block_index] = vec2<u32>(bswap(hi), bswap(lo));
 }

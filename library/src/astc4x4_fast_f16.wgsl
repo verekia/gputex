@@ -72,6 +72,25 @@ struct Params { blocks_x: u32, blocks_y: u32, width: u32, height: u32, y0: u32, 
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
+// Float -> u32 for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so bitcast(x + MAGIC) ^ MAGIC_BITS == x (or masked, for small
+// fields). WGSL's u32(float) is a SATURATING conversion (compares + selects
+// around the convert): the per-texel weight conversions alone cost ~1.5% GPU.
+const MAGIC = 8388608.0;
+const MAGIC_BITS = 0x4B000000u;
+fn hbits(x: f16, mask: u32) -> u32 {
+  return bitcast<u32>(f32(x) + MAGIC) & mask;
+}
+fn fu(x: f32) -> u32 {
+  return bitcast<u32>(x + MAGIC) ^ MAGIC_BITS;
+}
+fn fu3(x: vec3<f32>) -> vec3<u32> {
+  return bitcast<vec3<u32>>(x + MAGIC) ^ vec3<u32>(MAGIC_BITS);
+}
+fn fu4(x: vec4<f32>) -> vec4<u32> {
+  return bitcast<vec4<u32>>(x + MAGIC) ^ vec4<u32>(MAGIC_BITS);
+}
+
 // Fused projection + least-squares refit against the 4-level QUANT_4
 // palette (translucent blocks). Returns the refit endpoints and the
 // projection's packed weight stream.
@@ -96,7 +115,7 @@ fn proj_fit(pix: ptr<function, array<h4, 16>>, e0: h4, e1: h4) -> Fit {
   for (var k: u32 = 0u; k < 16u; k = k + 1u) {
     let vr = (*pix)[k] - e0;
     let s = clamp(floor(dot(vr, dir) * inv + h(0.5)), h(0.0), h(3.0));
-    out.wstream = out.wstream | (u32(s) << (2u * k));
+    out.wstream = out.wstream | (hbits(s, 3u) << (2u * k));
     s_min = min(s_min, s); s_max = max(s_max, s);
     let b = s * h(1.0 / 3.0);
     let a = h(1.0) - b;
@@ -131,7 +150,7 @@ fn trit_enc(t0: u32, t1: u32, t2: u32, t3: u32, t4: u32) -> u32 {
 // nearer representable neighbour (a fixed direction instead costs up to
 // 0.4 dB on smooth content). Returns (ISE value = trit·64 + bits, level).
 fn q192(x: f32) -> vec2<u32> {
-  let v = u32(clamp(floor(x + 0.5), 0.0, 255.0));
+  let v = fu(clamp(floor(x + 0.5), 0.0, 255.0));
   let up = v > 127u;
   var u = select(v, 255u - v, up);
   if ((u & 3u) == 3u) {
@@ -142,7 +161,7 @@ fn q192(x: f32) -> vec2<u32> {
 }
 
 fn q8(e: h4) -> vec4<u32> {
-  return vec4<u32>(clamp(floor(e * h(255.0) + h(0.5)), h4(0.0), h4(255.0)));
+  return fu4(vec4<f32>(clamp(floor(e * h(255.0) + h(0.5)), h4(0.0), h4(255.0))));
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -178,8 +197,8 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     // Scalar [0,255]-integer domain. Endpoints at the exact extremes (the
     // 8-bit values round-trip f16 exactly); 32 palette levels make an LSQ
     // refit unnecessary.
-    let L0 = u32(floor(lo.x * h(255.0) + h(0.5)));
-    let L1 = u32(floor(hi.x * h(255.0) + h(0.5)));
+    let L0 = hbits(floor(lo.x * h(255.0) + h(0.5)), 255u);
+    let L1 = hbits(floor(hi.x * h(255.0) + h(0.5)), 255u);
     var s0 = 0u; var s1 = 0u; var s2 = 0u;
     if (L1 > L0) {
       let l0f = h(f32(L0));
@@ -194,7 +213,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
         let wlo = clamp(floor(u * h(0.5) + h(0.5)), h(0.0), h(15.0));
         let whi = clamp(floor((u - h(2.0)) * h(0.5) + h(0.5)), h(16.0), h(31.0));
         let pick = abs(u - wlo * h(2.0)) <= abs(u - (whi * h(2.0) + h(2.0)));
-        let w = u32(select(whi, wlo, pick));
+        let w = hbits(select(whi, wlo, pick), 31u);
         // Stream bit q = 5k + j; straddles handled with constant shifts.
         let off = 5u * k;
         if (off < 28u) { s0 = s0 | (w << off); }
@@ -273,8 +292,8 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     var r0: vec2<u32>; var g0: vec2<u32>; var b0: vec2<u32>;
     var r1: vec2<u32>; var g1: vec2<u32>; var b1: vec2<u32>;
     if (small) {
-      let e0 = vec3<u32>(clamp(floor(x0 + 0.5), vec3<f32>(0.0), vec3<f32>(255.0)));
-      let e1 = vec3<u32>(clamp(floor(x1 + 0.5), vec3<f32>(0.0), vec3<f32>(255.0)));
+      let e0 = fu3(clamp(floor(x0 + 0.5), vec3<f32>(0.0), vec3<f32>(255.0)));
+      let e1 = fu3(clamp(floor(x1 + 0.5), vec3<f32>(0.0), vec3<f32>(255.0)));
       r0 = vec2<u32>(e0.x); g0 = vec2<u32>(e0.y); b0 = vec2<u32>(e0.z);
       r1 = vec2<u32>(e1.x); g1 = vec2<u32>(e1.y); b1 = vec2<u32>(e1.z);
     } else {
@@ -301,11 +320,11 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     if (dd >= h(0.008)) {
       let inv = lmax * h(32.0) / dd;
       for (var k: u32 = 0u; k < 8u; k = k + 1u) {
-        let w = u32(clamp(floor(dot(pix[k].xyz - d0, dir) * inv + h(0.5)), h(0.0), lmax));
+        let w = hbits(clamp(floor(dot(pix[k].xyz - d0, dir) * inv + h(0.5)), h(0.0), lmax), 15u);
         s0 = s0 | (w << (4u * k));
       }
       for (var k: u32 = 8u; k < 16u; k = k + 1u) {
-        let w = u32(clamp(floor(dot(pix[k].xyz - d0, dir) * inv + h(0.5)), h(0.0), lmax));
+        let w = hbits(clamp(floor(dot(pix[k].xyz - d0, dir) * inv + h(0.5)), h(0.0), lmax), 15u);
         s1 = s1 | (w << (4u * (k - 8u)));
       }
     }
@@ -412,7 +431,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
       if (dd >= h(0.008)) {
         let inv = h(96.0) / dd;
         for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-          let w = u32(clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(3.0)));
+          let w = hbits(clamp(floor(dot(pix[k] - d0, dir) * inv + h(0.5)), h(0.0), h(3.0)), 3u);
           s0 = s0 | (w << (2u * k));
         }
       }

@@ -39,12 +39,17 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> dst: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
 
+// Float -> u32 for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so bitcast(x + MAGIC) ^ MAGIC_BITS == x. WGSL's u32(float) is a
+// SATURATING conversion (compares + selects around the convert).
+const MAGIC = 8388608.0;
+const MAGIC_BITS = 0x4B000000u;
+
 fn to565(c: vec3<f32>) -> u32 {
-  // Round-to-nearest quantization into 5-6-5.
-  let r = u32(clamp(floor(c.r * 31.0 + 0.5), 0.0, 31.0));
-  let g = u32(clamp(floor(c.g * 63.0 + 0.5), 0.0, 63.0));
-  let b = u32(clamp(floor(c.b * 31.0 + 0.5), 0.0, 31.0));
-  return (r << 11u) | (g << 5u) | b;
+  // Round-to-nearest quantization into 5-6-5, packed in float (exact) and
+  // converted once.
+  let q = clamp(floor(c * vec3<f32>(31.0, 63.0, 31.0) + 0.5), vec3<f32>(0.0), vec3<f32>(31.0, 63.0, 31.0));
+  return bitcast<u32>(dot(q, vec3<f32>(2048.0, 32.0, 1.0)) + MAGIC) ^ MAGIC_BITS;
 }
 
 fn from565(c: u32) -> vec3<f32> {
@@ -81,28 +86,40 @@ fn order565(a: u32, b: u32) -> vec2<u32> {
 // refit needs: ΣL, ΣL², Σu, ΣL·u (u = v − p0). Level → BC1 index: 0→0
 // (c0), 1→2 (⅔c0+⅓c1), 2→3, 3→1 (c1); as a packed LUT: (0x78 >> 2L) & 3.
 struct Moments { sL: f32, sLL: f32, sU: vec3<f32>, sLu: vec3<f32>, indices: u32, err: f32 };
+fn project(m: ptr<function, Moments>, v: vec3<f32>, p0: vec3<f32>, dir: vec3<f32>, inv: f32, k: u32) {
+  let u = v - p0;
+  let L = clamp(floor(dot(u, dir) * inv + 0.5), 0.0, 3.0);
+  (*m).sL = (*m).sL + L;
+  (*m).sLL = (*m).sLL + L * L;
+  (*m).sU = (*m).sU + u;
+  (*m).sLu = (*m).sLu + L * u;
+  // 2L read out of the float by the MAGIC trick (no u32() conversion).
+  (*m).indices = (*m).indices | (((0x78u >> (bitcast<u32>(L * 2.0 + MAGIC) & 7u)) & 3u) << (k * 2u));
+  let e = u - L * (1.0 / 3.0) * dir;
+  (*m).err = (*m).err + dot(e, e);
+}
+// Unrolled over constant texel indices (see bc1_fast_f16.wgsl).
 fn moments(pix: ptr<function, array<vec3<f32>, 16>>, c0: u32, c1: u32) -> Moments {
   let p0 = from565(c0);
   let dir = from565(c1) - p0;
   let inv = 3.0 / dot(dir, dir);
-  var out: Moments;
-  out.sL = 0.0;
-  out.sLL = 0.0;
-  out.sU = vec3<f32>(0.0);
-  out.sLu = vec3<f32>(0.0);
-  out.indices = 0u;
-  out.err = 0.0;
-  for (var k: u32 = 0u; k < 16u; k = k + 1u) {
-    let u = (*pix)[k] - p0;
-    let L = clamp(floor(dot(u, dir) * inv + 0.5), 0.0, 3.0);
-    out.sL = out.sL + L;
-    out.sLL = out.sLL + L * L;
-    out.sU = out.sU + u;
-    out.sLu = out.sLu + L * u;
-    out.indices = out.indices | (((0x78u >> (u32(L) * 2u)) & 3u) << (k * 2u));
-    let e = u - L * (1.0 / 3.0) * dir;
-    out.err = out.err + dot(e, e);
-  }
+  var out = Moments(0.0, 0.0, vec3<f32>(0.0), vec3<f32>(0.0), 0u, 0.0);
+  project(&out, (*pix)[0], p0, dir, inv, 0u);
+  project(&out, (*pix)[1], p0, dir, inv, 1u);
+  project(&out, (*pix)[2], p0, dir, inv, 2u);
+  project(&out, (*pix)[3], p0, dir, inv, 3u);
+  project(&out, (*pix)[4], p0, dir, inv, 4u);
+  project(&out, (*pix)[5], p0, dir, inv, 5u);
+  project(&out, (*pix)[6], p0, dir, inv, 6u);
+  project(&out, (*pix)[7], p0, dir, inv, 7u);
+  project(&out, (*pix)[8], p0, dir, inv, 8u);
+  project(&out, (*pix)[9], p0, dir, inv, 9u);
+  project(&out, (*pix)[10], p0, dir, inv, 10u);
+  project(&out, (*pix)[11], p0, dir, inv, 11u);
+  project(&out, (*pix)[12], p0, dir, inv, 12u);
+  project(&out, (*pix)[13], p0, dir, inv, 13u);
+  project(&out, (*pix)[14], p0, dir, inv, 14u);
+  project(&out, (*pix)[15], p0, dir, inv, 15u);
   return out;
 }
 
@@ -206,7 +223,7 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     let lx = i32(i & 3u);
     let ly = i32(i >> 2u);
     // Clamp to edge for non-multiple-of-4 textures.
-    let p  = clamp(base + vec2<i32>(lx, ly), vec2<i32>(0, 0), max_xy);
+    let p  = min(base + vec2<i32>(lx, ly), max_xy);
     let c  = textureLoad(src_tex, p, 0).rgb;
     pixels[i] = c;
     bb_min = min(bb_min, c);
