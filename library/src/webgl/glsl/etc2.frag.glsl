@@ -26,12 +26,18 @@ uniform int uFlipY;     // 1 = sample bottom-up (matches Three.js flipY)
 layout(location = 0) out uvec4 outColor;
 
 const float THR[8] = float[8](15.0, 33.0, 57.0, 82.5, 117.0, 156.0, 208.5, 345.0);
-// Per-table score constants: DK = b3² − a3², DM = −2(b3 − a3), A8 = 8·a3²,
-// AM = −2·a3, with (a3, b3) = 3 × the modifier magnitudes.
-const float DK[8] = float[8](540.0, 2376.0, 6840.0, 14355.0, 29484.0, 52416.0, 91323.0, 281520.0);
-const float DM[8] = float[8](-36.0, -72.0, -120.0, -174.0, -252.0, -336.0, -438.0, -816.0);
-const float A8[8] = float[8](288.0, 1800.0, 5832.0, 12168.0, 23328.0, 41472.0, 78408.0, 159048.0);
-const float AM[8] = float[8](-12.0, -30.0, -54.0, -78.0, -108.0, -144.0, -198.0, -282.0);
+// Per-table score constants (DK, DM, C0, C1) = (b3² − a3², −2(b3 − a3),
+// 4(a3² + b3²), −(a3 + b3)), with (a3, b3) = 3 × the modifier magnitudes.
+const vec4 TAB[8] = vec4[8](
+  vec4(540.0, -36.0, 2448.0, -30.0),
+  vec4(2376.0, -72.0, 11304.0, -66.0),
+  vec4(6840.0, -120.0, 33192.0, -114.0),
+  vec4(14355.0, -174.0, 69588.0, -165.0),
+  vec4(29484.0, -252.0, 141264.0, -234.0),
+  vec4(52416.0, -336.0, 251136.0, -312.0),
+  vec4(91323.0, -438.0, 443700.0, -417.0),
+  vec4(281520.0, -816.0, 1285128.0, -690.0)
+);
 
 // Planar's closed-form estimate models the QUANTISED corners exactly; only
 // decode's floor-rounding (±½ per sample) is unmodelled. This small bias
@@ -41,13 +47,21 @@ const float PLANAR_FUDGE = 8.0;
 const float KAPPA = 0.9;
 const vec3 ONE3 = vec3(1.0);
 const vec4 ONE4 = vec4(1.0);
-
-int signed3(uint bits) {
-  return bits > 3u ? int(bits) - 8 : int(bits);
-}
+// Float -> uint for exact integers in [0, 2^23): x + 2^23 holds x in its
+// mantissa, so floatBitsToUint(x + MAGIC) ^ MAGIC_BITS == x, and a left
+// shift by >= 8 drops the exponent bits on its own.
+const float MAGIC = 8388608.0;
+const uint MAGIC_BITS = 0x4B000000u;
 
 uint bswap(uint x) {
-  return ((x & 0xffu) << 24u) | ((x & 0xff00u) << 8u) | ((x >> 8u) & 0xff00u) | (x >> 24u);
+  uint t = ((x & 0x00ff00ffu) << 8u) | ((x >> 8u) & 0x00ff00ffu);
+  return (t << 16u) | (t >> 16u);
+}
+
+// One column's four index bits at bit offset `at` (unrolled by the caller:
+// a runtime column index would make col[] indexable memory).
+uint indexBits(bvec4 b, uint at) {
+  return ((b.x ? 1u : 0u) | (b.y ? 2u : 0u) | (b.z ? 4u : 0u) | (b.w ? 8u : 0u)) << at;
 }
 
 float max4(vec4 v) {
@@ -69,19 +83,19 @@ Bases quantiseBases(vec3 sum0, vec3 sum1) {
   vec3 i1 = floor(sum1 * 1.875 + 0.5);
   o.c0 = o.diff ? q0 : i0;
   o.c1 = o.diff ? q1 : i1;
-  o.b0 = o.diff ? floor(q0 * 8.25) : i0 * 17.0;
-  o.b1 = o.diff ? floor(q1 * 8.25) : i1 * 17.0;
+  float k = o.diff ? 8.25 : 17.0;
+  o.b0 = floor(o.c0 * k);
+  o.b1 = floor(o.c1 * k);
   return o;
 }
 
-// Subblock error (×3) of table t under the threshold rule, in min form.
+// Subblock error (×3) of table t under the threshold rule, in min form
+// summed as 4(a3² + b3²) − (a3 + b3)·sad − ½·Σ|x| (min(0, x) = (x − |x|)/2).
 float tableScore(vec4 au, vec4 av, float sad, uint t) {
-  int i = int(t);
-  float dk = DK[i];
-  float dm = DM[i];
-  vec4 eu = min(vec4(0.0), au * dm + dk);
-  vec4 ev = min(vec4(0.0), av * dm + dk);
-  return A8[i] + AM[i] * sad + dot(eu + ev, ONE4);
+  vec4 k = TAB[int(t)];
+  vec4 xu = au * k.y + k.x;
+  vec4 xv = av * k.y + k.x;
+  return k.w * sad + k.z - 0.5 * dot(abs(xu) + abs(xv), ONE4);
 }
 
 // First table whose large modifier reaches mx — a binary search over the 7
@@ -150,11 +164,14 @@ FlipFit fitGray(vec4 s0u, vec4 s0v, vec4 s1u, vec4 s1v, float sum0, float sum1) 
   bool diff = d >= -4.0 && d <= 3.0;
   float i0 = floor(sum0 * (15.0 / 2040.0) + 0.5);
   float i1 = floor(sum1 * (15.0 / 2040.0) + 0.5);
+  float c0 = diff ? q0 : i0;
+  float c1 = diff ? q1 : i1;
   o.bases.diff = diff;
-  o.bases.c0 = vec3(diff ? q0 : i0);
-  o.bases.c1 = vec3(diff ? q1 : i1);
-  float b0 = diff ? floor(q0 * 8.25) : i0 * 17.0;
-  float b1 = diff ? floor(q1 * 8.25) : i1 * 17.0;
+  o.bases.c0 = vec3(c0);
+  o.bases.c1 = vec3(c1);
+  float k = diff ? 8.25 : 17.0;
+  float b0 = floor(c0 * k);
+  float b1 = floor(c1 * k);
   o.bases.b0 = vec3(b0);
   o.bases.b1 = vec3(b1);
   o.lb0 = 3.0 * b0;
@@ -171,15 +188,17 @@ vec3 fetchRGB(ivec2 p) {
   return texelFetch(uSrc, ivec2(p.x, sy), 0).rgb;
 }
 
+// Blocks straddling the edge of a non-multiple-of-4 image: texel loads
+// clamped to the last real texel.
+vec3 fetchRGBClamped(ivec2 p) {
+  return fetchRGB(min(p, uSrcSize - ivec2(1)));
+}
+
 // One 2×2 quad at top-left p: per-texel luma (gather order, exact 0..765),
 // unit-domain channel sums, and the sums of its right column and bottom row
 // (the planar moments' local parts).
 struct Quad { vec4 l; vec3 s; vec3 right; vec3 bottom; };
-Quad fetchQuad(ivec2 p) {
-  vec3 cw = fetchRGB(p);
-  vec3 cz = fetchRGB(p + ivec2(1, 0));
-  vec3 cx = fetchRGB(p + ivec2(0, 1));
-  vec3 cy = fetchRGB(p + ivec2(1, 1));
+Quad makeQuad(vec3 cw, vec3 cz, vec3 cx, vec3 cy) {
   vec4 r = vec4(cx.r, cy.r, cz.r, cw.r);
   vec4 g = vec4(cx.g, cy.g, cz.g, cw.g);
   vec4 b = vec4(cx.b, cy.b, cz.b, cw.b);
@@ -191,6 +210,17 @@ Quad fetchQuad(ivec2 p) {
   o.s = o.right + vec3(r.w + r.x, g.w + g.x, b.w + b.x);
   o.bottom = vec3(r.x + r.y, g.x + g.y, b.x + b.y);
   return o;
+}
+Quad fetchQuad(ivec2 p) {
+  return makeQuad(fetchRGB(p), fetchRGB(p + ivec2(1, 0)), fetchRGB(p + ivec2(0, 1)), fetchRGB(p + ivec2(1, 1)));
+}
+Quad fetchQuadClamped(ivec2 p) {
+  return makeQuad(
+    fetchRGBClamped(p),
+    fetchRGBClamped(p + ivec2(1, 0)),
+    fetchRGBClamped(p + ivec2(0, 1)),
+    fetchRGBClamped(p + ivec2(1, 1))
+  );
 }
 
 void main() {
@@ -218,24 +248,22 @@ void main() {
     col[2] = vec4(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
     col[3] = vec4(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
   } else {
-    // Blocks straddling the edge of a non-multiple-of-4 image: per-texel
-    // loads clamped to the last real texel.
-    ivec2 maxXY = uSrcSize - ivec2(1);
-    for (int q = 0; q < 4; q++) qsum[q] = vec3(0.0);
-    for (int i = 0; i < 16; i++) {
-      int lx = i & 3;
-      int ly = i >> 2;
-      vec3 c = roundEven(fetchRGB(clamp(base + ivec2(lx, ly), ivec2(0), maxXY)) * 255.0);
-      col[lx][ly] = c.r + c.g + c.b;
-      int q = (lx >= 2 ? 1 : 0) | (ly >= 2 ? 2 : 0);
-      qsum[q] += c;
-      sxp += float(lx) * c;
-      syp += float(ly) * c;
-    }
-    // Edge blocks accumulate in 0..255 units; rescale to the unit domain.
-    for (int q = 0; q < 4; q++) qsum[q] *= 1.0 / 255.0;
-    sxp *= 1.0 / 255.0;
-    syp *= 1.0 / 255.0;
+    // Edge blocks: the same quads from clamped loads (no runtime-indexed
+    // col/qsum writes).
+    Quad q0 = fetchQuadClamped(base);
+    Quad q1 = fetchQuadClamped(base + ivec2(2, 0));
+    Quad q2 = fetchQuadClamped(base + ivec2(0, 2));
+    Quad q3 = fetchQuadClamped(base + ivec2(2, 2));
+    qsum[0] = q0.s;
+    qsum[1] = q1.s;
+    qsum[2] = q2.s;
+    qsum[3] = q3.s;
+    sxp = (q0.right + q1.right) + (q2.right + q3.right) + 2.0 * (q1.s + q3.s);
+    syp = (q0.bottom + q1.bottom) + (q2.bottom + q3.bottom) + 2.0 * (q2.s + q3.s);
+    col[0] = vec4(q0.l.w, q0.l.x, q2.l.w, q2.l.x);
+    col[1] = vec4(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
+    col[2] = vec4(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
+    col[3] = vec4(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
   }
 
   vec3 total = (qsum[0] + qsum[1]) + (qsum[2] + qsum[3]);
@@ -337,11 +365,15 @@ void main() {
     bool fb = resB < resA;
     bflip = fb ? 1u : 0u;
     vec3 sum1 = fb ? bottom : right;
+    // sbPair is order-blind within a subblock: only two half-column pairs
+    // swap between the flips.
+    vec4 cz = vec4(col[0].zw, col[1].zw);
+    vec4 cx = vec4(col[2].xy, col[3].xy);
     sel = fitFlip(
-      fb ? vec4(col[0].xy, col[1].xy) : col[0],
-      fb ? vec4(col[2].xy, col[3].xy) : col[1],
-      fb ? vec4(col[0].zw, col[1].zw) : col[2],
-      fb ? vec4(col[2].zw, col[3].zw) : col[3],
+      vec4(col[0].xy, col[1].xy),
+      fb ? cx : cz,
+      vec4(col[2].zw, col[3].zw),
+      fb ? cz : cx,
       total - sum1,
       sum1
     );
@@ -351,18 +383,16 @@ void main() {
   uint hi;
   uint lo;
   if (sel.est <= planarEst) {
-    uvec3 codes0 = uvec3(sel.bases.c0);
-    uvec3 codes1 = uvec3(sel.bases.c1);
     uint t0 = sel.t0;
     uint t1 = sel.t1;
-    if (sel.bases.diff) {
-      uvec3 d = uvec3(ivec3(codes1) - ivec3(codes0)) & uvec3(7u);
-      hi = (codes0.r << 27u) | (d.r << 24u) | (codes0.g << 19u) | (d.g << 16u) | (codes0.b << 11u) | (d.b << 8u)
-         | (t0 << 5u) | (t1 << 2u) | 2u | bflip;
-    } else {
-      hi = (codes0.r << 28u) | (codes1.r << 24u) | (codes0.g << 20u) | (codes1.g << 16u) | (codes0.b << 12u) | (codes1.b << 8u)
-         | (t0 << 5u) | (t1 << 2u) | bflip;
-    }
+    // Per channel byte: differential = base5 << 3 | (delta & 7), individual
+    // = base4a << 4 | base4b — built in float, converted once (MAGIC).
+    bool dfl = sel.bases.diff;
+    vec3 dd = sel.bases.c1 - sel.bases.c0;
+    vec3 ddw = mix(dd, dd + 8.0, lessThan(dd, vec3(0.0)));
+    vec3 low = dfl ? ddw : sel.bases.c1;
+    uvec3 bytes = floatBitsToUint(sel.bases.c0 * (dfl ? 8.0 : 16.0) + low + MAGIC);
+    hi = (bytes.r << 24u) | (bytes.g << 16u) | (bytes.b << 8u) | (t0 << 5u) | (t1 << 2u) | (dfl ? 2u : 0u) | bflip;
     // Wire indices, column by column (bit x·4 + y): flip 0 gives columns
     // 0,1 subblock 0; flip 1 gives rows 0,1 (lanes x, y) subblock 0.
     // LSB = large modifier, MSB = negative.
@@ -377,34 +407,35 @@ void main() {
     vec4 lbR = fb ? lbRows : vec4(lb1);
     vec4 thL = fb ? thRows : vec4(th0);
     vec4 thR = fb ? thRows : vec4(th1);
-    uint lsb = 0u;
-    uint msb = 0u;
-    for (int c = 0; c < 4; c++) {
-      vec4 d = col[c] - (c >= 2 ? lbR : lbL);
-      bvec4 large = greaterThan(abs(d), c >= 2 ? thR : thL);
-      bvec4 neg = lessThan(d, vec4(0.0));
-      uint nl = (large.x ? 1u : 0u) | (large.y ? 2u : 0u) | (large.z ? 4u : 0u) | (large.w ? 8u : 0u);
-      uint nn = (neg.x ? 1u : 0u) | (neg.y ? 2u : 0u) | (neg.z ? 4u : 0u) | (neg.w ? 8u : 0u);
-      lsb |= nl << uint(c * 4);
-      msb |= nn << uint(c * 4);
-    }
+    vec4 d0 = col[0] - lbL;
+    vec4 d1 = col[1] - lbL;
+    vec4 d2 = col[2] - lbR;
+    vec4 d3 = col[3] - lbR;
+    uint lsb = indexBits(greaterThan(abs(d0), thL), 0u) | indexBits(greaterThan(abs(d1), thL), 4u)
+             | indexBits(greaterThan(abs(d2), thR), 8u) | indexBits(greaterThan(abs(d3), thR), 12u);
+    uint msb = indexBits(lessThan(d0, vec4(0.0)), 0u) | indexBits(lessThan(d1, vec4(0.0)), 4u)
+             | indexBits(lessThan(d2, vec4(0.0)), 8u) | indexBits(lessThan(d3, vec4(0.0)), 12u);
     lo = lsb | (msb << 16u);
   } else {
-    uint ro = uint(qo.r); uint go = uint(qo.g); uint bo = uint(qo.b);
-    uint rh = uint(qh.r); uint gh = uint(qh.g); uint bh = uint(qh.b);
-    uint rv = uint(qv.r); uint gv = uint(qv.g); uint bv = uint(qv.b);
-    int rSum = int(ro >> 2u) + signed3(((ro & 3u) << 1u) | (go >> 6u));
-    uint rFix = rSum < 0 ? 1u : 0u;
-    int gSum = int((go >> 2u) & 15u) + signed3(((go & 3u) << 1u) | (bo >> 5u));
-    uint gFix = gSum < 0 ? 1u : 0u;
-    uint p = (bo >> 3u) & 3u;
-    uint q = (bo >> 1u) & 3u;
-    uint bFix3 = p + q >= 4u ? 7u : 0u;
-    uint bFix1 = p + q >= 4u ? 0u : 1u;
-    hi = (rFix << 31u) | (ro << 25u) | ((go >> 6u) << 24u) | (gFix << 23u) | ((go & 63u) << 17u)
-       | ((bo >> 5u) << 16u) | (bFix3 << 13u) | (((bo >> 3u) & 3u) << 11u) | (bFix1 << 10u)
-       | ((bo & 7u) << 7u) | ((rh >> 1u) << 2u) | 2u | (rh & 1u);
-    lo = (gh << 25u) | (bh << 19u) | (rv << 13u) | (gv << 6u) | bv;
+    uvec4 pi = floatBitsToUint(vec4(qo, qh.r) + MAGIC) ^ uvec4(MAGIC_BITS);
+    uint ro = pi.x; uint go = pi.y; uint bo = pi.z; uint rh = pi.w;
+    // ETC1-view overflow fixes. R and G fields read as base + signed 3-bit
+    // delta (x >> 3, x & 7) must stay in [0, 31]: signed3(v) = (v ^ 4) − 4.
+    uint xr = (ro << 1u) | (go >> 6u);
+    uint xg = ((go & 63u) << 1u) | (bo >> 5u);
+    uint rFix = (xr >> 3u) + ((xr & 7u) ^ 4u) < 4u ? 0x80000000u : 0u;
+    uint gFix = (xg >> 3u) + ((xg & 7u) ^ 4u) < 4u ? 0x800000u : 0u;
+    // B must overflow: bits 47-45 = 111 with bit 42 = 0 when p + q >= 4,
+    // else 000 with bit 42 = 1.
+    uint bFix = ((bo >> 3u) & 3u) + ((bo >> 1u) & 3u) >= 4u ? 0xE000u : 0x400u;
+    // go + (go & 64) moves GO bit 6 up one place (bit 24; bit 23 is gFix);
+    // rh + (rh & 62) spreads RH around the diff bit.
+    hi = rFix | (ro << 25u) | ((go + (go & 64u)) << 17u) | gFix
+       | ((bo & 32u) << 11u) | ((bo & 24u) << 8u) | ((bo & 7u) << 7u) | bFix
+       | (rh + (rh & 62u)) | 2u;
+    // GH·2^25 | BH·2^19 | RV·2^13 | GV·2^6 | BV: two exact float field sums.
+    lo = (floatBitsToUint(qh.g * 64.0 + qh.b + MAGIC) << 19u)
+       | (floatBitsToUint((qv.r * 128.0 + qv.g) * 64.0 + qv.b + MAGIC) ^ MAGIC_BITS);
   }
 
   outColor = uvec4(bswap(hi), bswap(lo), 0u, 0u);
