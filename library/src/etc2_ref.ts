@@ -539,13 +539,13 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
   ]
   const qsq = [0, 0, 0, 0]
   const qlsq = [0, 0, 0, 0]
-  // Planar first moments Σx·p and Σy·p per channel (the gray test below).
-  const sxp = [0, 0, 0]
-  const syp = [0, 0, 0]
+  // Exactly gray: R = G = B in every texel (the gray test below).
+  let gray = true
   for (let k = 0; k < 16; k++) {
     const r = px[k * 3]!
     const g = px[k * 3 + 1]!
     const b = px[k * 3 + 2]!
+    if (r !== g || g !== b) gray = false
     const l = r + g + b
     luma[k] = l
     const q = ((k & 3) >= 2 ? 1 : 0) | (k >> 2 >= 2 ? 2 : 0)
@@ -554,10 +554,6 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
     qsum[q]![2]! += b
     qsq[q]! += r * r + g * g + b * b
     qlsq[q]! += l * l
-    for (let c = 0; c < 3; c++) {
-      sxp[c]! += (k & 3) * px[k * 3 + c]!
-      syp[c]! += (k >> 2) * px[k * 3 + c]!
-    }
   }
   const pair = (a: number, b: number): { sum: number[]; sq: number; lsq: number } => ({
     sum: [qsum[a]![0]! + qsum[b]![0]!, qsum[a]![1]! + qsum[b]![1]!, qsum[a]![2]! + qsum[b]![2]!],
@@ -617,8 +613,8 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
 
   // O(1) flip preselect: within-variance minus KAPPA of the luma-direction
   // component the modifier tables can absorb, summed over both subblocks.
-  // Exactly-gray blocks (every quadrant's R, G and B sums AND both planar
-  // moments equal) have no chroma to steer it, so both flips are scored.
+  // Exactly-gray blocks (R = G = B in every texel) have no chroma to steer
+  // it, so both flips are scored.
   const residual = (s: { sum: number[]; sq: number; lsq: number }): number => {
     const dotSum = s.sum[0]! * s.sum[0]! + s.sum[1]! * s.sum[1]! + s.sum[2]! * s.sum[2]!
     const lsum = s.sum[0]! + s.sum[1]! + s.sum[2]!
@@ -626,12 +622,6 @@ function encodeFastBlock(px: Int32Array): ETC2Block {
   }
   const resA = residual(pair(0, 2)) + residual(pair(1, 3))
   const resB = residual(pair(0, 1)) + residual(pair(2, 3))
-  const gray =
-    qsum.every(q => q[0] === q[1] && q[1] === q[2]) &&
-    sxp[0] === sxp[1] &&
-    sxp[1] === sxp[2] &&
-    syp[0] === syp[1] &&
-    syp[1] === syp[2]
   let flip: number
   let cur: FlipEval
   if (gray) {

@@ -196,8 +196,8 @@ vec3 fetchRGBClamped(ivec2 p) {
 
 // One 2×2 quad at top-left p: per-texel luma (gather order, exact 0..765),
 // unit-domain channel sums, and the sums of its right column and bottom row
-// (the planar moments' local parts).
-struct Quad { vec4 l; vec3 s; vec3 right; vec3 bottom; };
+// (the planar moments' local parts), and whether R = G = B in all four texels.
+struct Quad { vec4 l; vec3 s; vec3 right; vec3 bottom; bool gray; };
 Quad makeQuad(vec3 cw, vec3 cz, vec3 cx, vec3 cy) {
   vec4 r = vec4(cx.r, cy.r, cz.r, cw.r);
   vec4 g = vec4(cx.g, cy.g, cz.g, cw.g);
@@ -209,6 +209,7 @@ Quad makeQuad(vec3 cw, vec3 cz, vec3 cx, vec3 cy) {
   o.right = vec3(r.z + r.y, g.z + g.y, b.z + b.y);
   o.s = o.right + vec3(r.w + r.x, g.w + g.x, b.w + b.x);
   o.bottom = vec3(r.x + r.y, g.x + g.y, b.x + b.y);
+  o.gray = all(equal(r, g)) && all(equal(g, b));
   return o;
 }
 Quad fetchQuad(ivec2 p) {
@@ -232,6 +233,9 @@ void main() {
   // Planar right-hand sides: Σ x·p and Σ y·p (all sums in the unit domain).
   vec3 sxp = vec3(0.0);
   vec3 syp = vec3(0.0);
+  // Exactly gray: R = G = B in every texel — then R and B planar corners
+  // coincide (same 6-bit code).
+  bool gray;
   if (base.x + 4 <= uSrcSize.x && base.y + 4 <= uSrcSize.y) {
     Quad q0 = fetchQuad(base);
     Quad q1 = fetchQuad(base + ivec2(2, 0));
@@ -247,6 +251,7 @@ void main() {
     col[1] = vec4(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
     col[2] = vec4(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
     col[3] = vec4(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
+    gray = q0.gray && q1.gray && q2.gray && q3.gray;
   } else {
     // Edge blocks: the same quads from clamped loads (no runtime-indexed
     // col/qsum writes).
@@ -264,17 +269,13 @@ void main() {
     col[1] = vec4(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
     col[2] = vec4(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
     col[3] = vec4(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
+    gray = q0.gray && q1.gray && q2.gray && q3.gray;
   }
 
   vec3 total = (qsum[0] + qsum[1]) + (qsum[2] + qsum[3]);
   // Right and bottom halves (subblock 1 of flip 0 / flip 1).
   vec3 right = qsum[1] + qsum[3];
   vec3 bottom = qsum[2] + qsum[3];
-  // Exactly gray: every quadrant sum AND both planar moments equal across
-  // R, G, B — then R and B planar corners coincide (same 6-bit code).
-  bool gray = all(equal(qsum[0].rg, qsum[0].gb)) && all(equal(qsum[1].rg, qsum[1].gb)) &&
-              all(equal(qsum[2].rg, qsum[2].gb)) && all(equal(qsum[3].rg, qsum[3].gb)) &&
-              all(equal(sxp.rg, sxp.gb)) && all(equal(syp.rg, syp.gb));
 
   float planarEst;
   vec3 qo;

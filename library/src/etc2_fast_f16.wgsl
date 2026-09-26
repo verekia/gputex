@@ -51,8 +51,10 @@
 //     cover (+0.07-0.10 dB on photo colour vs κ = 1, free). Only the chosen
 //     flip is searched. Evaluated in half-difference form (only the two
 //     halves' difference varies between flips; −1..2% GPU).
-//   • Exactly-gray blocks (every quadrant's R, G and B sums AND both planar
-//     moments equal) have no chroma to steer the preselect, so both flips
+//   • Exactly-gray blocks (R = G = B in every texel, tested on the raw
+//     gathers before any luma or sum is formed; their lumas and sums then
+//     come from R alone — a third of the load-side ALU, −4..5% on gray
+//     maps) have no chroma to steer the preselect, so both flips
 //     are scored — worth ~0.3 dB on roughness/AO content over any O(1)
 //     proxy tried (luma variance, luma range, squared range all land at
 //     −0.30 dB; deciding the flip on the cover table's score alone loses
@@ -312,12 +314,13 @@ fn fit_gray(
 // One gathered 2×2 quad: per-texel luma (gather order, exact 0..765),
 // unit-domain channel sums, and the sums of its right column and bottom row
 // (the planar moments' local parts). Gather order: w=(0,0) z=(1,0) x=(0,1)
-// y=(1,1).
+// y=(1,1). `gray` (R = G = B in all four texels) is set by load_quad only.
 struct Quad {
   l: vec4<f16>,
   s: vec3<f32>,
   right: vec3<f32>,
   bottom: vec3<f32>,
+  gray: bool,
 };
 fn gather_quad(r: vec4<f32>, g: vec4<f32>, b: vec4<f32>) -> Quad {
   var o: Quad;
@@ -335,7 +338,12 @@ fn load_quad(p: vec2<i32>, max_xy: vec2<i32>) -> Quad {
   let b = textureLoad(src_tex, min(p + vec2<i32>(1, 0), max_xy), 0);
   let c = textureLoad(src_tex, min(p + vec2<i32>(0, 1), max_xy), 0);
   let d = textureLoad(src_tex, min(p + vec2<i32>(1, 1), max_xy), 0);
-  return gather_quad(vec4<f32>(c.r, d.r, b.r, a.r), vec4<f32>(c.g, d.g, b.g, a.g), vec4<f32>(c.b, d.b, b.b, a.b));
+  let r = vec4<f32>(c.r, d.r, b.r, a.r);
+  let g = vec4<f32>(c.g, d.g, b.g, a.g);
+  let bl = vec4<f32>(c.b, d.b, b.b, a.b);
+  var o = gather_quad(r, g, bl);
+  o.gray = all(r == g) && all(g == bl);
+  return o;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -355,39 +363,68 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   // Planar right-hand sides: Σ x·p and Σ y·p (all sums in the unit domain).
   var sxp = vec3<f32>(0.0);
   var syp = vec3<f32>(0.0);
+  // Exactly gray (R = G = B in every texel): no chroma, so the gray path
+  // below searches both flips on one channel, and R and B share their
+  // planar solve (same 6-bit code) — only R (6-bit) and G (7-bit) remain.
+  var gray: bool;
   if (u32(base_xy.x) + 4u <= params.width && u32(base_xy.y) + 4u <= params.height) {
     let inv = vec2<f32>(1.0) / vec2<f32>(textureDimensions(src_tex));
     let c0 = (vec2<f32>(base_xy) + 1.0) * inv;
-    let q0 = gather_quad(
-      textureGather(0, src_tex, smp, c0),
-      textureGather(1, src_tex, smp, c0),
-      textureGather(2, src_tex, smp, c0),
-    );
-    let q1 = gather_quad(
-      textureGather(0, src_tex, smp, c0, vec2<i32>(2, 0)),
-      textureGather(1, src_tex, smp, c0, vec2<i32>(2, 0)),
-      textureGather(2, src_tex, smp, c0, vec2<i32>(2, 0)),
-    );
-    let q2 = gather_quad(
-      textureGather(0, src_tex, smp, c0, vec2<i32>(0, 2)),
-      textureGather(1, src_tex, smp, c0, vec2<i32>(0, 2)),
-      textureGather(2, src_tex, smp, c0, vec2<i32>(0, 2)),
-    );
-    let q3 = gather_quad(
-      textureGather(0, src_tex, smp, c0, vec2<i32>(2, 2)),
-      textureGather(1, src_tex, smp, c0, vec2<i32>(2, 2)),
-      textureGather(2, src_tex, smp, c0, vec2<i32>(2, 2)),
-    );
-    qsum[0] = q0.s;
-    qsum[1] = q1.s;
-    qsum[2] = q2.s;
-    qsum[3] = q3.s;
-    sxp = (q0.right + q1.right) + (q2.right + q3.right) + 2.0 * (q1.s + q3.s);
-    syp = (q0.bottom + q1.bottom) + (q2.bottom + q3.bottom) + 2.0 * (q2.s + q3.s);
-    col[0] = vec4<f16>(q0.l.w, q0.l.x, q2.l.w, q2.l.x);
-    col[1] = vec4<f16>(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
-    col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
-    col[3] = vec4<f16>(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
+    let r0 = textureGather(0, src_tex, smp, c0);
+    let g0 = textureGather(1, src_tex, smp, c0);
+    let b0 = textureGather(2, src_tex, smp, c0);
+    let r1 = textureGather(0, src_tex, smp, c0, vec2<i32>(2, 0));
+    let g1 = textureGather(1, src_tex, smp, c0, vec2<i32>(2, 0));
+    let b1 = textureGather(2, src_tex, smp, c0, vec2<i32>(2, 0));
+    let r2 = textureGather(0, src_tex, smp, c0, vec2<i32>(0, 2));
+    let g2 = textureGather(1, src_tex, smp, c0, vec2<i32>(0, 2));
+    let b2 = textureGather(2, src_tex, smp, c0, vec2<i32>(0, 2));
+    let r3 = textureGather(0, src_tex, smp, c0, vec2<i32>(2, 2));
+    let g3 = textureGather(1, src_tex, smp, c0, vec2<i32>(2, 2));
+    let b3 = textureGather(2, src_tex, smp, c0, vec2<i32>(2, 2));
+    gray = all(r0 == g0) && all(g0 == b0) && all(r1 == g1) && all(g1 == b1) &&
+           all(r2 == g2) && all(g2 == b2) && all(r3 == g3) && all(g3 == b3);
+    if (gray) {
+      // Lumas and sums from R alone (the gray path reads only the R lanes
+      // of qsum/sxp/syp): a third of the colour path's load-side ALU.
+      let l0 = vec4<f16>(r0 * 765.0);
+      let l1 = vec4<f16>(r1 * 765.0);
+      let l2 = vec4<f16>(r2 * 765.0);
+      let l3 = vec4<f16>(r3 * 765.0);
+      let rt0 = r0.z + r0.y;
+      let rt1 = r1.z + r1.y;
+      let rt2 = r2.z + r2.y;
+      let rt3 = r3.z + r3.y;
+      let s0 = rt0 + (r0.w + r0.x);
+      let s1 = rt1 + (r1.w + r1.x);
+      let s2 = rt2 + (r2.w + r2.x);
+      let s3 = rt3 + (r3.w + r3.x);
+      qsum[0] = vec3<f32>(s0);
+      qsum[1] = vec3<f32>(s1);
+      qsum[2] = vec3<f32>(s2);
+      qsum[3] = vec3<f32>(s3);
+      sxp = vec3<f32>((rt0 + rt1) + (rt2 + rt3) + 2.0 * (s1 + s3));
+      syp = vec3<f32>(((r0.x + r0.y) + (r1.x + r1.y)) + ((r2.x + r2.y) + (r3.x + r3.y)) + 2.0 * (s2 + s3));
+      col[0] = vec4<f16>(l0.w, l0.x, l2.w, l2.x);
+      col[1] = vec4<f16>(l0.z, l0.y, l2.z, l2.y);
+      col[2] = vec4<f16>(l1.w, l1.x, l3.w, l3.x);
+      col[3] = vec4<f16>(l1.z, l1.y, l3.z, l3.y);
+    } else {
+      let q0 = gather_quad(r0, g0, b0);
+      let q1 = gather_quad(r1, g1, b1);
+      let q2 = gather_quad(r2, g2, b2);
+      let q3 = gather_quad(r3, g3, b3);
+      qsum[0] = q0.s;
+      qsum[1] = q1.s;
+      qsum[2] = q2.s;
+      qsum[3] = q3.s;
+      sxp = (q0.right + q1.right) + (q2.right + q3.right) + 2.0 * (q1.s + q3.s);
+      syp = (q0.bottom + q1.bottom) + (q2.bottom + q3.bottom) + 2.0 * (q2.s + q3.s);
+      col[0] = vec4<f16>(q0.l.w, q0.l.x, q2.l.w, q2.l.x);
+      col[1] = vec4<f16>(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
+      col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
+      col[3] = vec4<f16>(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
+    }
   } else {
     // Edge of a non-multiple-of-4 image: clamp to the last texel.
     let max_xy = vec2<i32>(i32(params.width) - 1, i32(params.height) - 1);
@@ -405,18 +442,13 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
     col[1] = vec4<f16>(q0.l.z, q0.l.y, q2.l.z, q2.l.y);
     col[2] = vec4<f16>(q1.l.w, q1.l.x, q3.l.w, q3.l.x);
     col[3] = vec4<f16>(q1.l.z, q1.l.y, q3.l.z, q3.l.y);
+    gray = q0.gray && q1.gray && q2.gray && q3.gray;
   }
 
   let total = (qsum[0] + qsum[1]) + (qsum[2] + qsum[3]);
   // Right and bottom halves (subblock 1 of flip 0 / flip 1).
   let right = qsum[1] + qsum[3];
   let bottom = qsum[2] + qsum[3];
-  // Exactly gray: every quadrant sum AND both planar moments equal across
-  // R, G, B — then R and B planar corners coincide (same 6-bit code) and
-  // only R (6-bit) and G (7-bit) need solving.
-  let gray = all(qsum[0].rg == qsum[0].gb) && all(qsum[1].rg == qsum[1].gb) &&
-             all(qsum[2].rg == qsum[2].gb) && all(qsum[3].rg == qsum[3].gb) &&
-             all(sxp.rg == sxp.gb) && all(syp.rg == syp.gb);
 
   var planar_est: f32;
   var qo: vec3<f32>;
