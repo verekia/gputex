@@ -197,7 +197,7 @@ export abstract class Encoder {
    * return `Promise<BC1Encoder>` instead of `Promise<Encoder>`.
    */
   static async create<T extends Encoder>(this: EncoderConstructor<T>): Promise<T> {
-    if (!('gpu' in navigator)) {
+    if (typeof navigator === 'undefined' || !navigator.gpu) {
       throw new Error('WebGPU not available in this browser')
     }
     const adapter = await navigator.gpu.requestAdapter()

@@ -228,6 +228,17 @@ interface GlTier {
 
 let sharedGpuPromise: Promise<SharedGpu | null> | null = null
 
+/**
+ * True when `navigator.gpu` holds a GPU object. `'gpu' in navigator` isn't
+ * enough: the attribute can exist and read `undefined` (test harnesses hide
+ * WebGPU with a getter that returns undefined), and renderers gate on the
+ * value — matching them keeps the encode on the renderer's side of the
+ * WebGPU/WebGL2 split.
+ */
+function hasWebGPU(): boolean {
+  return typeof navigator !== 'undefined' && !!navigator.gpu
+}
+
 /** Features worth having on the shared device when the adapter offers them.
  *  Superset of what any one encoder's `create()` would request, since the
  *  device is shared across formats. */
@@ -371,8 +382,7 @@ export async function prewarmCompressTexture(
 ): Promise<PrewarmResult> {
   const t0 = performance.now()
   const list: readonly PrewarmTarget[] = Array.isArray(targets) ? targets : [targets as PrewarmTarget]
-  const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator
-  const shared = hasWebGPU && list.some(t => !t.forceWebGL) ? await getSharedGpu().catch(() => null) : null
+  const shared = hasWebGPU() && list.some(t => !t.forceWebGL) ? await getSharedGpu().catch(() => null) : null
   const waits: Promise<unknown>[] = []
   let mipgenWarmed = false
   const out: PrewarmResult['targets'] = []
@@ -667,8 +677,28 @@ export async function compressTextureToBytes(
 
   // Tier 1: WebGPU compute path. Tier 2: WebGL2 fragment-shader fallback.
   // Tier 3: uncompressed RGBA8.
-  if (gpu && gpuEncoder) return encodeViaWebGPU(gpu, await gpuEncoder)
-  const viaWebGL = gl ? encodeViaWebGL(gl, glEncoder, glEncoderError) : null
+  let glTier = gl
+  if (gpu && gpuEncoder) {
+    try {
+      return await encodeViaWebGPU(gpu, await gpuEncoder)
+    } catch (e) {
+      // A device lost mid-encode (GPU reset, mobile tab backgrounded) or one
+      // that never worked: degrade to the WebGL2 tier instead of failing the
+      // load. Not cached — the transcode key names the WebGPU format and
+      // backend, and the next call gets a fresh shared device anyway.
+      console.warn('[compressTextureToBytes] WebGPU encode failed; falling back to WebGL2.', e)
+      transcodeKey = null
+      glTier = resolveWebGL()
+      if (glTier) {
+        try {
+          glEncoder = sharedWebGLEncoder(glTier.gl, glTier.selection.encoderClass)
+        } catch (err) {
+          glEncoderError = err
+        }
+      }
+    }
+  }
+  const viaWebGL = glTier ? encodeViaWebGL(glTier, glEncoder, glEncoderError) : null
   if (viaWebGL) return viaWebGL
 
   console.warn(
@@ -696,19 +726,27 @@ export async function compressTextureToBytes(
   /** Resolve the WebGPU tier: adapter + a usable format selection, or null
    *  when this device can't take the compute path. */
   async function resolveWebGPU(): Promise<GpuTier | null> {
-    if (!('gpu' in navigator)) return null
+    if (!hasWebGPU()) return null
 
     // Resolve the adapter: caller-provided, else the shared one. A provided
     // device without an adapter still needs one for capability detection.
+    // A failed request (blocklisted driver, crashed GPU process, a stack
+    // that lost its last device) means no WebGPU here: the WebGL2 tier
+    // takes over, as renderers do in the same situation.
     let shared: SharedGpu | null = null
     let adapter: GPUAdapter | null
-    if (providedAdapter) {
-      adapter = providedAdapter
-    } else if (providedDevice) {
-      adapter = await navigator.gpu.requestAdapter()
-    } else {
-      shared = await getSharedGpu()
-      adapter = shared?.adapter ?? null
+    try {
+      if (providedAdapter) {
+        adapter = providedAdapter
+      } else if (providedDevice) {
+        adapter = await navigator.gpu.requestAdapter()
+      } else {
+        shared = await getSharedGpu()
+        adapter = shared?.adapter ?? null
+      }
+    } catch (e) {
+      console.warn('[compressTextureToBytes] WebGPU adapter/device request failed; using the WebGL2 fallback.', e)
+      return null
     }
     if (!adapter) return null
 
@@ -742,8 +780,9 @@ export async function compressTextureToBytes(
     return acquired
   }
 
-  /** Encode on the WebGPU tier. The selection is already validated, so any
-   *  failure from here throws rather than falling back. */
+  /** Encode on the WebGPU tier. The selection is already validated, so a
+   *  failure here is a runtime one (device lost, pipeline error): it throws,
+   *  and the caller degrades to the WebGL2 tier. */
   async function encodeViaWebGPU(
     { adapter, selection }: GpuTier,
     { encoder, shared: sharedEncoder }: AcquiredEncoder,
