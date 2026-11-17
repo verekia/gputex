@@ -135,7 +135,7 @@ export abstract class WebGLBlockEncoder {
 
   /** Short lowercase identifier for labels / errors. */
   abstract get label(): string
-  /** 8 for BC1, 16 for BC5/BC7/ASTC 4×4. */
+  /** 8 for BC1/BC4/ETC2/EAC R11, 16 for BC5/BC7/ASTC 4×4. */
   abstract get bytesPerBlock(): number
   /** Whether this format has an sRGB variant (false for BC5). */
   abstract get supportsSrgb(): boolean

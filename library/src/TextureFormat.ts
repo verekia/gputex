@@ -7,7 +7,9 @@
 // the core so it carries no `three` import).
 //
 // BC5 has no sRGB variant because it is a 2-channel linear format (tangent-
-// space normals). The other families have matched UNORM + sRGB pairs.
+// space normals); BC4 and EAC R11 are its 1-channel counterparts (grayscale
+// data maps) and are linear-only too. The other families have matched
+// UNORM + sRGB pairs.
 //
 // Shape note: `as const` + derived type union keeps the identifiers usable
 // both as runtime strings and as TypeScript literal types (`TextureFormat`
@@ -18,6 +20,7 @@
 export const TextureFormat = {
   BC1: 'BC1',
   BC1_SRGB: 'BC1_SRGB',
+  BC4: 'BC4',
   BC5: 'BC5',
   BC7: 'BC7',
   BC7_SRGB: 'BC7_SRGB',
@@ -25,6 +28,7 @@ export const TextureFormat = {
   ASTC_4x4_SRGB: 'ASTC_4x4_SRGB',
   ETC2_RGB8: 'ETC2_RGB8',
   ETC2_RGB8_SRGB: 'ETC2_RGB8_SRGB',
+  EAC_R11: 'EAC_R11',
 } as const
 
 export type TextureFormat = (typeof TextureFormat)[keyof typeof TextureFormat]

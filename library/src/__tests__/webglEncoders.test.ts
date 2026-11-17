@@ -1,7 +1,10 @@
+import { _internal as _eacInternal } from '../eac_r11_ref.js'
 import { ASTC4x4WebGLEncoder } from '../webgl/ASTC4x4WebGLEncoder.js'
 import { BC1WebGLEncoder } from '../webgl/BC1WebGLEncoder.js'
+import { BC4WebGLEncoder } from '../webgl/BC4WebGLEncoder.js'
 import { BC5WebGLEncoder } from '../webgl/BC5WebGLEncoder.js'
 import { BC7WebGLEncoder } from '../webgl/BC7WebGLEncoder.js'
+import { EACR11WebGLEncoder } from '../webgl/EACR11WebGLEncoder.js'
 import { ETC2WebGLEncoder } from '../webgl/ETC2WebGLEncoder.js'
 
 // Inspect each encoder's metadata + GLSL source without constructing it
@@ -40,6 +43,36 @@ describe('BC5WebGLEncoder', () => {
     const src: string = view.fragSource()
     expectValidFragSource(src)
     expect(src).toContain('lvlToIdx')
+  })
+})
+
+describe('BC4WebGLEncoder', () => {
+  it('declares its metadata and loads bc4.frag.glsl', () => {
+    const view: AnyProto = Object.create(BC4WebGLEncoder.prototype)
+    expect(view.label).toBe('bc4')
+    expect(view.bytesPerBlock).toBe(8)
+    expect(view.supportsSrgb).toBe(false)
+    const src: string = view.fragSource()
+    expectValidFragSource(src)
+    expect(src).toContain('lvlToIdx')
+  })
+})
+
+describe('EACR11WebGLEncoder', () => {
+  it('declares its metadata and loads eac_r11.frag.glsl', () => {
+    const view: AnyProto = Object.create(EACR11WebGLEncoder.prototype)
+    expect(view.label).toBe('eac-r11')
+    expect(view.bytesPerBlock).toBe(8)
+    expect(view.supportsSrgb).toBe(false)
+    expectValidFragSource(view.fragSource())
+  })
+
+  it('carries the same candidate table as the CPU reference', () => {
+    const view: AnyProto = Object.create(EACR11WebGLEncoder.prototype)
+    const src: string = view.fragSource()
+    const lut = src.slice(src.indexOf('const uint LUT[41] = uint[41]('))
+    const want = _eacInternal.CANDIDATES.map(c => `0x${c.toString(16).padStart(5, '0')}u`)
+    expect(lut.slice(0, lut.indexOf(');')).match(/0x[0-9a-f]{5}u/g)).toEqual(want)
   })
 })
 

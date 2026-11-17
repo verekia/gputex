@@ -3,8 +3,10 @@ import { describe, expect, it, spyOn } from 'bun:test'
 import { TextureFormat } from '../TextureFormat.js'
 import { ASTC4x4WebGLEncoder } from '../webgl/ASTC4x4WebGLEncoder.js'
 import { BC1WebGLEncoder } from '../webgl/BC1WebGLEncoder.js'
+import { BC4WebGLEncoder } from '../webgl/BC4WebGLEncoder.js'
 import { BC5WebGLEncoder } from '../webgl/BC5WebGLEncoder.js'
 import { BC7WebGLEncoder } from '../webgl/BC7WebGLEncoder.js'
+import { EACR11WebGLEncoder } from '../webgl/EACR11WebGLEncoder.js'
 import { ETC2WebGLEncoder } from '../webgl/ETC2WebGLEncoder.js'
 import { selectWebGLFormat } from '../webgl/selectWebGLFormat.js'
 
@@ -216,6 +218,40 @@ describe('selectWebGLFormat: ETC2 last resort', () => {
   it('never uses ETC2 for alpha or normals', () => {
     expect(selectWebGLFormat(caps({ etc: true }), 'colorWithAlpha').format).toBe(null)
     expect(selectWebGLFormat(caps({ etc: true }), 'normal').format).toBe(null)
+  })
+})
+
+describe('selectWebGLFormat: singleChannel hint', () => {
+  it('returns BC4 when RGTC is present, whatever the colorSpace', () => {
+    for (const colorSpace of ['srgb', 'linear'] as const) {
+      const sel = selectWebGLFormat(caps({ rgtc: true, bptc: true }), 'singleChannel', { colorSpace })
+      expect(sel.format).toBe(TextureFormat.BC4)
+      expect(sel.encoderClass).toBe(BC4WebGLEncoder)
+      expect(sel.astcNormalRemap).toBe(false)
+    }
+  })
+
+  it('returns EAC R11 on ETC-class devices, ahead of ASTC', () => {
+    const sel = selectWebGLFormat(caps({ etc: true, astc: true }), 'singleChannel')
+    expect(sel.format).toBe(TextureFormat.EAC_R11)
+    expect(sel.encoderClass).toBe(EACR11WebGLEncoder)
+  })
+
+  it('prefers BC4 over EAC R11 when both are present', () => {
+    const sel = selectWebGLFormat(caps({ rgtc: true, etc: true }), 'singleChannel')
+    expect(sel.format).toBe(TextureFormat.BC4)
+  })
+
+  it('falls back to the LINEAR colour formats without rgtc or etc', () => {
+    expect(selectWebGLFormat(caps({ bptc: true }), 'singleChannel').format).toBe(TextureFormat.BC7)
+    expect(selectWebGLFormat(caps({ astc: true }), 'singleChannel').format).toBe(TextureFormat.ASTC_4x4)
+    const bc1 = selectWebGLFormat(caps({ s3tc: true, s3tcSrgb: true }), 'singleChannel')
+    expect(bc1.format).toBe(TextureFormat.BC1)
+    expect(bc1.encoderClass).toBe(BC1WebGLEncoder)
+  })
+
+  it('returns no format when nothing is supported', () => {
+    expect(selectWebGLFormat(caps({}), 'singleChannel').format).toBeNull()
   })
 })
 

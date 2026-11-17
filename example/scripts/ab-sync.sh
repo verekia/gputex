@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 mkdir -p example/public/ab
-for f in bc1 bc5 bc7 astc4x4 etc2; do
+for f in bc1 bc4 bc5 bc7 astc4x4 etc2 eac_r11; do
   for v in "" "_fast_f16"; do
     src="library/src/${f}${v}.wgsl"
     short="${f/astc4x4/astc}${v/_fast_f16/_f16}"

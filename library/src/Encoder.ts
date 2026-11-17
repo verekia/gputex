@@ -1,6 +1,6 @@
 // Abstract base class for all block-compression encoders.
 //
-// Each concrete encoder (BC1, BC5, BC7, ASTC_4x4) overrides a handful of
+// Each concrete encoder (BC1, BC4, BC5, BC7, ASTC_4x4, ETC2, EAC R11) overrides a handful of
 // hooks — shader source, block size, format strings — and inherits the shared
 // `encodeToBytes()` pipeline: pad → upload → dispatch → readback into raw
 // compressed bytes. The base class is deliberately Three.js-free; wrapping the
@@ -429,7 +429,7 @@ export abstract class Encoder {
   /** Short lowercase identifier used in GPU object labels and errors. */
   abstract get label(): string
 
-  /** 8 for BC1/BC4, 16 for BC5/BC7/ASTC 4×4. */
+  /** 8 for BC1/BC4/ETC2/EAC R11, 16 for BC5/BC7/ASTC 4×4. */
   abstract get bytesPerBlock(): number
 
   /** WGSL `@workgroup_size` dimensions. Default 8×8×1. */
@@ -446,7 +446,7 @@ export abstract class Encoder {
    * Format of the single-shot source texture the encode pass samples.
    * Encoders that read only a channel subset can narrow it to cut DRAM
    * traffic on the bandwidth-bound compute pass (BC5 reads rg8unorm — half
-   * the bytes of rgba8). Must be valid as a copyExternalImageToTexture
+   * the bytes of rgba8; BC4 and EAC R11 read r8unorm). Must be valid as a copyExternalImageToTexture
    * destination and renderable. Chain encodes keep rgba8unorm regardless
    * (their inputs are RGBA mip levels / texture views); the WGSL is
    * format-agnostic (`texture_2d<f32>`), so mixing is byte-identical.

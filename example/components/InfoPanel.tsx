@@ -48,7 +48,7 @@ const InfoPanel = ({ file, result, encoding, useCompressed, onToggleCompressed }
     <div className="fixed top-4 left-4 z-20 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-white/10 bg-black/80 p-4 text-sm leading-relaxed shadow-xl backdrop-blur-xl">
       <h1 className="mb-0.5 text-[15px] font-semibold text-white">GPUtex</h1>
       <div className="mb-1 text-[11px] text-gray-400">
-        WebGPU compute &middot; WebGL fallback &middot; BC7 / BC5 / ASTC &middot; R3F
+        WebGPU compute &middot; WebGL fallback &middot; BC7 / BC5 / BC4 / ASTC / ETC2 / EAC &middot; R3F
       </div>
 
       {caps && (

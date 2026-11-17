@@ -59,7 +59,12 @@ export async function compressTexture(
   const { levels, fallbackBitmap, ...rest } = await compressTextureToBytes(source, options)
   const texture =
     fallbackBitmap !== null
-      ? wrapUncompressed(fallbackBitmap, options.colorSpace !== 'linear', options.flipY ?? true)
+      ? // Single-channel data is linear on every path, the uncompressed one included.
+        wrapUncompressed(
+          fallbackBitmap,
+          options.colorSpace !== 'linear' && options.hint !== 'singleChannel',
+          options.flipY ?? true,
+        )
       : buildCompressedTexture(levels!, rest.format!)
   return { ...rest, texture, destroy: () => texture.dispose() }
 }

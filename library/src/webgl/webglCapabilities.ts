@@ -22,7 +22,7 @@ export interface ExtensionProvider {
 export interface WebGLCapabilities {
   /** EXT_texture_compression_bptc → BC7 (BPTC). */
   bptc: boolean
-  /** EXT_texture_compression_rgtc → BC5 (RGTC2). */
+  /** EXT_texture_compression_rgtc → BC4 (RGTC1) and BC5 (RGTC2). */
   rgtc: boolean
   /** WEBGL_compressed_texture_s3tc → BC1 (DXT1). */
   s3tc: boolean
@@ -30,7 +30,7 @@ export interface WebGLCapabilities {
   s3tcSrgb: boolean
   /** WEBGL_compressed_texture_astc → ASTC 4×4 (and other footprints). */
   astc: boolean
-  /** WEBGL_compressed_texture_etc → ETC2 RGB8 (and the other ETC2/EAC formats). */
+  /** WEBGL_compressed_texture_etc → ETC2 RGB8 and EAC R11 (and the other ETC2/EAC formats). */
   etc: boolean
 }
 

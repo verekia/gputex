@@ -11,8 +11,10 @@ const LINKS: { href: string; label: string }[] = [
   { href: '/bc1', label: 'BC1' },
   { href: '/bc7', label: 'BC7' },
   { href: '/bc5', label: 'BC5' },
+  { href: '/bc4', label: 'BC4' },
   { href: '/astc', label: 'ASTC' },
   { href: '/etc2', label: 'ETC2' },
+  { href: '/eac-r11', label: 'EAC R11' },
   { href: '/', label: 'Demo' },
 ]
 

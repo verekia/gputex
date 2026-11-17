@@ -1,7 +1,10 @@
 import { ASTC4x4Encoder } from '../ASTC4x4Encoder.js'
 import { BC1Encoder } from '../BC1Encoder.js'
+import { BC4Encoder } from '../BC4Encoder.js'
 import { BC5Encoder } from '../BC5Encoder.js'
 import { BC7Encoder } from '../BC7Encoder.js'
+import { _internal as _eacInternal } from '../eac_r11_ref.js'
+import { EACR11Encoder } from '../EACR11Encoder.js'
 import { ETC2Encoder } from '../ETC2Encoder.js'
 import { TextureFormat, WebGPUFeature } from '../TextureFormat.js'
 
@@ -40,7 +43,7 @@ describe('BC1Encoder metadata', () => {
 
 describe('f16 fast shader variants', () => {
   it('every encoder ships an f16 fast module', () => {
-    for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ASTC4x4Encoder, ETC2Encoder]) {
+    for (const cls of [BC1Encoder, BC4Encoder, BC5Encoder, BC7Encoder, ASTC4x4Encoder, ETC2Encoder, EACR11Encoder]) {
       const view: AnyProto = Object.create(cls.prototype)
       const src: string | null = view.wgslSourceFastF16()
       expect(typeof src).toBe('string')
@@ -73,10 +76,66 @@ describe('opaque-source kernels', () => {
   })
 
   it('the other encoders have none (the promise is ignored there)', () => {
-    for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ETC2Encoder]) {
+    for (const cls of [BC1Encoder, BC4Encoder, BC5Encoder, BC7Encoder, ETC2Encoder, EACR11Encoder]) {
       const view: AnyProto = Object.create(cls.prototype)
       expect(view.wgslSourceOpaqueF16()).toBeNull()
     }
+  })
+})
+
+describe('BC4Encoder', () => {
+  it('declares its metadata', () => {
+    expect(BC4Encoder.requiredFeature).toBe(WebGPUFeature.BC)
+    expect(BC4Encoder.textureFormats).toEqual([TextureFormat.BC4])
+    const view: AnyProto = Object.create(BC4Encoder.prototype)
+    expect(view.label).toBe('bc4')
+    expect(view.bytesPerBlock).toBe(8)
+    expect(view.supportsSrgb).toBe(false)
+    expect(view.srcTextureFormat).toBe('r8unorm')
+    expect(view.gpuTextureFormat({ colorSpace: 'linear' })).toBe('bc4-r-unorm')
+  })
+
+  it('loads both WGSL modules, reading R through four gathers', () => {
+    const view: AnyProto = Object.create(BC4Encoder.prototype)
+    for (const src of [view.wgslSource(), view.wgslSourceFastF16()] as string[]) {
+      expect(src).toContain('@compute')
+      expect(src).toContain('@binding(3) var smp: sampler;')
+      expect(src.match(/textureGather\(0, src_tex/g)?.length).toBe(4)
+      expect(src).not.toContain('textureGather(1, src_tex')
+      // 8-byte blocks: two u32 per block.
+      expect(src).toContain('let o = bi * 2u;')
+    }
+  })
+})
+
+describe('EACR11Encoder', () => {
+  it('declares its metadata', () => {
+    expect(EACR11Encoder.requiredFeature).toBe(WebGPUFeature.ETC2)
+    expect(EACR11Encoder.textureFormats).toEqual([TextureFormat.EAC_R11])
+    const view: AnyProto = Object.create(EACR11Encoder.prototype)
+    expect(view.label).toBe('eac-r11')
+    expect(view.bytesPerBlock).toBe(8)
+    expect(view.supportsSrgb).toBe(false)
+    expect(view.srcTextureFormat).toBe('r8unorm')
+    expect(view.gpuTextureFormat({ colorSpace: 'linear' })).toBe('eac-r11unorm')
+  })
+
+  it('both WGSL modules carry the same candidate table as the CPU reference', () => {
+    const view: AnyProto = Object.create(EACR11Encoder.prototype)
+    const want = _eacInternal.CANDIDATES.map(c => `0x${c.toString(16).padStart(5, '0')}u`)
+    for (const src of [view.wgslSource(), view.wgslSourceFastF16()] as string[]) {
+      expect(src).toContain('@compute')
+      const lut = src.slice(src.indexOf('const LUT = array<u32, 41>('))
+      expect(lut.slice(0, lut.indexOf(');')).match(/0x[0-9a-f]{5}u/g)).toEqual(want)
+    }
+  })
+
+  it('the f16 module is the exact-value port (error sums stay f32)', () => {
+    const view: AnyProto = Object.create(EACR11Encoder.prototype)
+    const src: string = view.wgslSourceFastF16()
+    expect(src).toContain('EXACT-VALUE f16')
+    expect(src).toContain('var t: array<h4, 4>;')
+    expect(src).toContain('var e = 0.0;')
   })
 })
 

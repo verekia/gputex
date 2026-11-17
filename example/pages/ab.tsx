@@ -19,6 +19,10 @@
 //   batch=10       dispatches per timed pass (default 10)
 //   samples=25     timed samples per shader (default 25, +8 warmup)
 //   image=proc     proc | gray | alpha | /textures/... URL (default proc)
+//
+// Source-format markers (a comment in the shader selects the bound source):
+// 'ab-src-rg8' (R,G as rg8unorm), 'ab-src-r8' (R as r8unorm), and the
+// experiment-only ones documented at their definitions below.
 //   dsts=1         output buffers rotated across the batch (default 1).
 //                  With 1, every dispatch writes the same buffer and the
 //                  driver serialises them on the write-write hazard —
@@ -198,6 +202,23 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     return texRG
   }
 
+  // r8unorm experiments ('ab-src-r8'): the image's R channel alone — a
+  // QUARTER of the bytes of rgba8, and what BC4Encoder / EACR11Encoder bind.
+  let texR: GPUTexture | null = null
+  const getTexR = (): GPUTexture => {
+    if (!texR) {
+      texR = device.createTexture({
+        size: [w, h],
+        format: 'r8unorm',
+        usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      })
+      const packed = new Uint8Array(w * h)
+      for (let i = 0; i < w * h; i++) packed[i] = img.data[i * 4]!
+      device.queue.writeTexture({ texture: texR }, packed, { bytesPerRow: w }, [w, h])
+    }
+    return texR
+  }
+
   // rgba8uint experiments ('ab-src-u8'): the same pixel bytes as an
   // integer texture — loads skip the unorm->float conversion.
   let texU8: GPUTexture | null = null
@@ -286,8 +307,10 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     return [texY32!, texQ!]
   }
 
-  const uniform = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
-  device.queue.writeBuffer(uniform, 0, new Uint32Array([blocksX, blocksY, w, h]))
+  // { blocks_x, blocks_y, width, height, y0 } — the encoders' Params (y0 = 0:
+  // whole-grid dispatches), bound as the same 32-byte slot Encoder.ts uses.
+  const uniform = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+  device.queue.writeBuffer(uniform, 0, new Uint32Array([blocksX, blocksY, w, h, 0, 0, 0, 0]))
 
   const cases: ShaderCase[] = []
   for (const name of names) {
@@ -297,7 +320,7 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const code = await res.text()
     const wg = /@workgroup_size\((\d+)\s*,\s*(\d+)/.exec(code)
     if (!wg) throw new Error(`${name}: no @workgroup_size`)
-    const bpb = name.includes('bc1') || name.includes('etc2') ? 8 : 16
+    const bpb = /bc1|bc4|etc2|eac/.test(name) ? 8 : 16
     const dsts = Array.from({ length: dstsCount }, () =>
       device.createBuffer({ size: blocksX * blocksY * bpb, usage: GPUBufferUsage.STORAGE }),
     )
@@ -312,6 +335,7 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
     const usesYQ = !usesYQ32 && code.includes('ab-src-yq')
     const usesU8 = code.includes('ab-src-u8')
     const usesRG = code.includes('ab-src-rg8')
+    const usesR = code.includes('ab-src-r8')
     const usesPacked = !uses565 && !usesU8 && /src_tex\s*:\s*texture_2d<u32>/.test(code)
     const bindGroups = dsts.map(dst => {
       const entries: GPUBindGroupEntry[] = [
@@ -325,11 +349,13 @@ async function runAb(onProgress: (msg: string) => void): Promise<AbResult[]> {
                 ? { binding: 0, resource: getTex565().createView() }
                 : usesRG
                   ? { binding: 0, resource: getTexRG().createView() }
-                  : usesU8
-                    ? { binding: 0, resource: getTexU8().createView() }
-                    : usesPacked
-                      ? { binding: 0, resource: getPackedTex().createView() }
-                      : { binding: 0, resource: tex.createView() },
+                  : usesR
+                    ? { binding: 0, resource: getTexR().createView() }
+                    : usesU8
+                      ? { binding: 0, resource: getTexU8().createView() }
+                      : usesPacked
+                        ? { binding: 0, resource: getPackedTex().createView() }
+                        : { binding: 0, resource: tex.createView() },
         { binding: 1, resource: { buffer: dst } },
         { binding: 2, resource: { buffer: uniform } },
       ]

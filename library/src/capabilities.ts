@@ -30,12 +30,13 @@ const FORMATS_BY_FEATURE: Record<WebGPUFeature, readonly TextureFormat[]> = {
   [WebGPUFeature.BC]: [
     TextureFormat.BC1,
     TextureFormat.BC1_SRGB,
+    TextureFormat.BC4,
     TextureFormat.BC5,
     TextureFormat.BC7,
     TextureFormat.BC7_SRGB,
   ],
   [WebGPUFeature.ASTC]: [TextureFormat.ASTC_4x4, TextureFormat.ASTC_4x4_SRGB],
-  [WebGPUFeature.ETC2]: [TextureFormat.ETC2_RGB8, TextureFormat.ETC2_RGB8_SRGB],
+  [WebGPUFeature.ETC2]: [TextureFormat.ETC2_RGB8, TextureFormat.ETC2_RGB8_SRGB, TextureFormat.EAC_R11],
 }
 
 export function detectCapabilities(adapter: FeatureProvider): Capabilities {

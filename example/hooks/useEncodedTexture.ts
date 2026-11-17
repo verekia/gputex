@@ -5,11 +5,15 @@ import {
   ASTC4x4WebGLEncoder,
   BC1Encoder,
   BC1WebGLEncoder,
+  BC4Encoder,
+  BC4WebGLEncoder,
   BC5Encoder,
   BC5WebGLEncoder,
   BC7Encoder,
   BC7WebGLEncoder,
   detectWebGLCapabilities,
+  EACR11Encoder,
+  EACR11WebGLEncoder,
   ETC2Encoder,
   ETC2WebGLEncoder,
   getSharedWebGLContext,
@@ -24,7 +28,7 @@ import type { Texture } from 'three'
 
 // Encode a single image with ONE specific encoder class, bypassing
 // `compressTexture()`'s capability-based auto-selection. The per-format test
-// pages (/bc1, /bc5, /bc7, /astc) use this to force exactly the format they
+// pages (/bc1, /bc4, /bc5, /bc7, /astc, /etc2, /eac-r11) use this to force exactly the format they
 // want — `compressTexture` would otherwise pick BC7 (desktop) or ASTC (mobile)
 // for a colour hint and never BC1 at all.
 //
@@ -35,10 +39,12 @@ import type { Texture } from 'three'
 // output sampleable there.
 const WEBGL_TWINS = new Map<EncoderConstructor, { cls: WebGLEncoderConstructor; cap: keyof WebGLCapabilities }>([
   [BC1Encoder, { cls: BC1WebGLEncoder, cap: 's3tc' }],
+  [BC4Encoder, { cls: BC4WebGLEncoder, cap: 'rgtc' }],
   [BC5Encoder, { cls: BC5WebGLEncoder, cap: 'rgtc' }],
   [BC7Encoder, { cls: BC7WebGLEncoder, cap: 'bptc' }],
   [ASTC4x4Encoder, { cls: ASTC4x4WebGLEncoder, cap: 'astc' }],
   [ETC2Encoder, { cls: ETC2WebGLEncoder, cap: 'etc' }],
+  [EACR11Encoder, { cls: EACR11WebGLEncoder, cap: 'etc' }],
 ])
 
 export interface EncodedInfo {

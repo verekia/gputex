@@ -48,6 +48,14 @@ export function uploadSourceTexture(
       device.queue.writeTexture({ texture: srcTex }, rg, { bytesPerRow: width * 2 }, [width, height, 1])
       return
     }
+    if (srcTex.format === 'r8unorm') {
+      // One-channel source texture (BC4, EAC R11): same, R only.
+      const rgba = source.data
+      const r = new Uint8Array(width * height)
+      for (let i = 0; i < width * height; i++) r[i] = rgba[i * 4]!
+      device.queue.writeTexture({ texture: srcTex }, r, { bytesPerRow: width }, [width, height, 1])
+      return
+    }
     device.queue.writeTexture({ texture: srcTex }, source.data, { bytesPerRow: width * 4 }, [width, height, 1])
   } else {
     device.queue.copyExternalImageToTexture({ source: source as ImageBitmap, flipY }, { texture: srcTex }, [

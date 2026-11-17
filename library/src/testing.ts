@@ -36,3 +36,10 @@ export {
   type ETC2Quality,
   type ETC2Mode,
 } from './etc2_ref.js'
+export {
+  encodeEACR11Block,
+  decodeEACR11Block,
+  type EACR11Values,
+  type EACR11Block,
+  type EACR11Quality,
+} from './eac_r11_ref.js'

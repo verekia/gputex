@@ -19,23 +19,27 @@
 //      queries) GPU compute-pass time per format on a 2048×2048 image, for
 //      both shader variants.
 
-import { ASTC4x4Encoder, BC1Encoder, BC5Encoder, BC7Encoder, ETC2Encoder } from 'gputex'
+import { ASTC4x4Encoder, BC1Encoder, BC4Encoder, BC5Encoder, BC7Encoder, EACR11Encoder, ETC2Encoder } from 'gputex'
 import type { Encoder } from 'gputex'
 
 import {
   decodeASTC4x4Block,
   decodeBC1Block,
+  decodeBC4Block,
   decodeBC5Block,
   decodeBC7Block,
+  decodeEACR11Block,
   decodeETC2Block,
   encodeASTC4x4Block,
   encodeBC1Block,
+  encodeBC4Block,
   encodeBC5Block,
   encodeBC7Mode6Block,
+  encodeEACR11Block,
   encodeETC2Block,
 } from 'gputex/testing'
 
-export type FormatKey = 'bc1' | 'bc5' | 'bc7' | 'astc' | 'etc2'
+export type FormatKey = 'bc1' | 'bc4' | 'bc5' | 'bc7' | 'astc' | 'etc2' | 'eac'
 
 export interface CorrectnessResult {
   name: string
@@ -203,6 +207,28 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc5:wood-normal-2k': 49.2,
   'bc7:wood-color-4k': 51.66,
   'bc5:wood-normal-4k': 47.8,
+  // Single-channel formats (2026-11, observed minus ~0.15 dB), on the R
+  // channel of each image. BC4 is the single-channel half of the BC5
+  // kernel; EAC R11 matches its CPU mirror byte for byte, so its pins are
+  // the mirror's numbers. EAC trails BC4 on 8-bit sources between spans of
+  // 6 and 20 levels (coarser palettes there, and its multiplier ≥ 1 grid
+  // sits up to half a level off the 8-bit grid) and leads on wide spans.
+  'bc4:color': 41.05,
+  'bc4:packed-1024': 48.05,
+  'bc4:rock-roughness-1k': 46.75,
+  'bc4:rock-ao-1k': 49.55,
+  'bc4:rock-displacement-1k': 58.95,
+  'bc4:rock-displacement-4k': 70.25,
+  'bc4:wood-roughness-1k': 47.95,
+  'bc4:wood-displacement-1k': 52.9,
+  'eac:color': 39.95,
+  'eac:packed-1024': 47.85,
+  'eac:rock-roughness-1k': 46.05,
+  'eac:rock-ao-1k': 48.7,
+  'eac:rock-displacement-1k': 55.9,
+  'eac:rock-displacement-4k': 65.35,
+  'eac:wood-roughness-1k': 47.6,
+  'eac:wood-displacement-1k': 51.55,
 }
 
 // Worst-EASY-block gate: over blocks that the CPU reference encodes
@@ -264,6 +290,22 @@ const EXCESS_LIMITS: Record<string, number | null> = {
   'bc5:wood-normal-1k': 0.05,
   'bc1:wood-roughness-1k': 0.1,
   'bc1:wood-displacement-1k': 0.05,
+  // BC4 (observed ≤ 0.013, the GPU kernel's small losses to the older CPU
+  // reference on blocks it nails). EAC R11's reference IS its mirror: zero.
+  'bc4:color': 0.05,
+  'bc4:packed-1024': 0.05,
+  'bc4:rock-roughness-1k': 0.05,
+  'bc4:rock-ao-1k': 0.05,
+  'bc4:rock-displacement-1k': 0.05,
+  'bc4:wood-roughness-1k': 0.05,
+  'bc4:wood-displacement-1k': 0.05,
+  'eac:color': 0,
+  'eac:packed-1024': 0,
+  'eac:rock-roughness-1k': 0,
+  'eac:rock-ao-1k': 0,
+  'eac:rock-displacement-1k': 0,
+  'eac:wood-roughness-1k': 0,
+  'eac:wood-displacement-1k': 0,
 }
 
 // ------------------------------------------------------------------ helpers
@@ -351,6 +393,10 @@ const DECODERS: Record<FormatKey, { bytesPerBlock: number; decode: BlockDecoder 
     bytesPerBlock: 8,
     decode: block => ({ values: Float64Array.from(decodeBC1Block(block)), channels: 3 }),
   },
+  bc4: {
+    bytesPerBlock: 8,
+    decode: block => ({ values: Float64Array.from(decodeBC4Block(block)), channels: 1 }),
+  },
   bc5: {
     bytesPerBlock: 16,
     decode: block => {
@@ -375,11 +421,18 @@ const DECODERS: Record<FormatKey, { bytesPerBlock: number; decode: BlockDecoder 
     bytesPerBlock: 8,
     decode: block => ({ values: Float64Array.from(decodeETC2Block(block)), channels: 3 }),
   },
+  eac: {
+    bytesPerBlock: 8,
+    decode: block => ({ values: Float64Array.from(decodeEACR11Block(block)), channels: 1 }),
+  },
 }
 
 /**
  * CPU-encode every block of `img` with the exhaustive reference encoder for
- * `format` — the quality yardstick the GPU encoder is gated against.
+ * `format` — the quality yardstick the GPU encoder is gated against. EAC R11
+ * always uses its 'fast' reference: that is the exact CPU mirror of the
+ * shader (the GPU must match it byte for byte), and its exhaustive search
+ * is far too slow for whole images.
  */
 function referenceEncode(format: FormatKey, img: ImageData, quality: 'fast' | 'high' = 'high'): Uint8Array {
   const blocksX = (img.width + 3) >> 2
@@ -393,6 +446,10 @@ function referenceEncode(format: FormatKey, img: ImageData, quality: 'fast' | 'h
         block = encodeBC1Block(extractBlock(img, bx, by, 3), { quality: 'high' })
       } else if (format === 'etc2') {
         block = encodeETC2Block(extractBlock(img, bx, by, 3), { quality })
+      } else if (format === 'bc4') {
+        block = encodeBC4Block(extractBlock(img, bx, by, 1))
+      } else if (format === 'eac') {
+        block = encodeEACR11Block(extractBlock(img, bx, by, 1), { quality: 'fast' })
       } else if (format === 'bc5') {
         const rgba = extractBlock(img, bx, by, 4)
         const r = new Float64Array(16)
@@ -521,14 +578,16 @@ export async function runSuite(
     userAgent: navigator.userAgent,
   }
 
-  const ALL_FORMATS: FormatKey[] = ['bc1', 'bc5', 'bc7', 'astc', 'etc2']
+  const ALL_FORMATS: FormatKey[] = ['bc1', 'bc4', 'bc5', 'bc7', 'astc', 'etc2', 'eac']
   const FORMATS = only?.length ? ALL_FORMATS.filter(f => only.includes(f)) : ALL_FORMATS
   const make = (format: FormatKey, disableF16: boolean): Encoder => {
     const opts = { device, adapter, disableF16 }
     if (format === 'bc1') return new BC1Encoder(opts)
+    if (format === 'bc4') return new BC4Encoder(opts)
     if (format === 'bc5') return new BC5Encoder(opts)
     if (format === 'bc7') return new BC7Encoder(opts)
     if (format === 'astc') return new ASTC4x4Encoder(opts)
+    if (format === 'eac') return new EACR11Encoder(opts)
     return new ETC2Encoder(opts)
   }
   // Only the selected formats are constructed (construction starts the
@@ -588,6 +647,53 @@ export async function runSuite(
       pass: delta >= -2.0,
       detail: `gpu ${gpuPsnr.toFixed(2)} dB vs reference ${refPsnr.toFixed(2)} dB (Δ ${delta.toFixed(2)})`,
     })
+
+    // EAC R11 runs exact integer arithmetic: every shader variant must
+    // reproduce the CPU mirror byte for byte — aligned and odd sizes.
+    if (format === 'eac') {
+      for (const [label, e] of [
+        ['default', enc],
+        ['f32', encodersF32[format]],
+      ] as const) {
+        onProgress(`Correctness: ${format} (${label}) bytes vs CPU mirror`)
+        const aligned = diffBytes((await e.encodeToBytes(color)).data, referenceEncode(format, color), 8)
+        const odd = diffBytes((await e.encodeToBytes(oddImg)).data, refOdd, 8)
+        correctness.push({
+          name: `${format} (${label}) byte-identical to the CPU mirror`,
+          format,
+          pass: aligned.blocks === 0 && odd.blocks === 0,
+          detail:
+            aligned.blocks === 0 && odd.blocks === 0
+              ? '256×256 and 133×61 identical'
+              : `${aligned.blocks} blocks differ at 256×256, ${odd.blocks} at 133×61`,
+        })
+      }
+    }
+
+    // BC4 is the single-channel half of the BC5 kernel: its blocks must be
+    // the R halves of the BC5 blocks for the same image.
+    if (format === 'bc4' && FORMATS.includes('bc5')) {
+      onProgress(`Correctness: ${format} bytes vs the R half of bc5`)
+      let differing = 0
+      for (const img of [color, oddImg]) {
+        const four = (await enc.encodeToBytes(img)).data
+        const five = (await encoders.bc5.encodeToBytes(img)).data
+        for (let b = 0; b * 8 < four.length; b++) {
+          for (let i = 0; i < 8; i++) {
+            if (four[b * 8 + i] !== five[b * 16 + i]) {
+              differing++
+              break
+            }
+          }
+        }
+      }
+      correctness.push({
+        name: `${format} byte-identical to the R half of bc5`,
+        format,
+        pass: differing === 0,
+        detail: differing === 0 ? '256×256 and 133×61 identical' : `${differing} blocks differ`,
+      })
+    }
 
     // The opaque-source kernel has its own edge-block path (clamped loads
     // arranged as gather quads): same odd-size gate, plus sizes below one
@@ -669,7 +775,7 @@ export async function runSuite(
   })
   const qualitySpecs: QualitySpec[] = [
     // Synthetic cards.
-    gated('color', ['bc1', 'bc7', 'astc', 'etc2'], colorFull),
+    gated('color', ['bc1', 'bc7', 'astc', 'etc2', 'bc4', 'eac'], colorFull),
     gated('normal', ['bc5', 'bc1', 'bc7', 'astc'], normalFull),
     // Committed 1024² alpha card (gen-test-textures.mjs): smooth alpha
     // ramps, cutout edges, Nyquist/noise alpha, low-alpha precision, plus
@@ -679,15 +785,16 @@ export async function runSuite(
     // Packed-materials game atlas (channel-packed, has alpha at 1024).
     gated('packed-256', ['bc7'], packed(256)),
     gated('packed-512', ['bc7'], packed(512)),
-    gated('packed-1024', ['bc1', 'bc7', 'astc', 'etc2'], packed(1024)),
+    gated('packed-1024', ['bc1', 'bc7', 'astc', 'etc2', 'bc4', 'eac'], packed(1024)),
     floorOnly('packed-2048', ['bc7'], packed(2048)),
     floorOnly('packed-4096', ['bc7'], packed(4096)),
     // Rock064 PBR set (photographic).
     gated('rock-color-1k', ['bc1', 'bc7', 'astc', 'etc2'], rock('1K', 'Color')),
     gated('rock-normal-1k', ['bc5'], rock('1K', 'NormalGL')),
-    gated('rock-roughness-1k', ['bc1', 'bc7', 'astc', 'etc2'], rock('1K', 'Roughness')),
-    gated('rock-ao-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'AmbientOcclusion')),
-    gated('rock-displacement-1k', ['bc1', 'bc7', 'astc'], rock('1K', 'Displacement')),
+    gated('rock-roughness-1k', ['bc1', 'bc7', 'astc', 'etc2', 'bc4', 'eac'], rock('1K', 'Roughness')),
+    gated('rock-ao-1k', ['bc1', 'bc7', 'astc', 'bc4', 'eac'], rock('1K', 'AmbientOcclusion')),
+    gated('rock-displacement-1k', ['bc1', 'bc7', 'astc', 'bc4', 'eac'], rock('1K', 'Displacement')),
+    floorOnly('rock-displacement-4k', ['bc4', 'eac'], rock('4K', 'Displacement')),
     floorOnly('rock-color-2k', ['bc7'], rock('2K', 'Color')),
     floorOnly('rock-normal-2k', ['bc5'], rock('2K', 'NormalGL')),
     floorOnly('rock-color-4k', ['bc7'], rock('4K', 'Color')),
@@ -695,8 +802,8 @@ export async function runSuite(
     // WoodFloor004 PBR set (photographic, strong plank seams).
     gated('wood-color-1k', ['bc1', 'bc7', 'astc', 'etc2'], wood('1K', 'Color')),
     gated('wood-normal-1k', ['bc5'], wood('1K', 'NormalGL')),
-    gated('wood-roughness-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Roughness')),
-    gated('wood-displacement-1k', ['bc1', 'bc7', 'astc'], wood('1K', 'Displacement')),
+    gated('wood-roughness-1k', ['bc1', 'bc7', 'astc', 'bc4', 'eac'], wood('1K', 'Roughness')),
+    gated('wood-displacement-1k', ['bc1', 'bc7', 'astc', 'bc4', 'eac'], wood('1K', 'Displacement')),
     floorOnly('wood-color-2k', ['bc7'], wood('2K', 'Color')),
     floorOnly('wood-normal-2k', ['bc5'], wood('2K', 'NormalGL')),
     floorOnly('wood-color-4k', ['bc7'], wood('4K', 'Color')),

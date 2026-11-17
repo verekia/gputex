@@ -2,8 +2,10 @@ import { describe, expect, it, spyOn } from 'bun:test'
 
 import { ASTC4x4Encoder } from '../ASTC4x4Encoder.js'
 import { BC1Encoder } from '../BC1Encoder.js'
+import { BC4Encoder } from '../BC4Encoder.js'
 import { BC5Encoder } from '../BC5Encoder.js'
 import { BC7Encoder } from '../BC7Encoder.js'
+import { EACR11Encoder } from '../EACR11Encoder.js'
 import { ETC2Encoder } from '../ETC2Encoder.js'
 import { selectFormat } from '../selectFormat.js'
 import { TextureFormat, WebGPUFeature } from '../TextureFormat.js'
@@ -210,6 +212,60 @@ describe('selectFormat: quality low', () => {
     const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC]), 'color', { quality: 'low' })
     expect(sel.format).toBe(TextureFormat.ASTC_4x4_SRGB)
     expect(sel.encoderClass).toBe(ASTC4x4Encoder)
+  })
+})
+
+describe('selectFormat: singleChannel hint', () => {
+  it('returns BC4 + BC4Encoder on a BC adapter, whatever the colorSpace', () => {
+    for (const colorSpace of ['srgb', 'linear'] as const) {
+      const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'singleChannel', { colorSpace })
+      expect(sel.format).toBe(TextureFormat.BC4)
+      expect(sel.encoderClass).toBe(BC4Encoder)
+      expect(sel.astcNormalRemap).toBe(false)
+    }
+  })
+
+  it('returns EAC_R11 + EACR11Encoder on a BC-less adapter, ahead of ASTC', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC, WebGPUFeature.ETC2]), 'singleChannel')
+    expect(sel.format).toBe(TextureFormat.EAC_R11)
+    expect(sel.encoderClass).toBe(EACR11Encoder)
+    expect(sel.astcNormalRemap).toBe(false)
+  })
+
+  it('prefers BC4 when the adapter has every family (e.g. Apple GPUs)', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.BC, WebGPUFeature.ASTC, WebGPUFeature.ETC2]), 'singleChannel')
+    expect(sel.format).toBe(TextureFormat.BC4)
+  })
+
+  it('is unaffected by quality low (already 4 bpp)', () => {
+    const bc = selectFormat(stubAdapter([WebGPUFeature.BC]), 'singleChannel', { quality: 'low' })
+    const etc = selectFormat(stubAdapter([WebGPUFeature.ETC2]), 'singleChannel', { quality: 'low' })
+    expect(bc.format).toBe(TextureFormat.BC4)
+    expect(etc.format).toBe(TextureFormat.EAC_R11)
+  })
+
+  it('falls back to LINEAR ASTC when neither BC nor ETC2 is present', () => {
+    const sel = selectFormat(stubAdapter([WebGPUFeature.ASTC]), 'singleChannel')
+    expect(sel.format).toBe(TextureFormat.ASTC_4x4)
+    expect(sel.encoderClass).toBe(ASTC4x4Encoder)
+    expect(sel.astcNormalRemap).toBe(false)
+  })
+
+  it('ignores preferredFormat bc1 (with a warning)', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const sel = selectFormat(stubAdapter([WebGPUFeature.BC]), 'singleChannel', { preferredFormat: 'bc1' })
+      expect(sel.format).toBe(TextureFormat.BC4)
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('returns null when no compressed format is supported', () => {
+    const sel = selectFormat(stubAdapter([]), 'singleChannel')
+    expect(sel.format).toBeNull()
+    expect(sel.encoderClass).toBeNull()
   })
 })
 

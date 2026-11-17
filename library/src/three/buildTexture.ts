@@ -10,6 +10,7 @@
 
 import {
   RED_GREEN_RGTC2_Format,
+  RED_RGTC1_Format,
   RGB_ETC2_Format,
   RGBA_ASTC_4x4_Format,
   RGBA_BPTC_Format,
@@ -23,6 +24,12 @@ import type { CompressedPixelFormat, CompressedTexture } from 'three'
 
 import type { Encoder, EncoderImageSource } from '../Encoder.js'
 
+// EAC R11, by value (= GL's COMPRESSED_R11_EAC): three.js only exports the
+// `R11_EAC_Format` name from r180, and a named import would fail to link on
+// the older releases the peer range still allows. Those releases cannot
+// upload the format either way; the ones that can use this same number.
+const R11_EAC_Format = 37488 as CompressedPixelFormat
+
 /**
  * Logical format → Three.js `CompressedPixelFormat`. sRGB and linear variants
  * of a family share one constant; the sRGB flag rides on `texture.colorSpace`
@@ -31,6 +38,7 @@ import type { Encoder, EncoderImageSource } from '../Encoder.js'
 const THREE_FORMAT: Record<TextureFormat, CompressedPixelFormat> = {
   [TextureFormat.BC1]: RGBA_S3TC_DXT1_Format,
   [TextureFormat.BC1_SRGB]: RGBA_S3TC_DXT1_Format,
+  [TextureFormat.BC4]: RED_RGTC1_Format,
   [TextureFormat.BC5]: RED_GREEN_RGTC2_Format,
   [TextureFormat.BC7]: RGBA_BPTC_Format,
   [TextureFormat.BC7_SRGB]: RGBA_BPTC_Format,
@@ -38,6 +46,7 @@ const THREE_FORMAT: Record<TextureFormat, CompressedPixelFormat> = {
   [TextureFormat.ASTC_4x4_SRGB]: RGBA_ASTC_4x4_Format,
   [TextureFormat.ETC2_RGB8]: RGB_ETC2_Format,
   [TextureFormat.ETC2_RGB8_SRGB]: RGB_ETC2_Format,
+  [TextureFormat.EAC_R11]: R11_EAC_Format,
 }
 
 const SRGB_FORMATS: ReadonlySet<TextureFormat> = new Set([

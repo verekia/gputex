@@ -9,7 +9,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 
-import { ASTC4x4Encoder, BC1Encoder, BC5Encoder, BC7Encoder, ETC2Encoder } from 'gputex'
+import { ASTC4x4Encoder, BC1Encoder, BC4Encoder, BC5Encoder, BC7Encoder, EACR11Encoder, ETC2Encoder } from 'gputex'
 import type { Encoder } from 'gputex'
 
 import { exposeEncoders } from '../lib/exposeEncoders'
@@ -80,10 +80,12 @@ async function runBench(onProgress: (msg: string) => void): Promise<BenchResult[
 
   const encoders: Array<[string, Encoder]> = [
     ['bc1', new BC1Encoder({ device, adapter })],
+    ['bc4', new BC4Encoder({ device, adapter })],
     ['bc5', new BC5Encoder({ device, adapter })],
     ['bc7', new BC7Encoder({ device, adapter })],
     ['astc', new ASTC4x4Encoder({ device, adapter })],
     ['etc2', new ETC2Encoder({ device, adapter })],
+    ['eac-r11', new EACR11Encoder({ device, adapter })],
   ]
 
   onProgress('Preparing images…')
@@ -103,7 +105,7 @@ async function runBench(onProgress: (msg: string) => void): Promise<BenchResult[
   onProgress('Warming up GPU clocks…')
   const bigBitmap = bitmaps.get(4096)!
   for (let i = 0; i < 20; i++) {
-    await encoders[2]![1].encodeToBytes(bigBitmap)
+    await encoders.find(([format]) => format === 'bc7')![1].encodeToBytes(bigBitmap)
   }
 
   const results: BenchResult[] = []

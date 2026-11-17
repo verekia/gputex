@@ -2,7 +2,7 @@
 
 Compress textures on the GPU at runtime, in the browser.
 
-Give it a regular image (PNG, JPG, WebP, AVIF, SVG) and get back a GPU-compressed texture that uses 4–8× less video memory. gputex picks the right format for the user's hardware (BC7, BC5, BC1, ASTC or ETC2) and encodes it in a few milliseconds using WebGPU, with a WebGL2 fallback. No build step, no format variants to ship.
+Give it a regular image (PNG, JPG, WebP, AVIF, SVG) and get back a GPU-compressed texture that uses 4–8× less video memory. gputex picks the right format for the user's hardware (BC7, BC5, BC4, BC1, ASTC, ETC2 or EAC) and encodes it in a few milliseconds using WebGPU, with a WebGL2 fallback. No build step, no format variants to ship.
 
 Works with Three.js and React Three Fiber out of the box.
 
@@ -60,20 +60,34 @@ function Ground() {
 
 ## Options
 
-| Option       | Default   | Description                                                                                        |
-| ------------ | --------- | -------------------------------------------------------------------------------------------------- |
-| `hint`       | `'color'` | What the texture is for: `'color'`, `'colorWithAlpha'` or `'normal'`. Decides which format is used |
-| `quality`    | `'high'`  | `'low'` halves the memory of opaque color textures at a visible quality cost                       |
-| `colorSpace` | `'srgb'`  | `'srgb'` or `'linear'`                                                                             |
-| `mipmaps`    | `false`   | Generate mipmaps                                                                                   |
-| `flipY`      | `true`    | Flip vertically (Three.js convention)                                                              |
-| `svgSize`    | intrinsic | Size to rasterize SVGs at: a number (longest side) or `{ width, height }`                          |
-| `cache`      | `false`   | Remember compressed textures for the session so loading the same image again is instant            |
-| `device`     | —         | Encode on an existing WebGPU device (e.g. your renderer's) instead of creating one                 |
+| Option       | Default   | Description                                                                             |
+| ------------ | --------- | --------------------------------------------------------------------------------------- |
+| `hint`       | `'color'` | What the texture is for: `'color'`, `'colorWithAlpha'`, `'normal'` or `'singleChannel'` |
+| `quality`    | `'high'`  | `'low'` halves the memory of opaque color textures at a visible quality cost            |
+| `colorSpace` | `'srgb'`  | `'srgb'` or `'linear'`                                                                  |
+| `mipmaps`    | `false`   | Generate mipmaps                                                                        |
+| `flipY`      | `true`    | Flip vertically (Three.js convention)                                                   |
+| `svgSize`    | intrinsic | Size to rasterize SVGs at: a number (longest side) or `{ width, height }`               |
+| `cache`      | `false`   | Remember compressed textures for the session so loading the same image again is instant |
+| `device`     | —         | Encode on an existing WebGPU device (e.g. your renderer's) instead of creating one      |
 
 Sources can be a URL, a `Blob`/`File`, an `ImageBitmap`, an `<img>`, a canvas, `ImageData`, or an inline SVG string.
 
 The result also exposes `format`, `backend` (`'webgpu'`, `'webgl'` or `'none'`), `width`, `height`, `mipLevels`, timings, and `destroy()`.
+
+### Grayscale maps
+
+Ambient occlusion, height maps, masks, roughness or metalness only need one channel. `hint: 'singleChannel'` stores the image's red channel in a one-channel format (BC4 on desktop, EAC R11 on mobile) that takes half the memory of the color formats. The texture samples as `(r, 0, 0, 1)` and is always linear.
+
+```ts
+const { texture } = await compressTexture('/rock_ao.jpg', {
+  hint: 'singleChannel',
+  mipmaps: true,
+})
+material.aoMap = texture
+```
+
+Only the red channel exists, so with Three.js's built-in materials use it for the maps they read from red: `aoMap`, `displacementMap` and `bumpMap`. `roughnessMap`, `metalnessMap` and `alphaMap` are read from green or blue — for those, sample `.r` yourself in a node material or custom shader.
 
 ### Normal maps on mobile
 
@@ -106,7 +120,7 @@ const { levels, format } = await compressTextureToBytes('/cobblestone.avif', {
 // levels[i] = { data: Uint8Array, width, height }
 ```
 
-Individual encoders (`BC7Encoder`, `BC5Encoder`, `BC1Encoder`, `ASTC4x4Encoder`, `ETC2Encoder`) are exported too. When you feed them your own pixels and know they are fully opaque, say so — `encoder.encodeToBytes(source, { opaque: true })` — to get the same dedicated path.
+Individual encoders (`BC7Encoder`, `BC5Encoder`, `BC4Encoder`, `BC1Encoder`, `ASTC4x4Encoder`, `ETC2Encoder`, `EACR11Encoder`) are exported too. When you feed them your own pixels and know they are fully opaque, say so — `encoder.encodeToBytes(source, { opaque: true })` — to get the same dedicated path.
 
 ## Browser support
 

@@ -14,9 +14,11 @@ describe('TextureFormat', () => {
       'ASTC_4x4_SRGB',
       'BC1',
       'BC1_SRGB',
+      'BC4',
       'BC5',
       'BC7',
       'BC7_SRGB',
+      'EAC_R11',
       'ETC2_RGB8',
       'ETC2_RGB8_SRGB',
     ])
@@ -44,6 +46,7 @@ describe('detectCapabilities', () => {
     expect(caps.supportedFormats).toEqual([
       TextureFormat.BC1,
       TextureFormat.BC1_SRGB,
+      TextureFormat.BC4,
       TextureFormat.BC5,
       TextureFormat.BC7,
       TextureFormat.BC7_SRGB,
@@ -63,18 +66,22 @@ describe('detectCapabilities', () => {
     // BC formats come first, then ASTC.
     expect(caps.supportedFormats).toContain(TextureFormat.BC7)
     expect(caps.supportedFormats).toContain(TextureFormat.ASTC_4x4)
-    expect(caps.supportedFormats.length).toBe(7)
+    expect(caps.supportedFormats.length).toBe(8)
   })
 
   it('exposes ETC2 formats when texture-compression-etc2 is present', () => {
     const caps = detectCapabilities(fakeAdapter(WebGPUFeature.ETC2))
     expect(caps.etc2).toBe(true)
-    expect(caps.supportedFormats).toEqual([TextureFormat.ETC2_RGB8, TextureFormat.ETC2_RGB8_SRGB])
+    expect(caps.supportedFormats).toEqual([
+      TextureFormat.ETC2_RGB8,
+      TextureFormat.ETC2_RGB8_SRGB,
+      TextureFormat.EAC_R11,
+    ])
   })
 
   it('unions all three families when every feature is present (e.g. Apple GPUs)', () => {
     const caps = detectCapabilities(fakeAdapter(WebGPUFeature.BC, WebGPUFeature.ASTC, WebGPUFeature.ETC2))
-    expect(caps.supportedFormats.length).toBe(9)
+    expect(caps.supportedFormats.length).toBe(11)
     expect(caps.supportedFormats).toContain(TextureFormat.ETC2_RGB8)
   })
 

@@ -68,7 +68,13 @@ export type CompressTextureSource =
   | ImageData
 
 export interface CompressOptions {
-  /** How the texture will be used. Drives format selection. Default 'color'. */
+  /**
+   * How the texture will be used. Drives format selection. Default 'color'.
+   * 'singleChannel' stores only the source's R channel, in a 4-bpp
+   * one-channel format (BC4 / EAC R11) — for grayscale data maps such as
+   * roughness, ambient occlusion, height or masks. Sample `.r`; the data is
+   * always linear.
+   */
   hint?: TextureHint
   /**
    * Prefer a specific format over the default choice when the device
@@ -84,11 +90,13 @@ export interface CompressOptions {
    * device has one — BC1 on desktop-class GPUs, ETC2 RGB8 on mobile-class
    * ones — halving GPU memory at visibly lower quality on smooth content.
    * Ignored for `hint: 'colorWithAlpha'` and `hint: 'normal'` (the 4-bpp
-   * formats can't carry them). The WebGL fallback tier makes the same
+   * formats can't carry them) and for `hint: 'singleChannel'` (already
+   * 4 bpp). The WebGL fallback tier makes the same
    * choice (BC1 where s3tc is exposed, else ETC2 RGB8).
    */
   quality?: FormatQuality
-  /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'. */
+  /** Pick the sRGB or linear variant of the chosen format. Default 'srgb'.
+   *  `hint: 'normal'` and `hint: 'singleChannel'` formats are linear-only. */
   colorSpace?: 'srgb' | 'linear'
   /**
    * Rasterisation size for SVG sources. A number scales the SVG so its

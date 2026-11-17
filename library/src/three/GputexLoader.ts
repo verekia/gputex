@@ -25,7 +25,8 @@ import type { FormatQuality, PreferredFormat, TextureHint } from '../selectForma
 import type { SvgRasterSize } from '../svg.js'
 
 export class GputexLoader extends Loader<Texture> {
-  /** Format-selection hint. Default 'color'. */
+  /** Format-selection hint: 'color', 'colorWithAlpha', 'normal' or
+   *  'singleChannel' (grayscale data maps, sampled from `.r`). Default 'color'. */
   hint: TextureHint = 'color'
   /**
    * Prefer a specific format (currently only 'bc1') when the device

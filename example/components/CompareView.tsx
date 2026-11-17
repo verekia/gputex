@@ -39,6 +39,19 @@ const NormalMaterial = ({ map }: { map: Texture }) => {
   return <primitive object={material} attach="material" />
 }
 
+// Single-channel preview material: show the stored R as gray on BOTH planes.
+// A one-channel compressed texture samples as (r, 0, 0, 1), so without this
+// the encoded side renders red against a gray original.
+const GrayMaterial = ({ map }: { map: Texture }) => {
+  const material = useMemo(() => new MeshBasicNodeMaterial({ toneMapped: false }), [])
+  useEffect(() => {
+    const r = textureNode(map).r
+    material.colorNode = vec4(r, r, r, float(1))
+    material.needsUpdate = true
+  }, [map, material])
+  return <primitive object={material} attach="material" />
+}
+
 const fmtBytes = (n: number): string => {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
@@ -55,6 +68,7 @@ const TexturedPlane = ({
   pixelated,
   colorSpace,
   reconstructNormal,
+  grayscale,
 }: {
   texture: Texture | null
   visible: boolean
@@ -62,6 +76,7 @@ const TexturedPlane = ({
   pixelated: boolean
   colorSpace: 'srgb' | 'linear'
   reconstructNormal: boolean
+  grayscale: boolean
 }) => {
   useEffect(() => {
     if (!texture) return
@@ -75,7 +90,13 @@ const TexturedPlane = ({
   return (
     <mesh visible={visible}>
       <planeGeometry args={[aspect, 1]} />
-      {reconstructNormal ? <NormalMaterial map={texture} /> : <meshBasicMaterial map={texture} toneMapped={false} />}
+      {reconstructNormal ? (
+        <NormalMaterial map={texture} />
+      ) : grayscale ? (
+        <GrayMaterial map={texture} />
+      ) : (
+        <meshBasicMaterial map={texture} toneMapped={false} />
+      )}
     </mesh>
   )
 }
@@ -87,6 +108,7 @@ const OriginalPlane = (props: {
   pixelated: boolean
   colorSpace: 'srgb' | 'linear'
   reconstructNormal: boolean
+  grayscale: boolean
 }) => {
   const texture = useLoader(TextureLoader, props.url)
   return <TexturedPlane texture={texture} {...props} />
@@ -112,6 +134,9 @@ export interface CompareViewProps {
   /** Reconstruct z from the stored (R, G) and show the full normal on both
    *  planes. For BC5, whose 2-channel output otherwise renders without blue. */
   reconstructNormal?: boolean
+  /** Show the stored R channel as gray on both planes. For the
+   *  single-channel formats (BC4, EAC R11), which otherwise render red. */
+  grayscale?: boolean
 }
 
 const CompareView = ({
@@ -123,6 +148,7 @@ const CompareView = ({
   encoder,
   colorSpace,
   reconstructNormal = false,
+  grayscale = false,
 }: CompareViewProps) => {
   const [pixelated, setPixelated] = useState(false)
   const [showOriginal, setShowOriginal] = useState(false)
@@ -161,6 +187,7 @@ const CompareView = ({
             pixelated={pixelated}
             colorSpace={colorSpace}
             reconstructNormal={reconstructNormal}
+            grayscale={grayscale}
           />
         </Suspense>
         <TexturedPlane
@@ -170,6 +197,7 @@ const CompareView = ({
           pixelated={pixelated}
           colorSpace={colorSpace}
           reconstructNormal={reconstructNormal}
+          grayscale={grayscale}
         />
         <OrbitControls
           makeDefault

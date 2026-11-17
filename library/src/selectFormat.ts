@@ -4,11 +4,20 @@
 // how the texture will be used, pick the best compressed format this
 // project can produce:
 //
-//   • `texture-compression-bc` available, 'normal' hint       → BC5
+//   • `texture-compression-bc` available, 'normal' hint        → BC5
+//   • `texture-compression-bc` available, 'singleChannel' hint → BC4
 //   • `texture-compression-bc` available, color/colorWithAlpha → BC7
+//   • `texture-compression-etc2` available, 'singleChannel'    → EAC R11
 //   • `texture-compression-astc` available (any hint)          → ASTC 4×4
 //   • `texture-compression-etc2` available, 'color' hint       → ETC2 RGB8
 //   • none of the above                                        → null (fall back to RGBA8)
+//
+// 'singleChannel' is for grayscale data maps (roughness, metalness, ambient
+// occlusion, height, masks): only the source's R channel is stored, in a
+// 4-bpp one-channel format — half the memory of the 8-bpp colour formats
+// and better per-channel precision than they give a gray image. BC4 on BC
+// hardware, EAC R11 everywhere ETC2 is (which WebGPU guarantees wherever BC
+// is missing). Both are linear-only and sample as (r, 0, 0, 1).
 //
 // The `quality` option trades memory for fidelity on opaque colour:
 //   • 'high' (default) — the 8-bpp formats above (BC7 / ASTC 4×4).
@@ -19,7 +28,8 @@
 //     and ETC2 RGB8's three channels carry no real alpha, and neither has
 //     a 2-channel mode), so 'colorWithAlpha' and 'normal' hints keep the
 //     'high' selection — that degradation is documented rather than
-//     warned, since `quality` is typically set app-wide.
+//     warned, since `quality` is typically set app-wide. 'singleChannel'
+//     is 4 bpp at either setting.
 //
 // BC1 is never selected by default — at 0.5 B/px it trades visible
 // quality for half of BC7's footprint, a call only the application can
@@ -37,9 +47,11 @@
 
 import { ASTC4x4Encoder } from './ASTC4x4Encoder.js'
 import { BC1Encoder } from './BC1Encoder.js'
+import { BC4Encoder } from './BC4Encoder.js'
 import { BC5Encoder } from './BC5Encoder.js'
 import { BC7Encoder } from './BC7Encoder.js'
 import { detectCapabilities, type FeatureProvider } from './capabilities.js'
+import { EACR11Encoder } from './EACR11Encoder.js'
 import { ETC2Encoder } from './ETC2Encoder.js'
 import { TextureFormat } from './TextureFormat.js'
 
@@ -50,8 +62,10 @@ import type { EncoderConstructor } from './Encoder.js'
  *   • 'color'          — RGB albedo-like data (alpha optional / ignored).
  *   • 'colorWithAlpha' — 4-channel RGBA with meaningful alpha.
  *   • 'normal'         — tangent-space normal map (R=x, G=y, z reconstructed).
+ *   • 'singleChannel'  — one channel of linear data, read from R (roughness,
+ *                        metalness, AO, height, masks). Sample `.r`.
  */
-export type TextureHint = 'color' | 'colorWithAlpha' | 'normal'
+export type TextureHint = 'color' | 'colorWithAlpha' | 'normal' | 'singleChannel'
 
 /**
  * Optional format preference — a wish, not a demand. Applied when the
@@ -99,7 +113,9 @@ export function selectFormat(
   options: SelectFormatOptions = {},
 ): FormatSelection {
   const { colorSpace = 'srgb', preferredFormat, quality = 'high' } = options
-  const srgb = colorSpace === 'srgb'
+  // Single-channel data is linear whatever the caller's colour space — it
+  // also keeps the colour-format fallback below from tagging it sRGB.
+  const srgb = colorSpace === 'srgb' && hint !== 'singleChannel'
   const caps = detectCapabilities(adapter)
 
   const bc1: FormatSelection = {
@@ -121,7 +137,7 @@ export function selectFormat(
   if (preferredFormat === 'bc1') {
     if (hint !== 'color') {
       console.warn(
-        `[gputex] preferredFormat 'bc1' ignored for hint '${hint}' — BC1 has no real alpha channel and is unsuitable for normal maps.`,
+        `[gputex] preferredFormat 'bc1' ignored for hint '${hint}' — BC1 is for opaque colour: it has no real alpha channel and is unsuitable for normal maps and single-channel data.`,
       )
     } else if (caps.bc) {
       return bc1
@@ -134,6 +150,15 @@ export function selectFormat(
   if (quality === 'low' && hint === 'color') {
     if (caps.bc) return bc1
     if (caps.etc2) return etc2
+  }
+
+  // Single-channel data: the 4-bpp one-channel formats, linear-only (the
+  // colorSpace option is ignored). BC4 on BC hardware, EAC R11 wherever
+  // ETC2 is; an adapter with neither falls through to the colour formats
+  // below, which carry a gray image in their RGB.
+  if (hint === 'singleChannel') {
+    if (caps.bc) return { format: TextureFormat.BC4, encoderClass: BC4Encoder, astcNormalRemap: false }
+    if (caps.etc2) return { format: TextureFormat.EAC_R11, encoderClass: EACR11Encoder, astcNormalRemap: false }
   }
 
   // BC path (desktop: Windows, Linux, most discrete-GPU Macs).
