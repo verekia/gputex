@@ -122,20 +122,21 @@ describe('EACR11Encoder', () => {
 
   it('both WGSL modules carry the same candidate table as the CPU reference', () => {
     const view: AnyProto = Object.create(EACR11Encoder.prototype)
-    const want = _eacInternal.CANDIDATES.map(c => `0x${c.toString(16).padStart(5, '0')}u`)
+    const want = _eacInternal.CANDIDATES.map(c => `0x${c.toString(16).padStart(3, '0')}u`)
     for (const src of [view.wgslSource(), view.wgslSourceFastF16()] as string[]) {
       expect(src).toContain('@compute')
-      const lut = src.slice(src.indexOf('const LUT = array<u32, 41>('))
-      expect(lut.slice(0, lut.indexOf(');')).match(/0x[0-9a-f]{5}u/g)).toEqual(want)
+      const lut = src.slice(src.indexOf('const LUT = array<u32, 164>('))
+      expect(lut.slice(0, lut.indexOf(');')).match(/0x[0-9a-f]{3}u/g)).toEqual(want)
     }
   })
 
-  it('the f16 module is the exact-value port (error sums stay f32)', () => {
+  it('the f16 module is the exact-value port (residual sums stay f32)', () => {
     const view: AnyProto = Object.create(EACR11Encoder.prototype)
     const src: string = view.wgslSourceFastF16()
     expect(src).toContain('EXACT-VALUE f16')
     expect(src).toContain('var t: array<h4, 4>;')
-    expect(src).toContain('var e = 0.0;')
+    expect(src).toContain('var ev = vec4<f32>(0.0);')
+    expect(src).toContain('var sv = vec4<f32>(0.0);')
   })
 })
 

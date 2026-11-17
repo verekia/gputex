@@ -70,9 +70,9 @@ describe('EACR11WebGLEncoder', () => {
   it('carries the same candidate table as the CPU reference', () => {
     const view: AnyProto = Object.create(EACR11WebGLEncoder.prototype)
     const src: string = view.fragSource()
-    const lut = src.slice(src.indexOf('const uint LUT[41] = uint[41]('))
-    const want = _eacInternal.CANDIDATES.map(c => `0x${c.toString(16).padStart(5, '0')}u`)
-    expect(lut.slice(0, lut.indexOf(');')).match(/0x[0-9a-f]{5}u/g)).toEqual(want)
+    const lut = src.slice(src.indexOf('const uint LUT[164] = uint[164]('))
+    const want = _eacInternal.CANDIDATES.map(c => `0x${c.toString(16).padStart(3, '0')}u`)
+    expect(lut.slice(0, lut.indexOf(');')).match(/0x[0-9a-f]{3}u/g)).toEqual(want)
   })
 })
 

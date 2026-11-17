@@ -19,10 +19,12 @@
 // QUALITY LEVELS
 //   'fast' (default): the CPU mirror of eac_r11.wgsl, in the same exact
 //     integer arithmetic — the GPU output matches it byte for byte.
-//     Targets T = round(v·2047); the block's 8-bit span picks three (table,
-//     multiplier rule) candidates from a fitted table; each is scored
-//     exactly with the palette centred on the mid-range; the winner is
-//     re-scored at base ± 1.
+//     Targets T = round(v·2047); the block's 8-bit span and its shape (mean
+//     distance from the mid-range) pick two (table, multiplier rule)
+//     candidates from a fitted table; each is scored with the palette
+//     centred on the mid-range, and its signed residual sum gives the base
+//     step that zeroes the mean residual and the error that step leaves.
+//     The better prediction wins, at its stepped base.
 //   'high': exhaustive — every table × every multiplier × a window of base
 //     codewords around the mid-range, decode-exact errors — and finally the
 //     'fast' result, keeping whichever decodes with lower error. That makes
@@ -59,19 +61,29 @@ const MODIFIERS: readonly (readonly number[])[] = [
   [-3, -5, -7, -9, 2, 4, 6, 8],
 ]
 
-// Span → three candidates, 6 bits each (low first): table in bits 0..3, rule
-// in bits 4..5 (0 = covering multiplier, 1 = that + 1, 2 = multiplier 0).
-// Index: the 8-bit span below 32, then 8 sub-buckets per octave of span;
-// entry 40 is for full-range blocks (span 255: both black and white).
-// Fitted offline per span on roughness / AO / displacement / mask /
-// normal-channel textures (greedy, on the encoder's own policy). Must stay
-// identical to the copy in eac_r11.wgsl, eac_r11_fast_f16.wgsl and
-// webgl/glsl/eac_r11.frag.glsl.
+// (Span, shape) → two candidates, 6 bits each (low first): table in bits
+// 0..3, rule in bits 4..5 (0 = covering multiplier, 1 = that + 1,
+// 2 = multiplier 0). Index = span bucket · 4 + shape bucket. Span bucket: the
+// 8-bit span below 32, then 8 sub-buckets per octave of span, 40 for
+// full-range blocks (span 255: both black and white). Shape bucket:
+// floor(4 · Σ|2T − (min + max)| / (16 · span + 1)), capped at 3 — 0..1 for
+// blocks that sit near their mid-range, 3 for two-level ones.
+// Fitted offline per cell on roughness / AO / displacement / mask /
+// normal-channel textures (best pair, on the encoder's own policy, every
+// texture weighted alike). Must stay identical to the copy in
+// eac_r11.wgsl, eac_r11_fast_f16.wgsl and webgl/glsl/eac_r11.frag.glsl.
+const SHAPE_BUCKETS = 4
 const CANDIDATES: readonly number[] = [
-  0x01026, 0x24a2d, 0x2b368, 0x21360, 0x2380d, 0x2380d, 0x0c74d, 0x1d0cd, 0x1141d, 0x0f2dd, 0x0b0dd, 0x0b0dd, 0x0a203,
-  0x033cb, 0x0a3cb, 0x013cb, 0x0e3cb, 0x0f389, 0x0d389, 0x0d2c9, 0x0b289, 0x06247, 0x05247, 0x07101, 0x04081, 0x020c1,
-  0x03081, 0x03081, 0x02001, 0x0f040, 0x083c0, 0x0f200, 0x0424f, 0x0f089, 0x00247, 0x05244, 0x0a042, 0x021c1, 0x00389,
-  0x0e245, 0x1269b,
+  0xb63, 0xb63, 0xb63, 0xb63, 0xae8, 0xae8, 0xae8, 0xae8, 0xae4, 0xae4, 0x92b, 0x969, 0x360, 0x360, 0x84d, 0x360, 0x80d,
+  0x360, 0x360, 0x360, 0x80d, 0x80d, 0x360, 0x340, 0x342, 0x342, 0x74d, 0x74d, 0x74d, 0x74d, 0x0cd, 0x303, 0x35d, 0x35d,
+  0x0dd, 0x74c, 0x0dd, 0x0dd, 0x2dd, 0x09d, 0x743, 0x743, 0x743, 0x743, 0x0dd, 0x0dd, 0x0dd, 0x743, 0x743, 0x743, 0x743,
+  0x0cf, 0x2c3, 0x2c3, 0x0cb, 0x2cf, 0x2ca, 0x2ca, 0x2cf, 0x3ce, 0x24a, 0x24a, 0x3c9, 0x3c6, 0x34b, 0x289, 0x3c9, 0x3ce,
+  0x348, 0x2ca, 0x24f, 0x38f, 0x34b, 0x2ca, 0x24f, 0x388, 0x344, 0x28b, 0x24b, 0x308, 0x34a, 0x2cd, 0x2ca, 0x202, 0x340,
+  0x28b, 0x2c7, 0x1c5, 0x2c7, 0x2c7, 0x2c7, 0x141, 0x1c2, 0x1c2, 0x147, 0x144, 0x084, 0x084, 0x081, 0x044, 0x0c2, 0x0c2,
+  0x081, 0x7c1, 0x0c2, 0x0c2, 0x042, 0x081, 0x0c2, 0x0c2, 0x042, 0x05b, 0x080, 0x080, 0x081, 0x04f, 0x002, 0x002, 0x040,
+  0x38f, 0x080, 0x080, 0x040, 0x00e, 0x002, 0x002, 0x200, 0x00e, 0x080, 0x080, 0x3c9, 0x385, 0x2c2, 0x2c2, 0x089, 0x20e,
+  0x08b, 0x08b, 0x1c9, 0x14e, 0x084, 0x084, 0x207, 0x10e, 0x042, 0x042, 0x081, 0x28e, 0x042, 0x042, 0x042, 0x14e, 0x08b,
+  0x08b, 0x2c9, 0x389, 0x009, 0x009, 0x009, 0x14e, 0x655, 0x655, 0x655, 0x655,
 ]
 
 function clampInt(v: number, lo: number, hi: number): number {
@@ -90,44 +102,77 @@ function spanBucket(s8: number): number {
   return 32 + ((s8 >> (2 + (s8 >= 64 ? 1 : 0) + (s8 >= 128 ? 1 : 0))) & 7)
 }
 
+/** Palette geometry in doubled 11-bit units (so multiplier 0 stays integral). */
+function palette(table: number, multiplier: number, base: number) {
+  const halfM2 = multiplier ? 8 * multiplier : 1 // 2 · (M / 2)
+  const centre2 = 16 * base + 8 - halfM2 // 2 · centre
+  const mods = MODIFIERS[table]!
+  const m = [0, 1, 2, 3].map(i => (2 * mods[4 + i]! + 1) * halfM2)
+  return { centre2, m, limitPos: 2 * 2047 - centre2, limitNeg: centre2 }
+}
+
+interface Score {
+  /** Squared error ×4 with the nearest magnitude per texel. */
+  error: number
+  /** Signed residual sum ×2. */
+  residual: number
+}
+
 /**
- * Exact squared error (×4, so multiplier-0 half-integers stay integral) of
- * one (table, multiplier, base) against 11-bit targets, with the nearest
- * modifier per texel. Mirrors the shader: the texel picks among the four
- * magnitudes on its side of the palette centre, the outermost one clamped
- * to the [0, 2047] range. `indices`, when given, receives the wire indices.
+ * Score one (table, multiplier, base) against 11-bit targets. Mirrors the
+ * shader: each texel takes the magnitude whose threshold interval holds its
+ * distance from the palette centre — thresholds are the midpoints of
+ * neighbouring magnitudes, the outermost magnitude clamped to the
+ * [0, 2047] range on the texel's side.
  */
-function scoreCandidate(
+function scoreCandidate(targets: ArrayLike<number>, table: number, multiplier: number, base: number): Score {
+  const { centre2, m, limitPos, limitNeg } = palette(table, multiplier, base)
+  const m3p = Math.min(m[3]!, limitPos)
+  const m3n = Math.min(m[3]!, limitNeg)
+  const t0 = (m[0]! + m[1]!) / 2
+  const t1 = (m[1]! + m[2]!) / 2
+  let error = 0
+  let residual = 0
+  for (let p = 0; p < 16; p++) {
+    const d = 2 * targets[p]! - centre2
+    const pos = d >= 0
+    const a = Math.abs(d)
+    const m3 = pos ? m3p : m3n
+    let level = m[0]!
+    if (a > t0) level = m[1]!
+    if (a > t1) level = m[2]!
+    if (a > (m[2]! + m3) / 2) level = m3
+    const r = a - level
+    error += r * r
+    residual += pos ? r : -r
+  }
+  return { error, residual }
+}
+
+/**
+ * Wire indices of the nearest palette entry per texel: the number of
+ * thresholds below the texel's distance, with every magnitude clamped to
+ * the [0, 2047] range on the texel's side. Mirrors the shader's index pass.
+ */
+function nearestIndices(
   targets: ArrayLike<number>,
   table: number,
   multiplier: number,
   base: number,
-  indices?: Uint8Array,
-): number {
-  const halfM2 = multiplier ? 8 * multiplier : 1 // 2 · (M / 2)
-  const centre2 = 16 * base + 8 - halfM2 // 2 · centre
-  const limitPos = 2 * 2047 - centre2
-  const limitNeg = centre2
-  const mods = MODIFIERS[table]!
-  let err = 0
+  indices: Uint8Array,
+): void {
+  const { centre2, m, limitPos, limitNeg } = palette(table, multiplier, base)
   for (let p = 0; p < 16; p++) {
     const d = 2 * targets[p]! - centre2
+    const pos = d >= 0
     const a = Math.abs(d)
-    let best = Infinity
-    let bestI = 0
-    for (let i = 0; i < 4; i++) {
-      let m = (2 * mods[4 + i]! + 1) * halfM2
-      if (i === 3) m = Math.min(m, d >= 0 ? limitPos : limitNeg)
-      const r = Math.abs(a - m)
-      if (r < best) {
-        best = r
-        bestI = i
-      }
+    const limit = pos ? limitPos : limitNeg
+    let index = pos ? 4 : 0
+    for (let i = 0; i < 3; i++) {
+      if (a > (Math.min(m[i]!, limit) + Math.min(m[i + 1]!, limit)) / 2) index++
     }
-    err += best * best
-    if (indices) indices[p] = (d >= 0 ? 4 : 0) + bestI
+    indices[p] = index
   }
-  return err
 }
 
 /** Decode-exact squared error (11-bit units) with free nearest-index choice. */
@@ -156,38 +201,35 @@ interface Choice {
   base: number
 }
 
-/** The shader's search: three span-picked candidates, then base ± 1. */
+/** The shader's search: two (span, shape)-picked candidates, base stepped analytically. */
 function searchFast(targets: ArrayLike<number>, tmin: number, tmax: number): Choice {
   const h2 = tmax - tmin
   const mid2 = tmin + tmax
   const s8 = Math.floor((tmax * 255) / 2047 + 0.5) - Math.floor((tmin * 255) / 2047 + 0.5)
-  const lut = CANDIDATES[spanBucket(s8)]!
+  let spread = 0
+  for (let p = 0; p < 16; p++) spread += Math.abs(2 * targets[p]! - mid2)
+  const shape = Math.min(Math.floor((SHAPE_BUCKETS * spread) / (16 * h2 + 1)), SHAPE_BUCKETS - 1)
+  const lut = CANDIDATES[spanBucket(s8) * SHAPE_BUCKETS + shape]!
   let best = Infinity
   let choice: Choice = { table: 0, multiplier: 0, base: 0 }
-  let winner = choice
-  for (let k = 0; k < 5; k++) {
-    let table: number
-    let multiplier: number
-    let base: number
-    if (k < 3) {
-      const c = (lut >> (6 * k)) & 63
-      table = c & 15
-      const rule = c >> 4
-      const divisor = 8 * (2 * MODIFIERS[table]![7]! + 1)
-      multiplier = clampInt(Math.floor((h2 + divisor / 2) / divisor), 1, 15)
-      if (rule === 1) multiplier = Math.min(multiplier + 1, 15)
-      if (rule === 2) multiplier = 0
-      base = Math.min((mid2 + (multiplier ? 8 * multiplier : 1)) >> 4, 255)
-    } else {
-      if (k === 3) winner = choice
-      table = winner.table
-      multiplier = winner.multiplier
-      base = k === 3 ? Math.max(winner.base, 1) - 1 : Math.min(winner.base + 1, 255)
-    }
-    const e = scoreCandidate(targets, table, multiplier, base)
-    if (e < best) {
-      best = e
-      choice = { table, multiplier, base }
+  for (let k = 0; k < 2; k++) {
+    const c = (lut >> (6 * k)) & 63
+    const table = c & 15
+    const rule = c >> 4
+    const divisor = 8 * (2 * MODIFIERS[table]![7]! + 1)
+    let multiplier = clampInt(Math.floor((h2 + divisor / 2) / divisor), 1, 15)
+    if (rule === 1) multiplier = Math.min(multiplier + 1, 15)
+    if (rule === 2) multiplier = 0
+    const base = Math.min((mid2 + (multiplier ? 8 * multiplier : 1)) >> 4, 255)
+    const { error, residual } = scoreCandidate(targets, table, multiplier, base)
+    // Base step round(mean residual / 8) and the error it leaves with the
+    // texels' magnitudes unchanged (×4, like `error`).
+    const stepped = clampInt(base + Math.floor((residual + 128) / 256), 0, 255)
+    const step = stepped - base
+    const predicted = error - 32 * step * residual + 4096 * step * step
+    if (predicted < best) {
+      best = predicted
+      choice = { table, multiplier, base: stepped }
     }
   }
   return choice
@@ -256,7 +298,7 @@ export function encodeEACR11Block(
       }
     }
   } else {
-    scoreCandidate(targets, table, multiplier, base, indices)
+    nearestIndices(targets, table, multiplier, base, indices)
   }
 
   const out = new Uint8Array(8)
@@ -291,6 +333,7 @@ export function decodeEACR11Block(block: EACR11Block): Float32Array {
 export const _internal = {
   MODIFIERS,
   CANDIDATES,
+  SHAPE_BUCKETS,
   decode11,
   spanBucket,
 }

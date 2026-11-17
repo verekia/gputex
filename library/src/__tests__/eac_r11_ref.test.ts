@@ -1,6 +1,6 @@
 import { _internal, decodeEACR11Block, encodeEACR11Block } from '../eac_r11_ref.js'
 
-const { MODIFIERS, CANDIDATES, decode11, spanBucket } = _internal
+const { MODIFIERS, CANDIDATES, SHAPE_BUCKETS, decode11, spanBucket } = _internal
 
 // Deterministic PRNG so failures reproduce.
 function mulberry32(seed: number): () => number {
@@ -35,18 +35,19 @@ describe('EAC R11 tables', () => {
     }
   })
 
-  it('the candidate table holds three valid picks per span bucket', () => {
-    expect(CANDIDATES.length).toBe(41)
+  it('the candidate table holds two valid picks per (span, shape) cell', () => {
+    expect(SHAPE_BUCKETS).toBe(4)
+    expect(CANDIDATES.length).toBe(41 * SHAPE_BUCKETS)
     for (const entry of CANDIDATES) {
-      expect(entry).toBeLessThan(1 << 18)
-      for (let k = 0; k < 3; k++) expect(((entry >> (6 * k)) & 63) >> 4).toBeLessThan(3)
+      expect(entry).toBeLessThan(1 << 12)
+      for (let k = 0; k < 2; k++) expect(((entry >> (6 * k)) & 63) >> 4).toBeLessThan(3)
     }
   })
 
   it('multiplier-0 candidates only appear where spans are a few levels', () => {
-    CANDIDATES.forEach((entry, bucket) => {
-      for (let k = 0; k < 3; k++) {
-        if (((entry >> (6 * k)) & 63) >> 4 === 2) expect(bucket).toBeLessThanOrEqual(5)
+    CANDIDATES.forEach((entry, cell) => {
+      for (let k = 0; k < 2; k++) {
+        if (((entry >> (6 * k)) & 63) >> 4 === 2) expect(Math.floor(cell / SHAPE_BUCKETS)).toBeLessThanOrEqual(5)
       }
     })
   })
@@ -131,13 +132,13 @@ describe('EAC R11 encoder', () => {
     }
   })
 
-  it('keeps small-span blocks within a quarter of a level per texel on average', () => {
+  it('keeps small-span blocks within 0.3 of a level per texel on average', () => {
     const rand = mulberry32(7)
     for (let trial = 0; trial < 200; trial++) {
       const lo = Math.floor(rand() * 250)
       const span = 1 + Math.floor(rand() * 3)
       const values = grid8(() => lo + Math.floor(rand() * (span + 1)))
-      expect(sse8(values, encodeEACR11Block(values)) / 16).toBeLessThan(0.25 * 0.25)
+      expect(sse8(values, encodeEACR11Block(values)) / 16).toBeLessThan(0.3 * 0.3)
     }
   })
 
@@ -177,7 +178,7 @@ describe('EAC R11 encoder', () => {
       fastTotal += fast
       highTotal += high
     }
-    // The three-candidate search stays within ~2 dB of the exhaustive one
+    // The two-candidate search stays within ~2 dB of the exhaustive one
     // even on uniform noise, its worst case.
     expect(fastTotal).toBeLessThan(highTotal * 1.6)
   })

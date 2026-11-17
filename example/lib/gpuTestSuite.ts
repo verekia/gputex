@@ -222,13 +222,13 @@ const PSNR_THRESHOLDS: Record<string, number | null> = {
   'bc4:wood-roughness-1k': 47.95,
   'bc4:wood-displacement-1k': 52.9,
   'eac:color': 39.95,
-  'eac:packed-1024': 47.85,
-  'eac:rock-roughness-1k': 46.05,
-  'eac:rock-ao-1k': 48.7,
-  'eac:rock-displacement-1k': 55.9,
-  'eac:rock-displacement-4k': 65.35,
-  'eac:wood-roughness-1k': 47.6,
-  'eac:wood-displacement-1k': 51.55,
+  'eac:packed-1024': 47.75,
+  'eac:rock-roughness-1k': 45.85,
+  'eac:rock-ao-1k': 48.5,
+  'eac:rock-displacement-1k': 55.55,
+  'eac:rock-displacement-4k': 64.65,
+  'eac:wood-roughness-1k': 47.75,
+  'eac:wood-displacement-1k': 51.2,
 }
 
 // Worst-EASY-block gate: over blocks that the CPU reference encodes

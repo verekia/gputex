@@ -20,32 +20,37 @@
 // (eac_r11_ref.ts) agree byte for byte:
 //   • TARGETS: each texel's 8-bit value v maps to T = round(v·2047/255)
 //     (0 → 0 and 255 → 2047 exactly), held relative to the block minimum.
-//   • CANDIDATES: the 8-bit span of the block indexes a 41-entry table of
-//     three (modifier table, multiplier rule) picks. The multiplier rule is
+//   • CANDIDATES: the block's 8-bit span and its shape index a 164-entry
+//     table of two (modifier table, multiplier rule) picks. The shape is the
+//     mean distance of the texels from the mid-range, as a fraction of the
+//     half-span, in four buckets: low for blocks that sit near their middle
+//     (tables with tight inner steps win), high for two-level blocks (tables
+//     with their steps at the ends win). The multiplier rule is
 //     round(half-span / largest magnitude) — the table just covers the
 //     block — or that plus one, or multiplier 0 (1/8-step precision, for
-//     spans of a few levels). The table was fitted offline, per span, on
-//     roughness / AO / displacement / mask / normal-channel textures (greedy,
-//     on this encoder's own policy): which quantiser shapes win is almost
-//     entirely a function of the span, so three picks land within ~0.3 dB of
-//     scoring all 16 tables.
-//   • BASE: the palette centre goes to the block's mid-range.
-//   • SCORE: exact squared error of each candidate — per texel, the nearest
-//     of the four magnitudes on its side of the centre. The outermost
-//     magnitude is clamped to the [0, 2047] range on each side, so texels
-//     at 0 or 255 are matched exactly by an over-reaching palette (masks
-//     keep true black and white).
-//   • REFINE: the winner is re-scored with base − 1 and base + 1. On tables
-//     with coarse steps the phase of the palette against the data matters
-//     more than the table choice; this buys ~0.5 dB for two more scores.
-//   • The 3-bit indices are packed as float fields Σ i·8^k (exact below
-//     2^24), one 24-bit word per pair of columns.
-// Five scores + one index pass per block, each four vec4 steps. The kernel
-// is ALU-bound (one-channel source: almost no texture traffic), so its cost
-// is the number of scores, ~13% of the pass each. Measured over 17 textures
-// (mean PSNR, M3): a 4th pick +0.22 dB, 6 picks +0.38 dB; 2 picks −0.35 dB;
-// dropping the refine −0.48 dB. Scoring on half the texels or by |error|
-// loses more per unit of time than dropping a pick.
+//     spans of a few levels). The table was fitted offline, per cell, on
+//     roughness / AO / displacement / mask / normal-channel textures (best
+//     pair on this encoder's own policy, every texture weighted alike).
+//   • SCORE: each candidate is scored with the palette centre on the block's
+//     mid-range: per texel, the magnitude whose threshold interval holds its
+//     distance from the centre (thresholds are the midpoints of neighbouring
+//     magnitudes; the outermost magnitude is clamped to the [0, 2047] range
+//     on each side). The pass sums the squared residuals E and the SIGNED
+//     residuals S.
+//   • BASE: S / 16 is the mean residual, so stepping the base by
+//     round(S / 128) zeroes it, and with the texels' magnitudes unchanged
+//     that leaves an error of E − 16·step·S + 1024·step². The candidate with
+//     the lower predicted error wins, at its stepped base — the phase of the
+//     palette against the data is fitted without scoring any other base.
+//   • INDICES: against the final palette, with every magnitude clamped to
+//     [0, 2047] on the texel's side (so texels at 0 or 255 are matched
+//     exactly by an over-reaching palette: masks keep true black and white),
+//     a texel's index is the number of thresholds below its distance. The
+//     3-bit indices are packed as float fields Σ i·8^k (exact below 2^24),
+//     one 24-bit word per pair of columns.
+// Two scores + one index pass per block, each four vec4 steps. Measured
+// over 17 textures (mean PSNR): a third pick is +0.3 dB for +24% GPU time;
+// one pick is −0.8 dB; scoring on half the texels −0.3 dB.
 
 struct Params {
   blocks_x: u32,
@@ -70,21 +75,42 @@ const QV = array<vec4<f32>, 16>(
   vec4<f32>(3.0, 7.0, 15.0, 19.0),  vec4<f32>(3.0, 9.0, 13.0, 19.0),
   vec4<f32>(5.0, 7.0, 13.0, 19.0),  vec4<f32>(1.0, 3.0, 5.0, 19.0),
   vec4<f32>(7.0, 11.0, 15.0, 17.0), vec4<f32>(5.0, 9.0, 13.0, 17.0));
-// The largest of those per table, as an integer (the multiplier rule divides
-// by it).
-const QW = array<u32, 16>(29u, 25u, 25u, 25u, 23u, 21u, 21u, 21u, 19u, 19u, 19u, 19u, 19u, 19u, 17u, 17u);
+// Per table, with q0..q3 the row above: the two inner thresholds
+// (q0 + q1) / 2 and (q1 + q2) / 2, then 4·q3 + ½ and 1 / (8·q3) for the
+// covering-multiplier rule.
+const QT = array<vec4<f32>, 16>(
+  vec4<f32>(8.0, 14.0, 116.5, 1.0 / 232.0), vec4<f32>(9.0, 16.0, 100.5, 1.0 / 200.0),
+  vec4<f32>(6.0, 12.0, 100.5, 1.0 / 200.0), vec4<f32>(5.0, 9.0, 100.5, 1.0 / 200.0),
+  vec4<f32>(8.0, 13.0, 92.5, 1.0 / 184.0), vec4<f32>(9.0, 15.0, 84.5, 1.0 / 168.0),
+  vec4<f32>(10.0, 14.0, 84.5, 1.0 / 168.0), vec4<f32>(7.0, 12.0, 84.5, 1.0 / 168.0),
+  vec4<f32>(7.0, 13.0, 76.5, 1.0 / 152.0), vec4<f32>(6.0, 12.0, 76.5, 1.0 / 152.0),
+  vec4<f32>(5.0, 11.0, 76.5, 1.0 / 152.0), vec4<f32>(6.0, 11.0, 76.5, 1.0 / 152.0),
+  vec4<f32>(6.0, 10.0, 76.5, 1.0 / 152.0), vec4<f32>(2.0, 4.0, 76.5, 1.0 / 152.0),
+  vec4<f32>(9.0, 13.0, 68.5, 1.0 / 136.0), vec4<f32>(7.0, 11.0, 68.5, 1.0 / 136.0));
 
-// Span → three candidates, 6 bits each (low first): table in bits 0..3, rule
-// in bits 4..5 (0 = covering multiplier, 1 = that + 1, 2 = multiplier 0).
-// Index: the 8-bit span below 32, then 8 sub-buckets per octave of span;
-// entry 40 is for full-range blocks (span 255: both black and white).
-const LUT = array<u32, 41>(
-  0x01026u, 0x24a2du, 0x2b368u, 0x21360u, 0x2380du, 0x2380du, 0x0c74du, 0x1d0cdu,
-  0x1141du, 0x0f2ddu, 0x0b0ddu, 0x0b0ddu, 0x0a203u, 0x033cbu, 0x0a3cbu, 0x013cbu,
-  0x0e3cbu, 0x0f389u, 0x0d389u, 0x0d2c9u, 0x0b289u, 0x06247u, 0x05247u, 0x07101u,
-  0x04081u, 0x020c1u, 0x03081u, 0x03081u, 0x02001u, 0x0f040u, 0x083c0u, 0x0f200u,
-  0x0424fu, 0x0f089u, 0x00247u, 0x05244u, 0x0a042u, 0x021c1u, 0x00389u, 0x0e245u,
-  0x1269bu);
+// (Span, shape) → two candidates, 6 bits each (low first): table in bits
+// 0..3, rule in bits 4..5 (0 = covering multiplier, 1 = that + 1,
+// 2 = multiplier 0). Index = span bucket · 4 + shape bucket; span bucket =
+// the 8-bit span below 32, then 8 sub-buckets per octave of span, 40 for
+// full-range blocks (span 255: both black and white).
+const LUT = array<u32, 164>(
+  0xb63u, 0xb63u, 0xb63u, 0xb63u, 0xae8u, 0xae8u, 0xae8u, 0xae8u, 0xae4u, 0xae4u,
+  0x92bu, 0x969u, 0x360u, 0x360u, 0x84du, 0x360u, 0x80du, 0x360u, 0x360u, 0x360u,
+  0x80du, 0x80du, 0x360u, 0x340u, 0x342u, 0x342u, 0x74du, 0x74du, 0x74du, 0x74du,
+  0x0cdu, 0x303u, 0x35du, 0x35du, 0x0ddu, 0x74cu, 0x0ddu, 0x0ddu, 0x2ddu, 0x09du,
+  0x743u, 0x743u, 0x743u, 0x743u, 0x0ddu, 0x0ddu, 0x0ddu, 0x743u, 0x743u, 0x743u,
+  0x743u, 0x0cfu, 0x2c3u, 0x2c3u, 0x0cbu, 0x2cfu, 0x2cau, 0x2cau, 0x2cfu, 0x3ceu,
+  0x24au, 0x24au, 0x3c9u, 0x3c6u, 0x34bu, 0x289u, 0x3c9u, 0x3ceu, 0x348u, 0x2cau,
+  0x24fu, 0x38fu, 0x34bu, 0x2cau, 0x24fu, 0x388u, 0x344u, 0x28bu, 0x24bu, 0x308u,
+  0x34au, 0x2cdu, 0x2cau, 0x202u, 0x340u, 0x28bu, 0x2c7u, 0x1c5u, 0x2c7u, 0x2c7u,
+  0x2c7u, 0x141u, 0x1c2u, 0x1c2u, 0x147u, 0x144u, 0x084u, 0x084u, 0x081u, 0x044u,
+  0x0c2u, 0x0c2u, 0x081u, 0x7c1u, 0x0c2u, 0x0c2u, 0x042u, 0x081u, 0x0c2u, 0x0c2u,
+  0x042u, 0x05bu, 0x080u, 0x080u, 0x081u, 0x04fu, 0x002u, 0x002u, 0x040u, 0x38fu,
+  0x080u, 0x080u, 0x040u, 0x00eu, 0x002u, 0x002u, 0x200u, 0x00eu, 0x080u, 0x080u,
+  0x3c9u, 0x385u, 0x2c2u, 0x2c2u, 0x089u, 0x20eu, 0x08bu, 0x08bu, 0x1c9u, 0x14eu,
+  0x084u, 0x084u, 0x207u, 0x10eu, 0x042u, 0x042u, 0x081u, 0x28eu, 0x042u, 0x042u,
+  0x042u, 0x14eu, 0x08bu, 0x08bu, 0x2c9u, 0x389u, 0x009u, 0x009u, 0x009u, 0x14eu,
+  0x655u, 0x655u, 0x655u, 0x655u);
 
 // Edge blocks: one quad's R from four clamped texel loads, in gather order
 // (x=(0,1) y=(1,1) z=(1,0) w=(0,0)).
@@ -139,70 +165,100 @@ fn encode(@builtin(global_invocation_id) gid_raw: vec3<u32>) {
   u[2] = u[2] - tmin;
   u[3] = u[3] - tmin;
 
-  let h2 = u32(tmax - tmin);        // twice the half-span
-  let mid2 = u32(tmin + tmax);      // twice the mid-range
+  let h2f = tmax - tmin;        // twice the half-span
+  let mid2f = tmin + tmax;      // twice the mid-range
   // 8-bit span (T is monotone in v, and v = round(T·255/2047)).
   let s8 = u32(floor(tmax * (255.0 / 2047.0) + 0.5) - floor(tmin * (255.0 / 2047.0) + 0.5));
   let sub = (s8 >> (2u + u32(s8 >= 64u) + u32(s8 >= 128u))) & 7u;
-  let lut = LUT[select(select(32u + sub, s8, s8 < 32u), 40u, s8 == 255u)];
+  // Shape bucket: floor(4 · Σ|2T − (min + max)| / (16 · span + 1)), as
+  // three exact comparisons.
+  let f4 = abs(u[0] + u[0] - h2f) + abs(u[1] + u[1] - h2f) + abs(u[2] + u[2] - h2f) + abs(u[3] + u[3] - h2f);
+  let fx = 4.0 * (f4.x + f4.y + f4.z + f4.w);
+  let fd = 16.0 * h2f + 1.0;
+  let fb = u32(fx >= fd) + u32(fx >= 2.0 * fd) + u32(fx >= 3.0 * fd);
+  let lut = LUT[select(select(32u + sub, s8, s8 < 32u), 40u, s8 == 255u) * 4u + fb];
 
   var best = 3.0e38;
-  var bt = 0u; var bm = 0u; var bb = 0u;   // best table / multiplier / base
-  var wt = 0u; var wm = 0u; var wb = 0u;   // winner of the three candidates
-  for (var k: u32 = 0u; k < 5u; k = k + 1u) {
-    var tab: u32; var mul: u32; var bas: u32;
-    if (k < 3u) {
-      let c = (lut >> (6u * k)) & 63u;
-      tab = c & 15u;
-      let rule = c >> 4u;
-      let dv = 8u * QW[tab];
-      mul = clamp((h2 + dv / 2u) / dv, 1u, 15u);
-      mul = select(mul, min(mul + 1u, 15u), rule == 1u);
-      mul = select(mul, 0u, rule == 2u);
-      bas = min((mid2 + select(8u * mul, 1u, mul == 0u)) >> 4u, 255u);
-    } else {
-      if (k == 3u) { wt = bt; wm = bm; wb = bb; }
-      tab = wt;
-      mul = wm;
-      bas = select(min(wb + 1u, 255u), max(wb, 1u) - 1u, k == 3u);
-    }
-    let half_m = select(4.0 * f32(mul), 0.5, mul == 0u);
-    let cr = f32(8u * bas + 4u) - half_m - tmin;   // centre, relative
-    let m = QV[tab] * half_m;
-    let m3p = min(m.w, 2047.0 - tmin - cr);
-    let m3n = min(m.w, cr + tmin);
-    var e = 0.0;
+  var bt = 0u; var bmf = 0.0; var bbf = 0.0;   // best table / multiplier / base
+  for (var k: u32 = 0u; k < 2u; k = k + 1u) {
+    let c = (lut >> (6u * k)) & 63u;
+    let tab = c & 15u;
+    let rule = c >> 4u;
+    let qv = QV[tab];
+    let qt = QT[tab];
+    // Covering multiplier floor((h2 + 4·q3) / (8·q3)); the extra ½ keeps the
+    // product off integer boundaries, so the floor is exact.
+    var mulf = clamp(floor((h2f + qt.z) * qt.w), 1.0, 15.0);
+    mulf = select(mulf, min(mulf + 1.0, 15.0), rule == 1u);
+    let fine = rule == 2u;
+    let half_m = select(4.0 * mulf, 0.5, fine);
+    let basf = min(floor((mid2f + 2.0 * half_m) * 0.0625), 255.0);
+    let cr = 8.0 * basf + 4.0 - half_m - tmin;   // centre, relative
+    let mf = qv * half_m;
+    // Outermost magnitude and its threshold, clamped per side (+, −). With a
+    // multiplier the distances are integers, so a half-integer threshold is
+    // floored: the same comparison, and exact in f16 at any magnitude.
+    let m3f = min(vec2<f32>(mf.w), vec2<f32>(2047.0 - tmin - cr, cr + tmin));
+    let t2r = (vec2<f32>(mf.z) + m3f) * 0.5;
+    let t2f = select(floor(t2r), t2r, vec2<bool>(fine));
+    let t01 = qt.xy * half_m;
+    let m0 = vec4<f32>(mf.x);
+    let m1 = vec4<f32>(mf.y);
+    let m2 = vec4<f32>(mf.z);
+    let m3p = vec4<f32>(m3f.x);
+    let m3n = vec4<f32>(m3f.y);
+    let t0 = vec4<f32>(t01.x);
+    let t1 = vec4<f32>(t01.y);
+    let t2p = vec4<f32>(t2f.x);
+    let t2n = vec4<f32>(t2f.y);
+    var ev = vec4<f32>(0.0);
+    var sv = vec4<f32>(0.0);
     for (var q: u32 = 0u; q < 4u; q = q + 1u) {
       let d = u[q] - cr;
       let a = abs(d);
-      let m3 = select(vec4<f32>(m3n), vec4<f32>(m3p), d >= vec4<f32>(0.0));
-      let r = min(min(abs(a - m.x), abs(a - m.y)), min(abs(a - m.z), abs(a - m3)));
-      e = e + dot(r, r);
+      let pos = d >= vec4<f32>(0.0);
+      var ms = select(m0, m1, a > t0);
+      ms = select(ms, m2, a > t1);
+      ms = select(ms, select(m3n, m3p, pos), a > select(t2n, t2p, pos));
+      let rh = a - ms;
+      let rf = select(-rh, rh, pos);
+      ev = ev + rf * rf;
+      sv = sv + rf;
     }
-    if (e < best) { best = e; bt = tab; bm = mul; bb = bas; }
+    let e = ev.x + ev.y + ev.z + ev.w;
+    let s = sv.x + sv.y + sv.z + sv.w;
+    // Base step that zeroes the mean residual, and the error it predicts.
+    let nb = clamp(basf + floor((s + 64.0) * 0.0078125), 0.0, 255.0);
+    let db = nb - basf;
+    let ep = e - 16.0 * db * s + 1024.0 * db * db;
+    if (ep < best) { best = ep; bt = tab; bmf = select(mulf, 0.0, fine); bbf = nb; }
   }
+  let bm = u32(bmf);
+  let bb = u32(bbf);
 
-  // Index pass against the final (table, multiplier, base).
-  let half_m = select(4.0 * f32(bm), 0.5, bm == 0u);
-  let cr = f32(8u * bb + 4u) - half_m - tmin;
-  let m = QV[bt] * half_m;
-  let m3p = min(m.w, 2047.0 - tmin - cr);
-  let m3n = min(m.w, cr + tmin);
+  // Index pass against the final (table, multiplier, base): the number of
+  // thresholds below the texel's distance, with all four magnitudes clamped
+  // to the [0, 2047] range on its side.
+  let fine = bm == 0u;
+  let half_m = select(4.0 * bmf, 0.5, fine);
+  let cr = 8.0 * bbf + 4.0 - half_m - tmin;
+  let mf = QV[bt] * half_m;
+  let np = min(mf, vec4<f32>(2047.0 - tmin - cr));
+  let nn = min(mf, vec4<f32>(cr + tmin));
+  let tpr = (np.xyz + np.yzw) * 0.5;
+  let tnr = (nn.xyz + nn.yzw) * 0.5;
+  let tp = select(floor(tpr), tpr, vec3<bool>(fine));
+  let tn = select(floor(tnr), tnr, vec3<bool>(fine));
   var pk = vec2<f32>(0.0);   // (columns 0..1, columns 2..3) index words
   for (var q: u32 = 0u; q < 4u; q = q + 1u) {
     let d = u[q] - cr;
     let a = abs(d);
     let pos = d >= vec4<f32>(0.0);
-    let r1 = abs(a - m.y);
-    let r2 = abs(a - m.z);
-    let r3 = abs(a - select(vec4<f32>(m3n), vec4<f32>(m3p), pos));
-    var b = abs(a - m.x);
-    var i = select(vec4<f32>(0.0), vec4<f32>(1.0), r1 < b);
-    b = min(b, r1);
-    i = select(i, vec4<f32>(2.0), r2 < b);
-    b = min(b, r2);
-    i = select(i, vec4<f32>(3.0), r3 < b);
-    let p = dot(i + select(vec4<f32>(0.0), vec4<f32>(4.0), pos), select(WA, WB, q >= 2u));
+    let i = select(vec4<f32>(0.0), vec4<f32>(4.0), pos)
+      + select(vec4<f32>(0.0), vec4<f32>(1.0), a > select(vec4<f32>(tn.x), vec4<f32>(tp.x), pos))
+      + select(vec4<f32>(0.0), vec4<f32>(1.0), a > select(vec4<f32>(tn.y), vec4<f32>(tp.y), pos))
+      + select(vec4<f32>(0.0), vec4<f32>(1.0), a > select(vec4<f32>(tn.z), vec4<f32>(tp.z), pos));
+    let p = dot(i, select(WA, WB, q >= 2u));
     let lo = (q & 1u) == 1u;
     pk = pk + vec2<f32>(select(p, 0.0, lo), select(0.0, p, lo));
   }

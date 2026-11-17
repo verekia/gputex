@@ -7,12 +7,17 @@
 // all of it exact integer / half-integer math, so the output is
 // byte-identical to the WGSL modules:
 //   • targets T = round(v·2047/255), relative to the block minimum;
-//   • the block's 8-bit span picks three (table, multiplier rule) candidates
-//     from a fitted 41-entry table;
-//   • each is scored exactly (nearest of four magnitudes per side of the
-//     palette centre, outermost one clamped to [0, 2047]);
-//   • the winner is re-scored at base − 1 and base + 1;
-//   • 3-bit indices pack as Σ i·8^k floats, big-endian and column-major.
+//   • the block's 8-bit span and shape (mean distance from the mid-range)
+//     pick two (table, multiplier rule) candidates from a fitted 164-entry
+//     table;
+//   • each is scored with the palette centred on the mid-range (the
+//     magnitude whose threshold interval holds the texel's distance,
+//     outermost one clamped to [0, 2047]), summing squared and signed
+//     residuals;
+//   • the signed sum gives the base step that zeroes the mean residual and
+//     the error it predicts; the lower prediction wins at its stepped base;
+//   • indices count the thresholds below each texel's distance on the final
+//     palette, and pack as Σ i·8^k floats, big-endian and column-major.
 
 precision highp float;
 precision highp int;
@@ -34,19 +39,43 @@ const vec4 QV[16] = vec4[16](
   vec4(5.0, 7.0, 13.0, 19.0),  vec4(1.0, 3.0, 5.0, 19.0),
   vec4(7.0, 11.0, 15.0, 17.0), vec4(5.0, 9.0, 13.0, 17.0)
 );
-const uint QW[16] = uint[16](29u, 25u, 25u, 25u, 23u, 21u, 21u, 21u, 19u, 19u, 19u, 19u, 19u, 19u, 17u, 17u);
+// Per table, with q0..q3 the row above: the two inner thresholds
+// (q0 + q1) / 2 and (q1 + q2) / 2, then 4·q3 + ½ and 1 / (8·q3) for the
+// covering-multiplier rule.
+const vec4 QT[16] = vec4[16](
+  vec4(8.0, 14.0, 116.5, 1.0 / 232.0), vec4(9.0, 16.0, 100.5, 1.0 / 200.0),
+  vec4(6.0, 12.0, 100.5, 1.0 / 200.0), vec4(5.0, 9.0, 100.5, 1.0 / 200.0),
+  vec4(8.0, 13.0, 92.5, 1.0 / 184.0), vec4(9.0, 15.0, 84.5, 1.0 / 168.0),
+  vec4(10.0, 14.0, 84.5, 1.0 / 168.0), vec4(7.0, 12.0, 84.5, 1.0 / 168.0),
+  vec4(7.0, 13.0, 76.5, 1.0 / 152.0), vec4(6.0, 12.0, 76.5, 1.0 / 152.0),
+  vec4(5.0, 11.0, 76.5, 1.0 / 152.0), vec4(6.0, 11.0, 76.5, 1.0 / 152.0),
+  vec4(6.0, 10.0, 76.5, 1.0 / 152.0), vec4(2.0, 4.0, 76.5, 1.0 / 152.0),
+  vec4(9.0, 13.0, 68.5, 1.0 / 136.0), vec4(7.0, 11.0, 68.5, 1.0 / 136.0)
+);
 
-// Span → three candidates, 6 bits each (low first): table in bits 0..3, rule
-// in bits 4..5 (0 = covering multiplier, 1 = that + 1, 2 = multiplier 0).
-// Index: the 8-bit span below 32, then 8 sub-buckets per octave of span;
-// entry 40 is for full-range blocks (span 255).
-const uint LUT[41] = uint[41](
-  0x01026u, 0x24a2du, 0x2b368u, 0x21360u, 0x2380du, 0x2380du, 0x0c74du, 0x1d0cdu,
-  0x1141du, 0x0f2ddu, 0x0b0ddu, 0x0b0ddu, 0x0a203u, 0x033cbu, 0x0a3cbu, 0x013cbu,
-  0x0e3cbu, 0x0f389u, 0x0d389u, 0x0d2c9u, 0x0b289u, 0x06247u, 0x05247u, 0x07101u,
-  0x04081u, 0x020c1u, 0x03081u, 0x03081u, 0x02001u, 0x0f040u, 0x083c0u, 0x0f200u,
-  0x0424fu, 0x0f089u, 0x00247u, 0x05244u, 0x0a042u, 0x021c1u, 0x00389u, 0x0e245u,
-  0x1269bu
+// (Span, shape) → two candidates, 6 bits each (low first): table in bits
+// 0..3, rule in bits 4..5 (0 = covering multiplier, 1 = that + 1,
+// 2 = multiplier 0). Index = span bucket · 4 + shape bucket; span bucket =
+// the 8-bit span below 32, then 8 sub-buckets per octave of span, 40 for
+// full-range blocks (span 255).
+const uint LUT[164] = uint[164](
+  0xb63u, 0xb63u, 0xb63u, 0xb63u, 0xae8u, 0xae8u, 0xae8u, 0xae8u, 0xae4u, 0xae4u,
+  0x92bu, 0x969u, 0x360u, 0x360u, 0x84du, 0x360u, 0x80du, 0x360u, 0x360u, 0x360u,
+  0x80du, 0x80du, 0x360u, 0x340u, 0x342u, 0x342u, 0x74du, 0x74du, 0x74du, 0x74du,
+  0x0cdu, 0x303u, 0x35du, 0x35du, 0x0ddu, 0x74cu, 0x0ddu, 0x0ddu, 0x2ddu, 0x09du,
+  0x743u, 0x743u, 0x743u, 0x743u, 0x0ddu, 0x0ddu, 0x0ddu, 0x743u, 0x743u, 0x743u,
+  0x743u, 0x0cfu, 0x2c3u, 0x2c3u, 0x0cbu, 0x2cfu, 0x2cau, 0x2cau, 0x2cfu, 0x3ceu,
+  0x24au, 0x24au, 0x3c9u, 0x3c6u, 0x34bu, 0x289u, 0x3c9u, 0x3ceu, 0x348u, 0x2cau,
+  0x24fu, 0x38fu, 0x34bu, 0x2cau, 0x24fu, 0x388u, 0x344u, 0x28bu, 0x24bu, 0x308u,
+  0x34au, 0x2cdu, 0x2cau, 0x202u, 0x340u, 0x28bu, 0x2c7u, 0x1c5u, 0x2c7u, 0x2c7u,
+  0x2c7u, 0x141u, 0x1c2u, 0x1c2u, 0x147u, 0x144u, 0x084u, 0x084u, 0x081u, 0x044u,
+  0x0c2u, 0x0c2u, 0x081u, 0x7c1u, 0x0c2u, 0x0c2u, 0x042u, 0x081u, 0x0c2u, 0x0c2u,
+  0x042u, 0x05bu, 0x080u, 0x080u, 0x081u, 0x04fu, 0x002u, 0x002u, 0x040u, 0x38fu,
+  0x080u, 0x080u, 0x040u, 0x00eu, 0x002u, 0x002u, 0x200u, 0x00eu, 0x080u, 0x080u,
+  0x3c9u, 0x385u, 0x2c2u, 0x2c2u, 0x089u, 0x20eu, 0x08bu, 0x08bu, 0x1c9u, 0x14eu,
+  0x084u, 0x084u, 0x207u, 0x10eu, 0x042u, 0x042u, 0x081u, 0x28eu, 0x042u, 0x042u,
+  0x042u, 0x14eu, 0x08bu, 0x08bu, 0x2c9u, 0x389u, 0x009u, 0x009u, 0x009u, 0x14eu,
+  0x655u, 0x655u, 0x655u, 0x655u
 );
 
 // Index weights 8^k for the big-endian, column-major index field (gather
@@ -80,69 +109,86 @@ void main() {
   float tmax = max(max(mxv.x, mxv.y), max(mxv.z, mxv.w));
   for (int q = 0; q < 4; q++) u[q] -= tmin;
 
-  uint h2 = uint(tmax - tmin);
-  uint mid2 = uint(tmin + tmax);
+  float h2f = tmax - tmin;
+  float mid2f = tmin + tmax;
   uint s8 = uint(floor(tmax * (255.0 / 2047.0) + 0.5) - floor(tmin * (255.0 / 2047.0) + 0.5));
   uint sub = (s8 >> (2u + uint(s8 >= 64u) + uint(s8 >= 128u))) & 7u;
-  uint lut = LUT[s8 == 255u ? 40u : (s8 < 32u ? s8 : 32u + sub)];
+  // Shape bucket: floor(4 · Σ|2T − (min + max)| / (16 · span + 1)).
+  vec4 f4 = abs(u[0] + u[0] - h2f) + abs(u[1] + u[1] - h2f) + abs(u[2] + u[2] - h2f) + abs(u[3] + u[3] - h2f);
+  float fx = 4.0 * (f4.x + f4.y + f4.z + f4.w);
+  float fd = 16.0 * h2f + 1.0;
+  uint fb = uint(fx >= fd) + uint(fx >= 2.0 * fd) + uint(fx >= 3.0 * fd);
+  uint lut = LUT[(s8 == 255u ? 40u : (s8 < 32u ? s8 : 32u + sub)) * 4u + fb];
 
   float best = 3.0e38;
-  uint bt = 0u, bm = 0u, bb = 0u;
-  uint wt = 0u, wm = 0u, wb = 0u;
-  for (uint k = 0u; k < 5u; k++) {
-    uint tab, mul, bas;
-    if (k < 3u) {
-      uint c = (lut >> (6u * k)) & 63u;
-      tab = c & 15u;
-      uint rule = c >> 4u;
-      uint dv = 8u * QW[tab];
-      mul = clamp((h2 + dv / 2u) / dv, 1u, 15u);
-      if (rule == 1u) mul = min(mul + 1u, 15u);
-      if (rule == 2u) mul = 0u;
-      bas = min((mid2 + (mul == 0u ? 1u : 8u * mul)) >> 4u, 255u);
-    } else {
-      if (k == 3u) { wt = bt; wm = bm; wb = bb; }
-      tab = wt;
-      mul = wm;
-      bas = k == 3u ? max(wb, 1u) - 1u : min(wb + 1u, 255u);
-    }
-    float halfM = mul == 0u ? 0.5 : 4.0 * float(mul);
-    float cr = float(8u * bas + 4u) - halfM - tmin;
-    vec4 m = QV[tab] * halfM;
-    float m3p = min(m.w, 2047.0 - tmin - cr);
-    float m3n = min(m.w, cr + tmin);
-    float e = 0.0;
+  uint bt = 0u;
+  float bmf = 0.0, bbf = 0.0;
+  for (uint k = 0u; k < 2u; k++) {
+    uint c = (lut >> (6u * k)) & 63u;
+    uint tab = c & 15u;
+    uint rule = c >> 4u;
+    vec4 qv = QV[tab];
+    vec4 qt = QT[tab];
+    float mulf = clamp(floor((h2f + qt.z) * qt.w), 1.0, 15.0);
+    if (rule == 1u) mulf = min(mulf + 1.0, 15.0);
+    bool fine = rule == 2u;
+    float halfM = fine ? 0.5 : 4.0 * mulf;
+    float basf = min(floor((mid2f + 2.0 * halfM) * 0.0625), 255.0);
+    float cr = 8.0 * basf + 4.0 - halfM - tmin;
+    vec4 mf = qv * halfM;
+    vec2 m3f = min(vec2(mf.w), vec2(2047.0 - tmin - cr, cr + tmin));   // (+ side, − side)
+    vec2 t2r = (vec2(mf.z) + m3f) * 0.5;
+    vec2 t2f = fine ? t2r : floor(t2r);
+    vec2 t01 = qt.xy * halfM;
+    vec4 ev = vec4(0.0);
+    vec4 sv = vec4(0.0);
     for (int q = 0; q < 4; q++) {
       vec4 d = u[q] - cr;
       vec4 a = abs(d);
-      vec4 m3 = mix(vec4(m3n), vec4(m3p), greaterThanEqual(d, vec4(0.0)));
-      vec4 r = min(min(abs(a - m.x), abs(a - m.y)), min(abs(a - m.z), abs(a - m3)));
-      e += dot(r, r);
+      bvec4 pos = greaterThanEqual(d, vec4(0.0));
+      vec4 ms = mix(vec4(mf.x), vec4(mf.y), greaterThan(a, vec4(t01.x)));
+      ms = mix(ms, vec4(mf.z), greaterThan(a, vec4(t01.y)));
+      ms = mix(ms, mix(vec4(m3f.y), vec4(m3f.x), pos), greaterThan(a, mix(vec4(t2f.y), vec4(t2f.x), pos)));
+      vec4 rh = a - ms;
+      vec4 rf = mix(-rh, rh, pos);
+      ev += rf * rf;
+      sv += rf;
     }
-    if (e < best) { best = e; bt = tab; bm = mul; bb = bas; }
+    float e = ev.x + ev.y + ev.z + ev.w;
+    float s = sv.x + sv.y + sv.z + sv.w;
+    // Base step that zeroes the mean residual, and the error it predicts.
+    float nb = clamp(basf + floor((s + 64.0) * 0.0078125), 0.0, 255.0);
+    float db = nb - basf;
+    float ep = e - 16.0 * db * s + 1024.0 * db * db;
+    if (ep < best) { best = ep; bt = tab; bmf = fine ? 0.0 : mulf; bbf = nb; }
   }
+  uint bm = uint(bmf);
+  uint bb = uint(bbf);
 
-  // Index pass against the final (table, multiplier, base).
-  float halfM = bm == 0u ? 0.5 : 4.0 * float(bm);
-  float cr = float(8u * bb + 4u) - halfM - tmin;
-  vec4 m = QV[bt] * halfM;
-  float m3p = min(m.w, 2047.0 - tmin - cr);
-  float m3n = min(m.w, cr + tmin);
+  // Index pass against the final (table, multiplier, base): the number of
+  // thresholds below the texel's distance, magnitudes clamped per side.
+  bool fine = bm == 0u;
+  float halfM = fine ? 0.5 : 4.0 * bmf;
+  float cr = 8.0 * bbf + 4.0 - halfM - tmin;
+  vec4 mf = QV[bt] * halfM;
+  vec4 np = min(mf, vec4(2047.0 - tmin - cr));
+  vec4 nn = min(mf, vec4(cr + tmin));
+  vec3 tp = (np.xyz + np.yzw) * 0.5;
+  vec3 tn = (nn.xyz + nn.yzw) * 0.5;
+  if (!fine) {
+    tp = floor(tp);
+    tn = floor(tn);
+  }
   vec2 pk = vec2(0.0);
   for (int q = 0; q < 4; q++) {
     vec4 d = u[q] - cr;
     vec4 a = abs(d);
     bvec4 pos = greaterThanEqual(d, vec4(0.0));
-    vec4 r1 = abs(a - m.y);
-    vec4 r2 = abs(a - m.z);
-    vec4 r3 = abs(a - mix(vec4(m3n), vec4(m3p), pos));
-    vec4 b = abs(a - m.x);
-    vec4 i = mix(vec4(0.0), vec4(1.0), lessThan(r1, b));
-    b = min(b, r1);
-    i = mix(i, vec4(2.0), lessThan(r2, b));
-    b = min(b, r2);
-    i = mix(i, vec4(3.0), lessThan(r3, b));
-    float p = dot(i + mix(vec4(0.0), vec4(4.0), pos), q >= 2 ? WB : WA);
+    vec4 i = mix(vec4(0.0), vec4(4.0), pos)
+      + vec4(greaterThan(a, mix(vec4(tn.x), vec4(tp.x), pos)))
+      + vec4(greaterThan(a, mix(vec4(tn.y), vec4(tp.y), pos)))
+      + vec4(greaterThan(a, mix(vec4(tn.z), vec4(tp.z), pos)));
+    float p = dot(i, q >= 2 ? WB : WA);
     bool lo = (q & 1) == 1;
     pk += vec2(lo ? 0.0 : p, lo ? p : 0.0);
   }
