@@ -36,6 +36,7 @@ import {
   type PreferredFormat,
   type TextureHint,
 } from './selectFormat.js'
+import { blobIsOpaque } from './sourceAlpha.js'
 import { hasSvgExtension, isSvgBlob, isSvgMarkup, rasterizeSvg, type SvgRasterSize } from './svg.js'
 import { buildTranscodeKey, readTranscodeCache, writeTranscodeCache } from './transcodeCache.js'
 import { selectWebGLFormat, type WebGLFormatSelection } from './webgl/selectWebGLFormat.js'
@@ -427,6 +428,15 @@ export async function prewarmCompressTexture(
 // ---------------------------------------------------------------------------
 
 /**
+ * Bitmaps `sourceToBitmap` decoded from an image file whose header rules
+ * out transparency (JPEG, PNG without alpha channel / tRNS, alpha-less
+ * WebP): every texel has alpha 255, which the encode is told via
+ * `EncodeOptions.opaque`. Canvas-, element- and caller-made bitmaps are
+ * never in here — their pixels would have to be scanned to know.
+ */
+const opaqueBitmaps = new WeakSet<ImageBitmap>()
+
+/**
  * Normalise any `CompressTextureSource` to an ImageBitmap. Keeps the rest
  * of the pipeline narrow — one input type, one width/height contract.
  *
@@ -443,6 +453,13 @@ async function sourceToBitmap(source: CompressTextureSource, svgSize?: SvgRaster
     colorSpaceConversion: 'none',
     premultiplyAlpha: 'none',
   }
+  // Image files are decoded here; while the decode runs, the file header
+  // says whether the format can carry alpha at all (sourceAlpha.ts).
+  const decode = async (blob: Blob): Promise<ImageBitmap> => {
+    const [bitmap, opaque] = await Promise.all([createImageBitmap(blob, opts), blobIsOpaque(blob)])
+    if (opaque) opaqueBitmaps.add(bitmap)
+    return bitmap
+  }
   if (typeof source === 'string') {
     // A string starting with `<` is inline SVG markup, not a URL.
     if (isSvgMarkup(source)) {
@@ -457,7 +474,7 @@ async function sourceToBitmap(source: CompressTextureSource, svgSize?: SvgRaster
       if (isSvgBlob(blob)) {
         return rasterizeSvg(blob, { size: svgSize })
       }
-      return createImageBitmap(blob, opts)
+      return decode(blob)
     }
     const resp = await fetch(source)
     if (!resp.ok) {
@@ -469,13 +486,13 @@ async function sourceToBitmap(source: CompressTextureSource, svgSize?: SvgRaster
     if (isSvgBlob(blob) || (!isImageMimeType(blob.type) && hasSvgExtension(source))) {
       return rasterizeSvg(blob, { size: svgSize })
     }
-    return createImageBitmap(blob, opts)
+    return decode(blob)
   }
   if (source instanceof Blob) {
     if (isSvgBlob(source)) {
       return rasterizeSvg(source, { size: svgSize })
     }
-    return createImageBitmap(source, opts)
+    return decode(source)
   }
   if (source instanceof ImageBitmap) {
     return source
@@ -793,15 +810,16 @@ export async function compressTextureToBytes(
 
     try {
       const needsWriteTexture = needsWriteTextureWorkaround(adapter)
+      const opaque = opaqueBitmaps.has(bitmap)
 
       if (!mipmaps) {
         let bytes
         if (needsWriteTexture) {
           const level0 = bitmapToMipLevel(bitmap, flipY)
           const imageData = mipLevelToImageData(level0)
-          bytes = await encoder.encodeToBytes(imageData)
+          bytes = await encoder.encodeToBytes(imageData, { opaque })
         } else {
-          bytes = await encoder.encodeToBytes(bitmap, { flipY })
+          bytes = await encoder.encodeToBytes(bitmap, { flipY, opaque })
         }
         if (transcodeKey) {
           writeTranscodeCache(transcodeKey, {
@@ -841,11 +859,13 @@ export async function compressTextureToBytes(
       let chainResult
       if (needsWriteTexture) {
         const level0 = bitmapToMipLevel(bitmap, flipY)
-        chainResult = await encoder.encodeMipChainToBytes(generateMipChain(level0).map(padToBlockMultiple))
+        chainResult = await encoder.encodeMipChainToBytes(generateMipChain(level0).map(padToBlockMultiple), {
+          opaque,
+        })
       } else {
         const chainTex = await generateGpuMipChain(encoder.device, bitmap, { flipY })
         try {
-          chainResult = await encoder.encodeMipChainFromTexture(chainTex)
+          chainResult = await encoder.encodeMipChainFromTexture(chainTex, { opaque })
         } finally {
           chainTex.destroy()
         }

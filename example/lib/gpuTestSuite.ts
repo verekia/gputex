@@ -46,7 +46,7 @@ export interface CorrectnessResult {
 
 export interface QualityResult {
   format: FormatKey
-  variant: 'f16' | 'f32'
+  variant: Variant
   image: string
   psnrDb: number
   /**
@@ -73,7 +73,7 @@ export interface QualityResult {
 
 export interface PerfResult {
   format: FormatKey
-  variant: 'f16' | 'f32'
+  variant: Variant
   image: string
   wallMsMedian: number
   gpuMsMedian: number | null
@@ -94,6 +94,13 @@ export interface SuiteResults {
   perf: PerfResult[]
   failures: number
 }
+
+/**
+ * Which shader produced a row: the f16 module, the f32 fallback, or — for
+ * encoders that have one — the opaque-source f16 kernel
+ * (`encodeToBytes(src, { opaque: true })`), run on fully opaque images only.
+ */
+export type Variant = 'f16' | 'f32' | 'opaque'
 
 export type ProgressFn = (message: string) => void
 
@@ -276,6 +283,13 @@ async function loadImageData(url: string): Promise<ImageData> {
   ctx.drawImage(bmp, 0, 0)
   bmp.close()
   return ctx.getImageData(0, 0, canvas.width, canvas.height)
+}
+
+/** True when every pixel has alpha 255. */
+function isOpaque(img: ImageData): boolean {
+  const d = img.data
+  for (let i = 3; i < d.length; i += 4) if (d[i] !== 255) return false
+  return true
 }
 
 function cropImageData(src: ImageData, x: number, y: number, w: number, h: number): ImageData {
@@ -574,6 +588,35 @@ export async function runSuite(
       pass: delta >= -2.0,
       detail: `gpu ${gpuPsnr.toFixed(2)} dB vs reference ${refPsnr.toFixed(2)} dB (Δ ${delta.toFixed(2)})`,
     })
+
+    // The opaque-source kernel has its own edge-block path (clamped loads
+    // arranged as gather quads): same odd-size gate, plus sizes below one
+    // block — the last levels of every mip chain.
+    if (format === 'astc' && hasF16Variant(format)) {
+      onProgress(`Correctness: ${format} opaque-source kernel, odd sizes`)
+      const opaqueOdd = await enc.encodeToBytes(oddImg, { opaque: true })
+      const opaquePsnr = computePsnr(format, oddImg, opaqueOdd.data)
+      let tinyWorst = 0
+      for (const [w, h] of [
+        [1, 1],
+        [2, 2],
+        [3, 9],
+        [5, 7],
+      ] as const) {
+        const tiny = cropImageData(colorFull, 300, 40, w, h)
+        const general = computePsnr(format, tiny, (await enc.encodeToBytes(tiny)).data)
+        const opaque = computePsnr(format, tiny, (await enc.encodeToBytes(tiny, { opaque: true })).data)
+        if (Number.isFinite(general) || Number.isFinite(opaque)) tinyWorst = Math.max(tinyWorst, general - opaque)
+      }
+      correctness.push({
+        name: `${format} opaque-source kernel, odd sizes`,
+        format,
+        pass: opaquePsnr - refPsnr >= -2.0 && opaquePsnr - gpuPsnr >= -0.3 && tinyWorst <= 1.0,
+        detail:
+          `133×61: ${opaquePsnr.toFixed(2)} dB vs general kernel ${gpuPsnr.toFixed(2)} dB; ` +
+          `1×1 / 2×2 / 3×9 / 5×7: worst gap to the general kernel ${tinyWorst.toFixed(2)} dB`,
+      })
+    }
   }
 
   // -------------------------------------------------------------- quality
@@ -679,16 +722,19 @@ export async function runSuite(
         refPsnrDb = computePsnr(format, img, refData)
       }
 
-      const variants: Array<['f16' | 'f32', Encoder]> =
+      const variants: Array<[Variant, Encoder]> =
         hasF16Variant(format) && spec.bothVariants
           ? [
               ['f16', encoders[format]],
               ['f32', encodersF32[format]],
             ]
           : [[hasF16Variant(format) ? 'f16' : 'f32', encoders[format]]]
+      // The opaque-source kernel must match the general one on images
+      // with no alpha: same pins, same per-block gates.
+      if (format === 'astc' && hasF16Variant(format) && isOpaque(img)) variants.push(['opaque', encoders[format]])
       for (const [variant, enc] of variants) {
         onProgress(`Quality: ${format} (${variant}) PSNR on ${image}`)
-        const { data } = await enc.encodeToBytes(img)
+        const { data } = await enc.encodeToBytes(img, { opaque: variant === 'opaque' })
         const psnrDb = computePsnr(format, img, data)
         const threshold = PSNR_THRESHOLDS[`${format}:${image}`] ?? null
 
@@ -743,21 +789,24 @@ export async function runSuite(
     await encoders[FORMATS.includes('bc7') ? 'bc7' : FORMATS[0]!].encodeToBytes(benchBitmap)
   }
 
-  const perfCases: Array<{ format: FormatKey; variant: 'f16' | 'f32'; enc: Encoder }> = []
+  const perfCases: Array<{ format: FormatKey; variant: Variant; enc: Encoder }> = []
   for (const format of FORMATS) {
     perfCases.push({ format, variant: hasF16Variant(format) ? 'f16' : 'f32', enc: encoders[format] })
     if (hasF16Variant(format)) perfCases.push({ format, variant: 'f32', enc: encodersF32[format] })
+    // (The benchmark image is opaque.)
+    if (format === 'astc' && hasF16Variant(format)) perfCases.push({ format, variant: 'opaque', enc: encoders[format] })
   }
 
   for (const { format, variant, enc } of perfCases) {
     onProgress(`Benchmark: ${format} (${variant}) — 2048²`)
+    const opaque = variant === 'opaque'
     for (let i = 0; i < WARMUP; i++) {
-      await enc.encodeToBytes(benchBitmap)
+      await enc.encodeToBytes(benchBitmap, { opaque })
     }
     const wall: number[] = []
     const gpu: number[] = []
     for (let i = 0; i < RUNS; i++) {
-      const r = await enc.encodeToBytes(benchBitmap, { withGpuTime: true })
+      const r = await enc.encodeToBytes(benchBitmap, { withGpuTime: true, opaque })
       wall.push(r.encodeMs)
       if (r.gpuMs !== undefined) gpu.push(r.gpuMs)
     }

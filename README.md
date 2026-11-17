@@ -91,6 +91,8 @@ prewarmCompressTexture([{ hint: 'color', mipmaps: true }, { hint: 'normal' }])
 
 **Reuse your renderer's WebGPU device** with the `device` option to avoid creating a second one.
 
+**Prefer image files without an alpha channel** for opaque textures on mobile. When the file itself rules out transparency (JPEG, PNG saved as RGB, WebP without alpha), ASTC encoding takes a dedicated path with the same quality in less GPU time: 10–30% less for color maps and 25–60% less for grayscale maps on phone GPUs. An RGBA PNG takes the general path even if every pixel is opaque.
+
 ## Without Three.js
 
 The root `gputex` entry has no Three.js dependency and returns raw compressed bytes you can upload with any engine:
@@ -104,7 +106,7 @@ const { levels, format } = await compressTextureToBytes('/cobblestone.avif', {
 // levels[i] = { data: Uint8Array, width, height }
 ```
 
-Individual encoders (`BC7Encoder`, `BC5Encoder`, `BC1Encoder`, `ASTC4x4Encoder`, `ETC2Encoder`) are exported too.
+Individual encoders (`BC7Encoder`, `BC5Encoder`, `BC1Encoder`, `ASTC4x4Encoder`, `ETC2Encoder`) are exported too. When you feed them your own pixels and know they are fully opaque, say so — `encoder.encodeToBytes(source, { opaque: true })` — to get the same dedicated path.
 
 ## Browser support
 

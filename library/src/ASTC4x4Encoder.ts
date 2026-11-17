@@ -16,9 +16,17 @@
 // `astc4x4.wgsl`); the CPU reference encoder/decoder in `astc4x4_ref.ts`
 // covers the same block layouts and is the quality yardstick the GPU
 // suite gates against.
+//
+// Sources promised opaque (`encodeToBytes(src, { opaque: true })`;
+// `compressTexture` makes the promise for image files that cannot carry
+// alpha) run `astc4x4_opaque_f16.wgsl` instead on f16 devices: the same
+// gray / opaque block classes with three-channel gathers and no
+// translucent path — same quality, less GPU time on every GPU measured
+// (the module's header has the numbers).
 
 import shaderSource from './astc4x4.wgsl'
 import shaderSourceF16 from './astc4x4_fast_f16.wgsl'
+import shaderSourceOpaqueF16 from './astc4x4_opaque_f16.wgsl'
 import { Encoder, type FormatVariant } from './Encoder.js'
 import { TextureFormat, WebGPUFeature } from './TextureFormat.js'
 
@@ -41,6 +49,9 @@ export class ASTC4x4Encoder extends Encoder {
   }
   override wgslSourceFastF16(): string {
     return shaderSourceF16
+  }
+  protected override wgslSourceOpaqueF16(): string {
+    return shaderSourceOpaqueF16
   }
 
   override gpuTextureFormat({ colorSpace }: FormatVariant): GPUTextureFormat {

@@ -57,6 +57,29 @@ describe('f16 fast shader variants', () => {
   })
 })
 
+describe('opaque-source kernels', () => {
+  it('ASTC ships one: three-channel gathers, no translucent class', () => {
+    const view: AnyProto = Object.create(ASTC4x4Encoder.prototype)
+    const src: string = view.wgslSourceOpaqueF16()
+    expect(src).toContain('enable f16')
+    expect(src).toContain('@binding(3) var smp: sampler;')
+    expect(src).toContain('textureGather(2, src_tex')
+    expect(src).not.toContain('textureGather(3, src_tex')
+    // CEM 0 and CEM 8 block modes only — no CEM 12 (0x042) layout.
+    expect(src).toContain('0x253u')
+    expect(src).toContain('0x242u')
+    expect(src).toContain('0x053u')
+    expect(src).not.toContain('0x042u')
+  })
+
+  it('the other encoders have none (the promise is ignored there)', () => {
+    for (const cls of [BC1Encoder, BC5Encoder, BC7Encoder, ETC2Encoder]) {
+      const view: AnyProto = Object.create(cls.prototype)
+      expect(view.wgslSourceOpaqueF16()).toBeNull()
+    }
+  })
+})
+
 describe('BC5Encoder', () => {
   it('declares its metadata', () => {
     expect(BC5Encoder.requiredFeature).toBe(WebGPUFeature.BC)

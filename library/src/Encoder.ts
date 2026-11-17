@@ -48,6 +48,23 @@ export interface EncoderOptions {
   disableF16?: boolean
 }
 
+/** Per-call options of the bytes-level encode methods. */
+export interface EncodeOptions {
+  /** Flip the source vertically on upload. Default false. */
+  flipY?: boolean
+  /** Also measure GPU compute time (see `EncodeBytesResult.gpuMs`). */
+  withGpuTime?: boolean
+  /**
+   * Promise that every texel of the source has alpha 255. Encoders with a
+   * dedicated opaque-source kernel then use it — ASTC skips the alpha
+   * fetches and its translucent path: same quality, 5–60% less GPU time
+   * depending on the GPU and content. Ignored by encoders without one. If
+   * the promise is false the output is still a valid opaque texture: alpha
+   * is dropped. Default false.
+   */
+  opaque?: boolean
+}
+
 export interface EncodeCallOptions {
   /** Tags the output color space. Forced 'linear' for encoders with supportsSrgb=false. */
   colorSpace?: 'srgb' | 'linear'
@@ -108,6 +125,9 @@ const CHAIN_ALIGN = 256
 // bytes, bound as a 32-byte slot. y0 is the first block row a dispatch
 // covers (row-band encodes); whole-grid dispatches pass 0.
 const PARAMS_SIZE = 32
+// A shader that declares a @binding(3) sampler reads texels through
+// textureGather; the host then binds a clamp-to-edge sampler there.
+const SAMPLER_BINDING = /@binding\(3\)\s+var\s+\w+\s*:\s*sampler\s*;/
 const PARAMS_ALIGN = 256
 const MAX_BANDS = 8
 // Target output bytes per band. Interleaved A/B on Apple M3 (16 MB BC7/ASTC
@@ -235,6 +255,11 @@ export abstract class Encoder {
   // Source-preparation pipeline, when the subclass declares one (ETC2's
   // packed-luma + quadrant-average split). Null for direct-source encoders.
   protected _prepPipelineReady: Promise<GPUComputePipeline> | null = null
+  // Alternate pipeline for sources the caller promises are opaque, when the
+  // subclass ships a kernel for them (`wgslSourceOpaqueF16()`) and the f16
+  // path is in use. Compiled alongside the main one.
+  private _opaquePipelineReady: Promise<GPUComputePipeline> | null = null
+  private _opaqueUsesSampler = false
 
   // -------------------------------------------------------------------- //
   // Per-encoder GPU resource cache. Creating the source texture, output/
@@ -263,6 +288,9 @@ export abstract class Encoder {
   private _cachedParams: GPUBuffer | null = null
   private _lastParamsKey: string | null = null
   private _cachedBindGroups: GPUBindGroup[] = []
+  // Bind groups come from a pipeline's own ('auto') layout: the cached ones
+  // are only valid for the pipeline they were created against.
+  private _cachedBindGroupsPipeline: GPUComputePipeline | null = null
   private _cachedPrepPlanes: GPUTexture[] | null = null
   private _cachedPrepBindGroup: GPUBindGroup | null = null
   private _resourcesBusy = false
@@ -303,7 +331,7 @@ export abstract class Encoder {
     // subclasses override the wgsl source hooks; stubs throw here
     const useF16 = this._useF16
     const code = useF16 ? this.wgslSourceFastF16()! : this.wgslSource()
-    this._usesSampler = /@binding\(3\)\s+var\s+\w+\s*:\s*sampler\s*;/.test(code)
+    this._usesSampler = SAMPLER_BINDING.test(code)
     const module = device.createShaderModule({
       label: `${this.label}-encoder${useF16 ? '-f16' : ''}`,
       code,
@@ -323,10 +351,33 @@ export abstract class Encoder {
       })
       this._prepPipelineReady.catch(() => {})
     }
+    const opaqueCode = useF16 ? this.wgslSourceOpaqueF16() : null
+    if (opaqueCode) {
+      this._opaqueUsesSampler = SAMPLER_BINDING.test(opaqueCode)
+      const opaqueModule = device.createShaderModule({ label: `${this.label}-encoder-opaque-f16`, code: opaqueCode })
+      this._opaquePipelineReady = device.createComputePipelineAsync({
+        label: `${this.label}-encoder-opaque-pipeline-f16`,
+        layout: 'auto',
+        compute: { module: opaqueModule, entryPoint: 'encode' },
+      })
+      this._opaquePipelineReady.catch(() => {})
+    }
     // An encoder may be constructed and never used — don't let an orphaned
     // promise surface as an unhandled rejection. Encodes await the live
     // promise and still observe compile errors.
     this._pipelineReady.catch(() => {})
+  }
+
+  /** The compute pipeline for one encode: the opaque-source kernel when the
+   *  caller made the promise and the encoder has one, the main one
+   *  otherwise. Resolves instantly once compiled. */
+  private async _pipelineFor(
+    opaque: boolean,
+  ): Promise<{ pipeline: GPUComputePipeline; usesSampler: boolean; isOpaque: boolean }> {
+    if (opaque && this._opaquePipelineReady) {
+      return { pipeline: await this._opaquePipelineReady, usesSampler: this._opaqueUsesSampler, isOpaque: true }
+    }
+    return { pipeline: await this._pipelineReady, usesSampler: this._usesSampler, isOpaque: false }
   }
 
   /**
@@ -337,6 +388,7 @@ export abstract class Encoder {
   async ready(): Promise<void> {
     await this._pipelineReady
     if (this._prepPipelineReady) await this._prepPipelineReady
+    if (this._opaquePipelineReady) await this._opaquePipelineReady
   }
 
   destroy(): void {
@@ -409,6 +461,18 @@ export abstract class Encoder {
    * fallback. Returns null when there's no f16 variant.
    */
   wgslSourceFastF16(): string | null {
+    return null
+  }
+
+  /**
+   * Optional f16 kernel for sources whose every texel has alpha 255, used
+   * for encodes called with `opaque: true` when the f16 path is active.
+   * Must produce blocks the main kernel could have produced for such a
+   * source (same format, same quality); what it may do is skip everything
+   * alpha costs. Returns null when the encoder has no such kernel — the
+   * promise is then simply ignored.
+   */
+  protected wgslSourceOpaqueF16(): string | null {
     return null
   }
 
@@ -508,7 +572,7 @@ export abstract class Encoder {
    */
   async encodeToBytes(
     source: EncoderImageSource,
-    { flipY = false, withGpuTime = false }: { flipY?: boolean; withGpuTime?: boolean } = {},
+    { flipY = false, withGpuTime = false, opaque = false }: EncodeOptions = {},
   ): Promise<EncodeBytesResult> {
     const device = this.device
     // ImageBitmap/VideoFrame/etc. all expose width/height numerically;
@@ -531,7 +595,7 @@ export abstract class Encoder {
 
     // Resolves instantly after the first encode; only the first one can
     // actually wait on shader compilation.
-    const pipeline = await this._pipelineReady
+    const { pipeline, usesSampler } = await this._pipelineFor(opaque)
     const prepPipeline = this._prepPipelineReady ? await this._prepPipelineReady : null
 
     // Acquire GPU resources — from the per-encoder cache when it's free (the
@@ -683,7 +747,10 @@ export abstract class Encoder {
       // 4. Bind groups (one per band slot), kept until a bound resource is
       //    recreated. With a prep pass the encode pass reads the prepared
       //    planes; without one it reads the source texture directly.
-      if (useCache && (srcTexIsNew || dstIsNew || prepPlanesNew)) this._cachedBindGroups = []
+      if (useCache && (srcTexIsNew || dstIsNew || prepPlanesNew || this._cachedBindGroupsPipeline !== pipeline)) {
+        this._cachedBindGroups = []
+        this._cachedBindGroupsPipeline = pipeline
+      }
       const bindGroups: GPUBindGroup[] = []
       for (let b = 0; b < bands.length; b++) {
         let bg = useCache ? this._cachedBindGroups[b] : undefined
@@ -695,7 +762,7 @@ export abstract class Encoder {
           ]
           if (prepPlanes) {
             entries.push({ binding: 3, resource: prepPlanes[1]!.createView() })
-          } else if (this._usesSampler) {
+          } else if (usesSampler) {
             this._sampler ??= device.createSampler({
               label: `${this.label}-clamp-sampler`,
               addressModeU: 'clamp-to-edge',
@@ -817,13 +884,13 @@ export abstract class Encoder {
    */
   async encodeMipChainToBytes(
     levels: readonly MipLevel[],
-    { withGpuTime = false }: { withGpuTime?: boolean } = {},
+    { withGpuTime = false, opaque = false }: Omit<EncodeOptions, 'flipY'> = {},
   ): Promise<EncodeMipChainResult> {
     const device = this.device
     if (levels.length === 0) {
       throw new Error(`${this.label}Encoder: encodeMipChainToBytes needs at least one level`)
     }
-    const pipeline = await this._pipelineReady
+    const { pipeline, usesSampler, isOpaque } = await this._pipelineFor(opaque)
     const prepPipeline = this._prepPipelineReady ? await this._prepPipelineReady : null
     const t0 = performance.now()
 
@@ -839,7 +906,8 @@ export abstract class Encoder {
       }
     })
     const { geoms, byteSpan, bands } = this._chainGeometry(levels)
-    const sig = geoms.map(g => `${g.width}x${g.height}`).join()
+    // The cached level set holds bind groups, which belong to one pipeline.
+    const sig = geoms.map(g => `${g.width}x${g.height}`).join() + (isOpaque ? '|opaque' : '')
 
     const useCache = !this._chainBusy
     if (useCache) this._chainBusy = true
@@ -900,7 +968,7 @@ export abstract class Encoder {
 
         params = this._createChainParams(geoms, bands)
 
-        if (this._usesSampler) {
+        if (usesSampler) {
           this._sampler ??= device.createSampler({
             label: `${this.label}-clamp-sampler`,
             addressModeU: 'clamp-to-edge',
@@ -928,7 +996,7 @@ export abstract class Encoder {
           ]
           if (prepPipeline) {
             entries.push({ binding: 3, resource: planeSets[i]![1]!.createView() })
-          } else if (this._usesSampler) {
+          } else if (usesSampler) {
             entries.push({ binding: 3, resource: this._sampler! })
           }
           return device.createBindGroup({
@@ -1012,10 +1080,10 @@ export abstract class Encoder {
    */
   async encodeMipChainFromTexture(
     srcTex: GPUTexture,
-    { withGpuTime = false }: { withGpuTime?: boolean } = {},
+    { withGpuTime = false, opaque = false }: Omit<EncodeOptions, 'flipY'> = {},
   ): Promise<EncodeMipChainResult> {
     const device = this.device
-    const pipeline = await this._pipelineReady
+    const { pipeline, usesSampler } = await this._pipelineFor(opaque)
     const prepPipeline = this._prepPipelineReady ? await this._prepPipelineReady : null
     const t0 = performance.now()
 
@@ -1056,7 +1124,7 @@ export abstract class Encoder {
       // call, so nothing level-specific is reusable. (~0.1 ms per chain.)
       params = this._createChainParams(geoms, bands)
 
-      if (this._usesSampler) {
+      if (usesSampler) {
         this._sampler ??= device.createSampler({
           label: `${this.label}-clamp-sampler`,
           addressModeU: 'clamp-to-edge',
@@ -1091,7 +1159,7 @@ export abstract class Encoder {
         ]
         if (planes) {
           entries.push({ binding: 3, resource: planes[i]![1]!.createView() })
-        } else if (this._usesSampler) {
+        } else if (usesSampler) {
           entries.push({ binding: 3, resource: this._sampler! })
         }
         return device.createBindGroup({

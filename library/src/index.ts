@@ -22,6 +22,7 @@ export {
   type EncoderOptions,
   type EncoderConstructor,
   type EncodeCallOptions,
+  type EncodeOptions,
   type EncodeBytesResult,
   type EncodedLevelBytes,
   type EncodeMipChainResult,

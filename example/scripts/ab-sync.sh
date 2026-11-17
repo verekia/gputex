@@ -13,4 +13,7 @@ for f in bc1 bc5 bc7 astc4x4 etc2; do
     git show "HEAD:$src" > "example/public/ab/${short}_head.wgsl" 2>/dev/null || true
   done
 done
+# ASTC's opaque-source kernel (f16 only).
+cp library/src/astc4x4_opaque_f16.wgsl example/public/ab/astc_opq_f16_work.wgsl
+git show "HEAD:library/src/astc4x4_opaque_f16.wgsl" > example/public/ab/astc_opq_f16_head.wgsl 2>/dev/null || rm -f example/public/ab/astc_opq_f16_head.wgsl
 echo "synced $(ls example/public/ab | wc -l | tr -d ' ') files into example/public/ab/"
