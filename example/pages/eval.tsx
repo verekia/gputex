@@ -30,15 +30,36 @@
 //   shaders=bc7_f16_head,bc7_f16_work   (required)
 //   images=default | all | key,key,…    (see IMAGES below; default = the
 //                                        format's standard corpus)
-//   batch=N  samples=15                  timing (samples=0 skips timing;
-//                                        batch defaults to ~10 4K-equivalents)
+//   samples=15                           timed samples per shader (0 skips timing)
+//   passms=60                            target duration of one timed pass: the
+//                                        dispatch count per pass is calibrated
+//                                        per image so slow (mobile) and fast
+//                                        GPUs both get well-resolved samples
+//   batch=N                              fixed dispatch count instead
+//   timer=wall                           time with onSubmittedWorkDone instead
+//                                        of timestamp queries (automatic when
+//                                        the adapter lacks timestamp-query)
 //   src=rgba8                            bind bc5 shaders to the rgba8 source
 //                                        (default: rg8, like BC5Encoder)
+//   oracle=1                             also report the PSNR of taking, per
+//                                        block, the best of the listed shaders
+//                                        (the ceiling a perfect per-block
+//                                        selector between them would reach)
 //   easy=16                              easy-block threshold: block SSE in
 //                                        8-bit units² summed over its pixels
 //                                        and stored channels
 //
-// Automation hook: window.__GPUTEX_EVAL__ = { status, results?, summary?, error? }
+// Noise: the machine may be busy with other work while this runs, so every
+// number is built to survive that. Shaders are sampled round-robin with the
+// order rotated each round (no shader always runs first, or right after a
+// neighbour's heat), and the time ratio vs the first shader is the MEDIAN OF
+// PER-ROUND RATIOS — a burst of outside load hits all shaders of a round
+// alike and cancels, where a ratio of minimums or of medians does not. The
+// spread column is the inter-quartile range of those per-round ratios: when
+// it is wider than the difference being claimed, re-run. List a shader
+// twice (a control copy) to see the noise floor directly.
+//
+// Automation hook: window.__GPUTEX_EVAL__ = { status, progress, results?, summary?, error? }
 
 import { useEffect, useRef, useState } from 'react'
 
@@ -56,15 +77,32 @@ interface Row {
   /** vs the first shader (0 / null for the first). */
   dPsnr: number
   timeRatio: number | null
+  /** Inter-quartile range of the per-round time ratios (noise indicator). */
+  ratioIqr: number | null
+  /** Dispatches per timed pass used for this image. */
+  batch: number
   worseBlocks: number
   betterBlocks: number
   maxBlockWorse: number
   maxEasyWorse: number
   /** The block behind maxEasyWorse: source RGBA bytes (row-major) and both encodings. */
-  maxEasyBlock?: { index: number; bx: number; by: number; src: number[]; base: number[]; mine: number[] }
+  maxEasyBlock?: BlockDump
+  /** The block behind maxBlockWorse. */
+  maxWorseBlock?: BlockDump
   identicalPct: number
   /** BC7 only: block count per mode (mode 4: m4r<rotation>i<idxMode>, mode 5: m5r<rotation>). */
   modeHist?: Record<string, number>
+}
+
+interface BlockDump {
+  index: number
+  bx: number
+  by: number
+  /** Source RGBA bytes, row-major (16 texels). */
+  src: number[]
+  /** The first shader's encoding of the block, and this shader's. */
+  base: number[]
+  mine: number[]
 }
 
 interface ImageResult {
@@ -72,6 +110,9 @@ interface ImageResult {
   width: number
   height: number
   rows: Row[]
+  /** `oracle=1`: PSNR if every block took the best of the listed shaders,
+   *  and the share of blocks each shader wins (ties to the earliest). */
+  oracle?: { psnr: number; wins: number[] }
 }
 
 interface Summary {
@@ -80,15 +121,25 @@ interface Summary {
   meanDPsnr: number
   minDPsnr: number
   maxDPsnr: number
-  /** Geometric mean of per-image min-time ratios vs the first shader. */
+  /** Geometric mean of per-image time ratios vs the first shader. */
   geoTimeRatio: number | null
+  /** Largest per-image ratio IQR (how far to trust geoTimeRatio). */
+  maxRatioIqr: number | null
   totalWorse: number
   worstEasy: number
 }
 
 declare global {
   interface Window {
-    __GPUTEX_EVAL__?: { status: Status; results?: ImageResult[]; summary?: Summary[]; text?: string; error?: string }
+    __GPUTEX_EVAL__?: {
+      status: Status
+      progress?: string
+      adapter?: string
+      results?: ImageResult[]
+      summary?: Summary[]
+      text?: string
+      error?: string
+    }
   }
 }
 
@@ -110,6 +161,8 @@ const IMAGES: Record<string, string> = {
   'proc-translucent': 'proc:translucent',
   'cutout-rock-1k': `cutout:${rock('1K', 'Color')}`,
   'cutout-wood-4k': `cutout:${wood('4K', 'Color')}`,
+  'softcut-rock-1k': `softcut:${rock('1K', 'Color')}`,
+  'sprite-wood-1k': `sprite:${wood('1K', 'Color')}`,
 }
 for (const [size, key] of [
   ['1K', '1k'],
@@ -195,6 +248,14 @@ const median = (xs: number[]): number => {
   return s.length % 2 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2
 }
 
+const quantile = (xs: number[], q: number): number => {
+  const s = xs.toSorted((a, b) => a - b)
+  const pos = (s.length - 1) * q
+  const lo = Math.floor(pos)
+  const hi = Math.ceil(pos)
+  return s[lo]! + (s[hi]! - s[lo]!) * (pos - lo)
+}
+
 /**
  * Procedural 2048² images (keys 'proc-*'): gradients + sine detail + hash
  * noise — the /ab and /bench benchmark image — in three alpha flavours:
@@ -246,6 +307,25 @@ async function loadImageData(url: string): Promise<ImageData> {
     }
     return img
   }
+  if (url.startsWith('softcut:') || url.startsWith('sprite:')) {
+    // Antialiased cutouts (a 3-texel alpha ramp along every disc edge) and
+    // soft sprites (alpha falling off quadratically from each disc centre):
+    // the blocks where alpha and colour vary independently.
+    const sprite = url.startsWith('sprite:')
+    const img = await loadImageData(url.slice(url.indexOf(':') + 1))
+    const { width: w, height: h, data } = img
+    const r = w / 10
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const cx = (Math.floor(x / (2.5 * r)) + 0.5) * 2.5 * r
+        const cy = (Math.floor(y / (2.5 * r)) + 0.5) * 2.5 * r
+        const dist = Math.hypot(x - cx, y - cy)
+        const a = sprite ? 1 - (dist / (1.2 * r)) ** 2 : (r - dist) / 3 + 0.5
+        data[(y * w + x) * 4 + 3] = Math.round(255 * Math.min(1, Math.max(0, a)))
+      }
+    }
+    return img
+  }
   const res = await fetch(url)
   if (!res.ok) throw new Error(`fetch ${url}: ${res.status}`)
   const bmp = await createImageBitmap(await res.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' })
@@ -289,7 +369,9 @@ interface ShaderCase {
   rg8: boolean
 }
 
-async function runEval(onProgress: (msg: string) => void): Promise<{ results: ImageResult[]; summary: Summary[] }> {
+async function runEval(
+  onProgress: (msg: string) => void,
+): Promise<{ results: ImageResult[]; summary: Summary[]; adapter: string }> {
   const q = new URLSearchParams(window.location.search)
   const names = (q.get('shaders') ?? '').split(',').filter(Boolean)
   if (names.length === 0) throw new Error('missing ?shaders=a,b (files under /ab/<name>.wgsl)')
@@ -305,12 +387,12 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
         ? Object.keys(IMAGES)
         : imagesParam.split(',').filter(Boolean)
   for (const k of imageKeys) if (!IMAGES[k]) throw new Error(`unknown image '${k}'`)
-  // Dispatches per timed pass: default scales with the image so every pass
-  // runs a few ms (timestamps quantise to ~6.5 µs; a lone 1K dispatch is
-  // ~50 µs).
+  // Dispatches per timed pass: calibrated per image so a pass lasts about
+  // `passms` on THIS device (browsers quantise timestamps to 100 µs without
+  // developer features; a lone 1K dispatch is ~30 µs on a desktop GPU and
+  // several ms on a phone — a fixed count is wrong for one of them).
   const batchParam = q.get('batch')
-  const batchFor = (w: number, h: number): number =>
-    batchParam ? Number(batchParam) : Math.min(160, Math.max(10, Math.round((10 * 4096 * 4096) / (w * h))))
+  const passMs = Number(q.get('passms') ?? 60)
   const samples = Number(q.get('samples') ?? 15)
   const easy = Number(q.get('easy') ?? 16)
   const WARMUP = 6
@@ -327,7 +409,13 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
     'subgroups',
   ]
   const device = await adapter.requestDevice({ requiredFeatures: wanted.filter(f => adapter.features.has(f)) })
-  if (!device.features.has('timestamp-query') && samples > 0) throw new Error('adapter lacks timestamp-query')
+  const wallTimer = q.get('timer') === 'wall' || !device.features.has('timestamp-query')
+  const adapterLabel = `${adapter.info.vendor} ${adapter.info.architecture}${adapter.info.description ? ` (${adapter.info.description})` : ''}${wallTimer ? ' [wall timer]' : ''}`
+  let lost = false
+  void device.lost.then(info => {
+    lost = true
+    onProgress(`device lost: ${info.message}`)
+  })
 
   const cases: ShaderCase[] = []
   for (const name of names) {
@@ -362,7 +450,7 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
     compute: { module: errModule, entryPoint: 'main' },
   })
   const sampler = device.createSampler({ addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' })
-  const querySet = samples > 0 ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null
+  const querySet = samples > 0 && !wallTimer ? device.createQuerySet({ type: 'timestamp', count: 2 }) : null
   const resolveBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC })
   const tsRead = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
 
@@ -407,7 +495,7 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
     const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
     device.queue.writeBuffer(params, 0, new Uint32Array([bx, by, w, h, 0, 0, 0, 0]))
 
-    const batch = batchFor(w, h)
+    let batch = batchParam ? Number(batchParam) : 1
     const perCase = cases.map(c => {
       const dst = device.createBuffer({ size: outBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC })
       const entries: GPUBindGroupEntry[] = [
@@ -487,33 +575,58 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
 
     // ---- speed: interleaved batched timing
     const times: number[][] = perCase.map(() => [])
-    if (samples > 0 && querySet) {
-      const run = async (pc: (typeof perCase)[number], timed: boolean): Promise<number> => {
+    if (samples > 0) {
+      const run = async (pc: (typeof perCase)[number], n: number, timed: boolean): Promise<number> => {
+        if (lost) throw new Error('GPU device lost during timing')
         const enc = device.createCommandEncoder()
+        const useTs = timed && querySet
         const pass = enc.beginComputePass(
-          timed ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
+          useTs ? { timestampWrites: { querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
         )
-        dispatch(pass, pc, batch)
+        dispatch(pass, pc, n)
         pass.end()
-        if (timed) {
+        if (useTs) {
           enc.resolveQuerySet(querySet, 0, 2, resolveBuf, 0)
           enc.copyBufferToBuffer(resolveBuf, 0, tsRead, 0, 16)
         }
+        const t0 = performance.now()
         device.queue.submit([enc.finish()])
-        if (!timed) {
+        if (!useTs) {
           await device.queue.onSubmittedWorkDone()
-          return 0
+          return (performance.now() - t0) / n
         }
         await tsRead.mapAsync(GPUMapMode.READ)
         const t = new BigUint64Array(tsRead.getMappedRange())
-        const ms = Number(t[1]! - t[0]!) / 1e6 / batch
+        const ms = Number(t[1]! - t[0]!) / 1e6 / n
         tsRead.unmap()
         return ms
       }
-      for (let s = 0; s < WARMUP; s++) for (const pc of perCase) await run(pc, false)
+      // Calibrate the dispatch count on the first shader (wall clock is fine
+      // here): grow until a pass is long enough to measure, then scale to
+      // the target pass duration.
+      if (!batchParam) {
+        let n = 1
+        let per = 0
+        for (;;) {
+          await run(perCase[0]!, n, false)
+          const t0 = performance.now()
+          await run(perCase[0]!, n, false)
+          const dt = performance.now() - t0
+          per = dt / n
+          if (dt >= 20 || n >= 256) break
+          n *= 4
+        }
+        batch = Math.min(400, Math.max(1, Math.round(passMs / Math.max(per, 1e-3))))
+      }
+      const warmups = Math.max(2, Math.min(WARMUP, Math.ceil(300 / passMs)))
+      for (let s = 0; s < warmups; s++) for (const pc of perCase) await run(pc, batch, false)
       for (let s = 0; s < samples; s++) {
-        onProgress(`${key}: timing sample ${s + 1}/${samples}`)
-        for (let i = 0; i < perCase.length; i++) times[i]!.push(await run(perCase[i]!, true))
+        onProgress(`${key}: timing sample ${s + 1}/${samples} (batch ${batch})`)
+        // Rotate the starting shader each round so position bias cancels.
+        for (let j = 0; j < perCase.length; j++) {
+          const i = (j + s) % perCase.length
+          times[i]!.push(await run(perCase[i]!, batch, true))
+        }
       }
     }
 
@@ -529,6 +642,20 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
       }
       return out
     })
+    const dumpBlock = (idx: number, b0: Uint8Array, bi: Uint8Array): BlockDump | undefined => {
+      if (idx < 0) return undefined
+      const bxi = idx % bx
+      const byi = Math.floor(idx / bx)
+      const src: number[] = []
+      for (let y = 0; y < 4; y++)
+        for (let x = 0; x < 4; x++) {
+          const px = Math.min(bxi * 4 + x, w - 1)
+          const py = Math.min(byi * 4 + y, h - 1)
+          for (let c = 0; c < 4; c++) src.push(img.data[(py * w + px) * 4 + c]!)
+        }
+      const slice = (u: Uint8Array): number[] => [...u.subarray(idx * info.bpb, (idx + 1) * info.bpb)]
+      return { index: idx, bx: bxi, by: byi, src, base: slice(b0), mine: slice(bi) }
+    }
     const rows: Row[] = perCase.map((pc, i) => {
       const e = blockErr[i]!
       const tot = [0, 0, 0, 0]
@@ -545,6 +672,7 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
       let maxWorse = 0
       let maxEasyWorse = 0
       let maxEasyIdx = -1
+      let maxWorseIdx = -1
       let identical = 0
       const base = blockSse[0]!
       const mine = blockSse[i]!
@@ -554,7 +682,10 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
         const d = mine[b]! - base[b]!
         if (d > 1e-3) worse++
         else if (d < -1e-3) better++
-        if (d > maxWorse) maxWorse = d
+        if (d > maxWorse) {
+          maxWorse = d
+          maxWorseIdx = b
+        }
         if (base[b]! <= easy && d > maxEasyWorse) {
           maxEasyWorse = d
           maxEasyIdx = b
@@ -578,37 +709,42 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
         psnrA,
         dPsnr: 0,
         timeRatio: null,
+        ratioIqr: null,
+        batch,
         worseBlocks: worse,
         betterBlocks: better,
         maxBlockWorse: maxWorse,
         maxEasyWorse,
-        maxEasyBlock:
-          maxEasyIdx < 0
-            ? undefined
-            : (() => {
-                const bxi = maxEasyIdx % bx
-                const byi = Math.floor(maxEasyIdx / bx)
-                const src: number[] = []
-                for (let y = 0; y < 4; y++)
-                  for (let x = 0; x < 4; x++) {
-                    const px = Math.min(bxi * 4 + x, w - 1)
-                    const py = Math.min(byi * 4 + y, h - 1)
-                    for (let c = 0; c < 4; c++) src.push(img.data[(py * w + px) * 4 + c]!)
-                  }
-                const slice = (u: Uint8Array): number[] => [
-                  ...u.subarray(maxEasyIdx * info.bpb, (maxEasyIdx + 1) * info.bpb),
-                ]
-                return { index: maxEasyIdx, bx: bxi, by: byi, src, base: slice(b0), mine: slice(bi) }
-              })(),
+        maxEasyBlock: dumpBlock(maxEasyIdx, b0, bi),
+        maxWorseBlock: dumpBlock(maxWorseIdx, b0, bi),
         identicalPct: (100 * identical) / blocks,
         modeHist: fmt === 'bc7' ? bc7ModeHist(bi, blocks) : undefined,
       }
     })
-    for (const r of rows) {
+    rows.forEach((r, i) => {
       r.dPsnr = r.psnr - rows[0]!.psnr
-      r.timeRatio = r.minMs !== null && rows[0]!.minMs ? r.minMs / rows[0]!.minMs : null
+      // Median of per-round ratios (see the header note on noise).
+      const base = times[0]!
+      const mine = times[i]!
+      if (mine.length && base.length === mine.length) {
+        const ratios = mine.map((t, k) => t / base[k]!)
+        r.timeRatio = median(ratios)
+        r.ratioIqr = quantile(ratios, 0.75) - quantile(ratios, 0.25)
+      }
+    })
+    let oracle: ImageResult['oracle']
+    if (q.get('oracle')) {
+      let sse = 0
+      const wins = perCase.map(() => 0)
+      for (let b = 0; b < blocks; b++) {
+        let best = 0
+        for (let i = 1; i < blockSse.length; i++) if (blockSse[i]![b]! < blockSse[best]![b]!) best = i
+        sse += blockSse[best]![b]!
+        wins[best]!++
+      }
+      oracle = { psnr: psnrOf(sse, visible * channels.length), wins: wins.map(n => (100 * n) / blocks) }
     }
-    results.push({ image: key, width: w, height: h, rows })
+    results.push({ image: key, width: w, height: h, rows, oracle })
 
     for (const pc of perCase) pc.dst.destroy()
     srcRgba.destroy()
@@ -625,23 +761,30 @@ async function runEval(onProgress: (msg: string) => void): Promise<{ results: Im
       minDPsnr: Math.min(...d),
       maxDPsnr: Math.max(...d),
       geoTimeRatio: ratios.length ? Math.exp(ratios.reduce((a, b) => a + Math.log(b), 0) / ratios.length) : null,
+      maxRatioIqr: ratios.length ? Math.max(...results.map(r => r.rows[i]!.ratioIqr ?? 0)) : null,
       totalWorse: results.reduce((a, r) => a + r.rows[i]!.worseBlocks, 0),
       worstEasy: Math.max(...results.map(r => r.rows[i]!.maxEasyWorse)),
     }
   })
 
   device.destroy()
-  return { results, summary }
+  return { results, summary, adapter: adapterLabel }
 }
 
 /** Plain-text table for automation logs. */
-function toText(results: ImageResult[], summary: Summary[]): string {
-  const lines: string[] = []
+function toText(results: ImageResult[], summary: Summary[], adapter: string): string {
+  const lines: string[] = [`adapter: ${adapter}`]
   for (const r of results) {
     lines.push(`${r.image} (${r.width}×${r.height})`)
+    if (r.oracle) {
+      lines.push(
+        `  ORACLE (per-block best)  ${r.oracle.psnr.toFixed(3)} dB Δ${(r.oracle.psnr - r.rows[0]!.psnr >= 0 ? '+' : '') + (r.oracle.psnr - r.rows[0]!.psnr).toFixed(3)}  wins ${r.oracle.wins.map(x => x.toFixed(1) + '%').join(' / ')}`,
+      )
+    }
     for (const row of r.rows) {
       lines.push(
-        `  ${row.shader.padEnd(22)} ${row.minMs?.toFixed(4) ?? '   -  '} ms ×${row.timeRatio?.toFixed(3) ?? ' -  '}  ` +
+        `  ${row.shader.padEnd(22)} ${row.medianMs?.toFixed(4) ?? '   -  '} ms ×${row.timeRatio?.toFixed(3) ?? ' -  '}` +
+          `${row.ratioIqr === null ? '' : ` ±${row.ratioIqr.toFixed(3)}`}  ` +
           `${row.psnr.toFixed(3)} dB Δ${row.dPsnr >= 0 ? '+' : ''}${row.dPsnr.toFixed(3)}` +
           (Number.isNaN(row.psnrA) ? '' : ` (rgb ${row.psnrRgb.toFixed(2)} a ${row.psnrA.toFixed(2)})`) +
           `  worse ${row.worseBlocks} better ${row.betterBlocks} maxWorse ${row.maxBlockWorse.toFixed(0)} ` +
@@ -653,7 +796,8 @@ function toText(results: ImageResult[], summary: Summary[]): string {
   for (const s of summary) {
     lines.push(
       `  ${s.shader.padEnd(22)} ΔdB mean ${s.meanDPsnr.toFixed(3)} [${s.minDPsnr.toFixed(3)}, ${s.maxDPsnr.toFixed(3)}]  ` +
-        `time ×${s.geoTimeRatio?.toFixed(3) ?? '-'}  worse blocks ${s.totalWorse}  worst easy ${s.worstEasy.toFixed(1)}`,
+        `time ×${s.geoTimeRatio?.toFixed(3) ?? '-'}${s.maxRatioIqr === null ? '' : ` (max IQR ${s.maxRatioIqr.toFixed(3)})`}  ` +
+        `worse blocks ${s.totalWorse}  worst easy ${s.worstEasy.toFixed(1)}`,
     )
   }
   return lines.join('\n')
@@ -670,12 +814,15 @@ const EvalPage = () => {
     if (started.current) return
     started.current = true
     window.__GPUTEX_EVAL__ = { status: 'running' }
-    runEval(setProgress)
-      .then(({ results, summary }) => {
-        const t = toText(results, summary)
+    runEval(msg => {
+      setProgress(msg)
+      if (window.__GPUTEX_EVAL__?.status === 'running') window.__GPUTEX_EVAL__.progress = msg
+    })
+      .then(({ results, summary, adapter }) => {
+        const t = toText(results, summary, adapter)
         setText(t)
         setStatus('done')
-        window.__GPUTEX_EVAL__ = { status: 'done', results, summary, text: t }
+        window.__GPUTEX_EVAL__ = { status: 'done', adapter, results, summary, text: t }
       })
       .catch((e: unknown) => {
         const msg = e instanceof Error ? (e.stack ?? e.message) : String(e)

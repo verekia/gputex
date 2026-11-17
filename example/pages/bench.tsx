@@ -9,35 +9,10 @@
 
 import { useEffect, useRef, useState } from 'react'
 
-import {
-  ASTC4x4Encoder,
-  ASTC4x4WebGLEncoder,
-  BC1Encoder,
-  BC1WebGLEncoder,
-  BC5Encoder,
-  BC5WebGLEncoder,
-  BC7Encoder,
-  BC7WebGLEncoder,
-  ETC2Encoder,
-  generateGpuMipChain,
-  generateMipChain,
-  padToBlockMultiple,
-} from 'gputex'
+import { ASTC4x4Encoder, BC1Encoder, BC5Encoder, BC7Encoder, ETC2Encoder } from 'gputex'
 import type { Encoder } from 'gputex'
 
-import {
-  decodeASTC4x4Block,
-  decodeBC1Block,
-  decodeBC5Block,
-  decodeBC7Block,
-  decodeETC2Block,
-  encodeASTC4x4Block,
-  encodeBC1Block,
-  encodeBC5Block,
-  encodeBC7Mode6Block,
-  encodeETC2Block,
-} from 'gputex/testing'
-import { clearTranscodeCache, compressTexture, releaseSharedGpuResources, setTranscodeCacheLimit } from 'gputex/three'
+import { exposeEncoders } from '../lib/exposeEncoders'
 
 type Status = 'running' | 'done' | 'error'
 
@@ -51,41 +26,10 @@ interface BenchResult {
 declare global {
   interface Window {
     __GPUTEX_BENCH__?: { status: Status; results?: BenchResult[]; error?: string }
-    /** Encoder classes, exposed for ad-hoc console/automation experiments. */
-    __GPUTEX_ENCODERS__?: Record<string, unknown>
   }
 }
 
-if (typeof window !== 'undefined') {
-  window.__GPUTEX_ENCODERS__ = {
-    BC1Encoder,
-    BC5Encoder,
-    BC7Encoder,
-    ASTC4x4Encoder,
-    ETC2Encoder,
-    BC1WebGLEncoder,
-    BC5WebGLEncoder,
-    BC7WebGLEncoder,
-    ASTC4x4WebGLEncoder,
-    decodeBC1Block,
-    decodeBC5Block,
-    decodeBC7Block,
-    decodeASTC4x4Block,
-    decodeETC2Block,
-    encodeBC1Block,
-    encodeBC5Block,
-    encodeBC7Mode6Block,
-    encodeASTC4x4Block,
-    encodeETC2Block,
-    compressTexture,
-    releaseSharedGpuResources,
-    clearTranscodeCache,
-    setTranscodeCacheLimit,
-    generateMipChain,
-    generateGpuMipChain,
-    padToBlockMultiple,
-  }
-}
+exposeEncoders()
 
 const SIZES = [256, 512, 1024, 2048, 4096]
 const WARMUP = 5

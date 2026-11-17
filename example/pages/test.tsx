@@ -48,7 +48,8 @@ const TestPage = () => {
     if (started.current) return
     started.current = true
     window.__GPUTEX_TESTS__ = { status: 'running' }
-    runSuite(setProgress)
+    const only = new URLSearchParams(window.location.search).get('formats')
+    runSuite(setProgress, only ? (only.split(',') as Parameters<typeof runSuite>[1]) : undefined)
       .then(r => {
         setResults(r)
         setStatus('done')

@@ -476,7 +476,13 @@ function diffBytes(a: Uint8Array, b: Uint8Array, bytesPerBlock: number): { block
 
 // ------------------------------------------------------------------- suite
 
-export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
+export async function runSuite(
+  onProgress: ProgressFn,
+  // Restrict the run to some formats (`/test?formats=astc,etc2`): a phone
+  // driver may fail to build pipelines for formats the device can never
+  // use (Adreno 620: BC7 → VK_ERROR_UNKNOWN), which would abort the run.
+  only?: FormatKey[],
+): Promise<SuiteResults> {
   if (!('gpu' in navigator)) throw new Error('WebGPU not available in this browser')
   const adapter = await navigator.gpu.requestAdapter()
   if (!adapter) throw new Error('No WebGPU adapter')
@@ -501,22 +507,22 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     userAgent: navigator.userAgent,
   }
 
-  const encoders: Record<FormatKey, Encoder> = {
-    bc1: new BC1Encoder({ device, adapter }),
-    bc5: new BC5Encoder({ device, adapter }),
-    bc7: new BC7Encoder({ device, adapter }),
-    astc: new ASTC4x4Encoder({ device, adapter }),
-    etc2: new ETC2Encoder({ device, adapter }),
+  const ALL_FORMATS: FormatKey[] = ['bc1', 'bc5', 'bc7', 'astc', 'etc2']
+  const FORMATS = only?.length ? ALL_FORMATS.filter(f => only.includes(f)) : ALL_FORMATS
+  const make = (format: FormatKey, disableF16: boolean): Encoder => {
+    const opts = { device, adapter, disableF16 }
+    if (format === 'bc1') return new BC1Encoder(opts)
+    if (format === 'bc5') return new BC5Encoder(opts)
+    if (format === 'bc7') return new BC7Encoder(opts)
+    if (format === 'astc') return new ASTC4x4Encoder(opts)
+    return new ETC2Encoder(opts)
   }
+  // Only the selected formats are constructed (construction starts the
+  // pipeline build); the loops below never index an unselected one.
+  const encoders = Object.fromEntries(FORMATS.map(f => [f, make(f, false)])) as Record<FormatKey, Encoder>
   // f32-forced twins, for validating/benchmarking the fallback shader on
   // f16 hardware. Identical to `encoders` when the device lacks f16.
-  const encodersF32: Record<FormatKey, Encoder> = {
-    bc1: new BC1Encoder({ device, adapter, disableF16: true }),
-    bc5: new BC5Encoder({ device, adapter, disableF16: true }),
-    bc7: new BC7Encoder({ device, adapter, disableF16: true }),
-    astc: new ASTC4x4Encoder({ device, adapter, disableF16: true }),
-    etc2: new ETC2Encoder({ device, adapter, disableF16: true }),
-  }
+  const encodersF32 = Object.fromEntries(FORMATS.map(f => [f, make(f, true)])) as Record<FormatKey, Encoder>
   // Formats without an f16 module collapse the f16/f32 twin logic below.
   const hasF16Variant = (format: FormatKey): boolean => hasF16 && encoders[format].wgslSourceFastF16() !== null
 
@@ -533,7 +539,6 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   const perf: PerfResult[] = []
 
   // ---------------------------------------------------------- correctness
-  const FORMATS: FormatKey[] = ['bc1', 'bc5', 'bc7', 'astc', 'etc2']
   for (const format of FORMATS) {
     const enc = encoders[format]
 
@@ -661,6 +666,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
     const img = typeof spec.src === 'string' ? await loadImageData(spec.src) : spec.src
 
     for (const format of spec.formats) {
+      if (!FORMATS.includes(format)) continue
       // Per-block error of the exhaustive CPU reference encode — the
       // yardstick for the worst-block gate. Aggregate PSNR alone is
       // insensitive to a handful of catastrophically wrong blocks.
@@ -734,7 +740,7 @@ export async function runSuite(onProgress: ProgressFn): Promise<SuiteResults> {
   // cheap, so it takes a burst of them to move the clocks.
   onProgress('Warming up GPU clocks…')
   for (let i = 0; i < 40; i++) {
-    await encoders.bc7.encodeToBytes(benchBitmap)
+    await encoders[FORMATS.includes('bc7') ? 'bc7' : FORMATS[0]!].encodeToBytes(benchBitmap)
   }
 
   const perfCases: Array<{ format: FormatKey; variant: 'f16' | 'f32'; enc: Encoder }> = []
